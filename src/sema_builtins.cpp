@@ -13,6 +13,10 @@ Type FnCheckState::check_method_call(Expr* e) {
             e->resolved_type = Type::i32();
             return Type::i32();
         }
+        if (m == "linear_index" || m == "total_cells") {
+            e->resolved_type = Type::i64();
+            return Type::i64();
+        }
         if (m == "coord" || m == "pos") {
             Type rt = (dim == 1) ? Type::i32() : Type::vec(ScalarKind::I32, dim);
             e->resolved_type = rt;
@@ -110,8 +114,10 @@ Type FnCheckState::check_method_call(Expr* e) {
                 ctx.diags.error(e->span, "store.load expects " + std::to_string(dim) + " coordinate argument(s)");
             }
             for (auto& a : e->args) {
-                check_expr(a.get(), Type::i32());
-                check_assignable(a.get(), Type::i32(), ctx.diags, a->span);
+                Type at = check_expr(a.get(), Type::i32());
+                if (!at.is_integer() || !at.is_scalar()) {
+                    ctx.diags.error(a->span, "store.load coordinate must be a scalar integer, got '" + at.to_string() + "'");
+                }
             }
             e->resolved_type = elem;
             return elem;
@@ -124,8 +130,10 @@ Type FnCheckState::check_method_call(Expr* e) {
                 ctx.diags.error(e->span, "store.store expects " + std::to_string(dim) + " coordinate argument(s) and 1 value argument");
             } else {
                 for (size_t i = 0; i < dim; ++i) {
-                    check_expr(e->args[i].get(), Type::i32());
-                    check_assignable(e->args[i].get(), Type::i32(), ctx.diags, e->args[i]->span);
+                    Type at = check_expr(e->args[i].get(), Type::i32());
+                    if (!at.is_integer() || !at.is_scalar()) {
+                        ctx.diags.error(e->args[i]->span, "store.store coordinate must be a scalar integer, got '" + at.to_string() + "'");
+                    }
                 }
                 check_expr(e->args[dim].get(), elem);
                 check_assignable(e->args[dim].get(), elem, ctx.diags, e->args[dim]->span);
@@ -141,8 +149,10 @@ Type FnCheckState::check_method_call(Expr* e) {
                 ctx.diags.error(e->span, m + " expects " + std::to_string(dim) + " coordinate argument(s) and 1 value argument");
             } else {
                 for (size_t i = 0; i < dim; ++i) {
-                    check_expr(e->args[i].get(), Type::i32());
-                    check_assignable(e->args[i].get(), Type::i32(), ctx.diags, e->args[i]->span);
+                    Type at = check_expr(e->args[i].get(), Type::i32());
+                    if (!at.is_integer() || !at.is_scalar()) {
+                        ctx.diags.error(e->args[i]->span, m + " coordinate must be a scalar integer, got '" + at.to_string() + "'");
+                    }
                 }
                 check_expr(e->args[dim].get(), elem);
                 check_assignable(e->args[dim].get(), elem, ctx.diags, e->args[dim]->span);
@@ -213,6 +223,59 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = target;
         return target;
     }
+    if (n == "is_f64" || n == "sizeof") {
+        if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, scopes)) {
+            if (cv->type.is_bool()) {
+                e->kind = Expr::Kind::BoolLit;
+                e->bool_val = cv->bool_val;
+            } else {
+                e->kind = Expr::Kind::IntLit;
+                e->int_val = cv->int_val;
+            }
+            e->generic_args.clear();
+            e->args.clear();
+            e->resolved_type = cv->type;
+            return cv->type;
+        }
+        ctx.diags.error(e->span, "'" + n + "<T>()' expects 1 type argument and 0 value arguments");
+        return Type::bool_type();
+    }
+    if (n == "bitcast") {
+        if (e->generic_args.size() != 1 || e->args.size() != 1) {
+            ctx.diags.error(e->span, "'bitcast<T>(x)' expects 1 type argument and 1 value argument");
+            return Type::i32();
+        }
+        Type target = Type::i32();
+        const auto& ga = e->generic_args[0];
+        if (ga.type_arg) {
+            target = ctx.resolve_type(ga.type_arg.get(), fn.module_name, genv);
+        } else if (!ga.ident_or_const_name.empty()) {
+            TypeExpr tmp{ga.span, ga.ident_or_const_name, {}};
+            target = ctx.resolve_type(&tmp, fn.module_name, genv);
+        }
+        Type src_t = check_expr(e->args[0].get());
+        auto bit_width = [](ScalarKind sk) -> uint32_t {
+            switch (sk) {
+                case ScalarKind::F32:
+                case ScalarKind::I32:
+                case ScalarKind::U32:
+                    return 32;
+                case ScalarKind::F64:
+                case ScalarKind::I64:
+                case ScalarKind::U64:
+                    return 64;
+                default:
+                    return 0;
+            }
+        };
+        if (target.kind != src_t.kind || target.dimension != src_t.dimension ||
+            bit_width(target.scalar) == 0 || bit_width(target.scalar) != bit_width(src_t.scalar)) {
+            ctx.diags.error(e->span, "cannot bitcast '" + src_t.to_string() + "' to '" + target.to_string() + "'");
+        }
+        mark_type_usage(target);
+        e->resolved_type = target;
+        return target;
+    }
     // 2. Vector / Array constructors: vec2, vec3, vec4, vec2f, vec3d, vec<T, D>, array<T, N>
     if (n == "vec2" || n == "vec3" || n == "vec4" ||
         n == "vec2f" || n == "vec3f" || n == "vec4f" ||
@@ -277,6 +340,12 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         ensure_grid_dim(3);
         e->resolved_type = Type::i32();
         return Type::i32();
+    }
+    if (n == "grid_linear_index" || n == "grid_total_cells") {
+        uint32_t d = std::max(1u, fn.grid_dim);
+        ensure_grid_dim(d);
+        e->resolved_type = Type::i64();
+        return Type::i64();
     }
     if (n == "grid_coord" || n == "grid_pos") {
         uint32_t d = std::max(1u, fn.grid_dim);

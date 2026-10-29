@@ -545,8 +545,8 @@ LoweredKernelMir lower_kernel_to_mir(
         brass::Value* gw = b.build_load(brass::Type::i32(), shape_ptr, 0);
         brass::Value* gh = b.build_load(brass::Type::i32(), shape_ptr, 4);
         brass::Value* gd = b.build_load(brass::Type::i32(), shape_ptr, 8);
-        brass::Value* total = b.build_mul(b.build_mul(gw, gh), gd);
-        brass::Value* gh_gw = b.build_mul(gh, gw);
+        brass::Value* has_out_i32 = b.build_load(brass::Type::i32(), shape_ptr, 12);
+        brass::Value* has_out = b.build_ne(has_out_i32, b.build_iconst_i32(0));
         // Unpack kernel parameters once in the entry block outside the loop
         std::vector<ValueList> unpacked_params;
         unpacked_params.reserve(fn.params.size());
@@ -568,34 +568,45 @@ LoweredKernelMir lower_kernel_to_mir(
                 unpacked_params.push_back(std::move(leaves));
             }
         }
-        // Single flat loop `idx in 0..total` recovering (gx, gy, gz)
-        brass::BasicBlock* loop_head = new_block(b, "grid_head");
-        brass::BasicBlock* loop_body = new_block(b, "grid_body");
+        // Nested 3D/2D/1D loops over (gz in 0..gd, gy in 0..gh, gx in 0..gw)
+        // with 64-bit linear indexing so grids > 2B cells never overflow 32-bit
+        // and the inner gx loop has no integer divisions or branches.
+        brass::BasicBlock* z_head = new_block(b, "grid_z_head");
+        brass::BasicBlock* z_body = new_block(b, "grid_z_body");
+        brass::BasicBlock* y_head = new_block(b, "grid_y_head");
+        brass::BasicBlock* y_body = new_block(b, "grid_y_body");
+        brass::BasicBlock* x_head = new_block(b, "grid_x_head");
+        brass::BasicBlock* x_body = new_block(b, "grid_x_body");
+        brass::BasicBlock* y_latch = new_block(b, "grid_y_latch");
+        brass::BasicBlock* z_latch = new_block(b, "grid_z_latch");
         brass::BasicBlock* loop_exit = new_block(b, "grid_exit");
-        b.build_br(loop_head, {b.build_iconst_i32(0)});
-        brass::Value* idx = b.add_block_param(loop_head, brass::Type::i32());
-        b.position_at_end(loop_head);
-        b.build_br_if(b.build_slt(idx, total), loop_body, loop_exit);
-        b.position_at_end(loop_body);
+
+        b.build_br(z_head, {b.build_iconst_i32(0)});
+        brass::Value* gz_idx = b.add_block_param(z_head, brass::Type::i32());
+        b.position_at_end(z_head);
+        b.build_br_if(b.build_slt(gz_idx, gd), z_body, loop_exit);
+
+        b.position_at_end(z_body);
+        b.build_br(y_head, {b.build_iconst_i32(0)});
+        brass::Value* gy_idx = b.add_block_param(y_head, brass::Type::i32());
+        b.position_at_end(y_head);
+        b.build_br_if(b.build_slt(gy_idx, gh), y_body, z_latch);
+
+        b.position_at_end(y_body);
+        b.build_br(x_head, {b.build_iconst_i32(0)});
+        brass::Value* gx_idx = b.add_block_param(x_head, brass::Type::i32());
+        b.position_at_end(x_head);
+        b.build_br_if(b.build_slt(gx_idx, gw), x_body, y_latch);
+
+        b.position_at_end(x_body);
         MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/false);
         lowerer.push_scope();
         lowerer.gw = gw;
         lowerer.gh = gh;
         lowerer.gd = gd;
-        if (fn.grid_dim <= 1) {
-            lowerer.gx = idx;
-            lowerer.gy = b.build_iconst_i32(0);
-            lowerer.gz = b.build_iconst_i32(0);
-        } else if (fn.grid_dim == 2) {
-            lowerer.gx = b.build_smod(idx, gw);
-            lowerer.gy = b.build_sdiv(idx, gw);
-            lowerer.gz = b.build_iconst_i32(0);
-        } else {
-            lowerer.gz = b.build_sdiv(idx, gh_gw);
-            brass::Value* rem = b.build_smod(idx, gh_gw);
-            lowerer.gy = b.build_sdiv(rem, gw);
-            lowerer.gx = b.build_smod(rem, gw);
-        }
+        lowerer.gx = gx_idx;
+        lowerer.gy = gy_idx;
+        lowerer.gz = gz_idx;
         lowerer.active_return_type = fn.return_type;
         lowerer.has_returned_var_id = lowerer.alloc_var("__has_returned", {b.build_iconst_i32(0)});
         if (!fn.return_type.is_void()) {
@@ -606,20 +617,22 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         lowerer.lower_stmt_list(fn.body);
         if (lowerer.ret_val_var_id >= 0) {
-            // Only write if shape4[3] != 0 (i.e. return_store_out != nullptr)
-            brass::Value* has_out_i32 = b.build_load(brass::Type::i32(), shape_ptr, 12);
-            brass::Value* has_out = b.build_ne(has_out_i32, b.build_iconst_i32(0));
-            brass::BasicBlock* write_out_bb = new_block(b, "write_ret");
-            brass::BasicBlock* next_iter_bb = new_block(b, "next_iter");
-            b.build_br_if(has_out, write_out_bb, next_iter_bb);
-            b.position_at_end(write_out_bb);
-            lowerer.store_element_to_buffer(fn.return_type, out_ret, idx,
+            brass::Value* lin = lowerer.compute_linear_index(std::max(1u, fn.grid_dim), gx_idx, gy_idx, gz_idx);
+            brass::Value* store_idx = b.build_select(has_out, lin, b.build_iconst_i64(0));
+            lowerer.store_element_to_buffer(fn.return_type, out_ret, store_idx,
                                             lowerer.var_values[lowerer.ret_val_var_id]);
-            b.build_br(next_iter_bb);
-            b.position_at_end(next_iter_bb);
         }
-        brass::Value* next_idx = b.build_add(idx, b.build_iconst_i32(1));
-        b.build_br(loop_head, {next_idx});
+        brass::Value* next_gx = b.build_add(gx_idx, b.build_iconst_i32(1));
+        b.build_br(x_head, {next_gx});
+
+        b.position_at_end(y_latch);
+        brass::Value* next_gy = b.build_add(gy_idx, b.build_iconst_i32(1));
+        b.build_br(y_head, {next_gy});
+
+        b.position_at_end(z_latch);
+        brass::Value* next_gz = b.build_add(gz_idx, b.build_iconst_i32(1));
+        b.build_br(z_head, {next_gz});
+
         b.position_at_end(loop_exit);
         b.build_ret_void();
     }

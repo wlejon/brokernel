@@ -65,7 +65,7 @@ static void test_custom_and_filesystem_modules_and_cycles() {
         }
 
         pub fn aridity_index<T>(s: ClimateSample<T>) -> T {
-            return math::saturate_val<T>(s.rain / (s.temp + 30.0));
+            return math::saturate<T>(s.rain / (s.temp + 30.0));
         }
     )");
 

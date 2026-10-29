@@ -108,20 +108,29 @@ brass::Value* MirBodyLowerer::clamp_coord(brass::Value* c, brass::Value* extent)
         return b.build_select(b.build_sgt(c_lo, hi), hi, c_lo);
     }
 brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z) {
-        if (dim == 1) return x;
+        auto to_i64 = [&](brass::Value* v) -> brass::Value* {
+            return (v->type() == brass::Type::i64()) ? v : b.build_sext_i64(v);
+        };
+        brass::Value* x64 = to_i64(x);
+        if (dim == 1) return x64;
+        brass::Value* y64 = to_i64(y);
+        brass::Value* gw64 = to_i64(gw);
         if (dim == 2) {
-            return b.build_add(b.build_mul(y, gw), x);
+            return b.build_add(b.build_mul(y64, gw64), x64);
         }
-        brass::Value* zy = b.build_add(b.build_mul(z, gh), y);
-        return b.build_add(b.build_mul(zy, gw), x);
+        brass::Value* z64 = to_i64(z);
+        brass::Value* gh64 = to_i64(gh);
+        brass::Value* zy = b.build_add(b.build_mul(z64, gh64), y64);
+        return b.build_add(b.build_mul(zy, gw64), x64);
     }
 ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx) {
+        brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
         auto kinds = mod.types.flatten_scalars(elem_type);
         ValueList res;
         res.reserve(kinds.size());
         if (kinds.size() == 1) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            res.push_back(b.build_load_indexed(mt, base_ptr, linear_idx, static_cast<uint8_t>(mt.size_in_bytes())));
+            res.push_back(b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes())));
             return res;
         }
         // Check if all leaves have identical scalar kind
@@ -132,16 +141,16 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass:
         if (uniform) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
             uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
-            brass::Value* base_elem = b.build_mul(linear_idx, b.build_iconst_i32(static_cast<int32_t>(kinds.size())));
+            brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size(); ++i) {
-                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i32(static_cast<int32_t>(i)));
+                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
                 res.push_back(b.build_load_indexed(mt, base_ptr, idx_i, scale));
             }
             return res;
         }
         // Heterogeneous struct: compute byte offset = linear_idx * elem_byte_size + leaf_off
         uint32_t elem_bytes = mod.types.byte_size(elem_type);
-        brass::Value* byte_base = b.build_mul(linear_idx, b.build_iconst_i32(static_cast<int32_t>(elem_bytes)));
+        brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
         uint32_t cur_off = 0;
         for (ScalarKind sk : kinds) {
             brass::Type mt = to_mir_scalar_type(sk);
@@ -152,10 +161,11 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass:
     }
 void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx,
                                  const ValueList& vals) {
+        brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
         auto kinds = mod.types.flatten_scalars(elem_type);
         if (kinds.size() == 1 && !vals.empty()) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            b.build_store_indexed(mt, base_ptr, linear_idx, static_cast<uint8_t>(mt.size_in_bytes()), vals[0]);
+            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), vals[0]);
             return;
         }
         bool uniform = true;
@@ -165,15 +175,15 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, brass::Value
         if (uniform) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
             uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
-            brass::Value* base_elem = b.build_mul(linear_idx, b.build_iconst_i32(static_cast<int32_t>(kinds.size())));
+            brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
-                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i32(static_cast<int32_t>(i)));
+                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
                 b.build_store_indexed(mt, base_ptr, idx_i, scale, vals[i]);
             }
             return;
         }
         uint32_t elem_bytes = mod.types.byte_size(elem_type);
-        brass::Value* byte_base = b.build_mul(linear_idx, b.build_iconst_i32(static_cast<int32_t>(elem_bytes)));
+        brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
         uint32_t cur_off = 0;
         for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
             brass::Type mt = to_mir_scalar_type(kinds[i]);
@@ -565,6 +575,15 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 if (m == "width") return {gw};
                 if (m == "height") return {gh};
                 if (m == "depth") return {gd};
+                if (m == "linear_index") {
+                    return {compute_linear_index(rt.dimension, gx, gy, gz)};
+                }
+                if (m == "total_cells") {
+                    brass::Value* total = b.build_sext_i64(gw);
+                    if (rt.dimension >= 2) total = b.build_mul(total, b.build_sext_i64(gh));
+                    if (rt.dimension >= 3) total = b.build_mul(total, b.build_sext_i64(gd));
+                    return {total};
+                }
                 if (m == "coord" || m == "pos") {
                     if (rt.dimension == 1) return {gx};
                     if (rt.dimension == 2) return {gx, gy};
@@ -638,7 +657,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
                     if (is_gpu) {
                         uint32_t esz = elem_t.scalar_size_bytes();
-                        brass::Value* byte_off = b.build_mul(b.build_sext_i64(lin), b.build_iconst_i64(esz));
+                        brass::Value* lin64 = (lin->type() == brass::Type::i64()) ? lin : b.build_sext_i64(lin);
+                        brass::Value* byte_off = b.build_mul(lin64, b.build_iconst_i64(esz));
                         brass::Value* addr = b.build_add(base[0], byte_off);
                         if (m == "atomic_add") {
                             return {elem_t.is_f32() ? kb.atom_add_f32(addr, val[0]) : kb.atom_add_i32(addr, val[0])};
@@ -686,6 +706,26 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 for (brass::Value* v : sv) out.push_back(lower_scalar_cast(v, from_sk, to_sk));
                 return out;
             }
+            if (n == "bitcast") {
+                ValueList sv = lower_expr(e->args[0].get());
+                ScalarKind from_sk = e->args[0]->resolved_type.scalar;
+                ScalarKind to_sk = e->resolved_type.scalar;
+                ValueList out;
+                for (brass::Value* v : sv) {
+                    if (from_sk == ScalarKind::F32 && (to_sk == ScalarKind::I32 || to_sk == ScalarKind::U32)) {
+                        out.push_back(b.build_bitcast_i32_f32(v));
+                    } else if ((from_sk == ScalarKind::I32 || from_sk == ScalarKind::U32) && to_sk == ScalarKind::F32) {
+                        out.push_back(b.build_bitcast_f32_i32(v));
+                    } else if (from_sk == ScalarKind::F64 && (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64)) {
+                        out.push_back(b.build_bitcast_i64_f64(v));
+                    } else if ((from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) && to_sk == ScalarKind::F64) {
+                        out.push_back(b.build_bitcast_f64_i64(v));
+                    } else {
+                        out.push_back(v);
+                    }
+                }
+                return out;
+            }
             // 4. Vector / Array / Struct constructors
             if (n == "vec2" || n == "vec3" || n == "vec4" ||
                 n == "vec2f" || n == "vec3f" || n == "vec4f" ||
@@ -714,6 +754,16 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (n == "grid_width") return {gw};
             if (n == "grid_height") return {gh};
             if (n == "grid_depth") return {gd};
+            if (n == "grid_linear_index") {
+                return {compute_linear_index(std::max(1u, root_fn.grid_dim), gx, gy, gz)};
+            }
+            if (n == "grid_total_cells") {
+                uint32_t d = std::max(1u, root_fn.grid_dim);
+                brass::Value* total = b.build_sext_i64(gw);
+                if (d >= 2) total = b.build_mul(total, b.build_sext_i64(gh));
+                if (d >= 3) total = b.build_mul(total, b.build_sext_i64(gd));
+                return {total};
+            }
             if (n == "grid_coord" || n == "grid_pos") {
                 if (e->resolved_type.is_scalar()) return {gx};
                 if (e->resolved_type.dimension == 2) return {gx, gy};

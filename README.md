@@ -60,6 +60,14 @@ general graphics:
     polynomials.
   - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
     fails, with `ran_gpu` false, when there is no Vulkan device.
+- **Grid indices are 64-bit.** `g.linear_index()`, `g.total_cells()` (and
+  `grid_linear_index()`, `grid_total_cells()`) are i64, stores take i32 or
+  i64 coordinates, and the CPU's grid loop indexes in i64, so a grid may
+  pass 2^31 cells.
+- **Type introspection for generics.** `is_f64<T>()` and `sizeof<T>()`
+  fold to constants at check time, so a generic body can branch on its
+  scalar; `bitcast<T>(x)` reinterprets a value's bits as a type of the same
+  width (f32 / i32 / u32, f64 / i64 / u64).
 - **CPU builds are for compute kernels.** The CPU runs a kernel cell by cell,
   as a subgroup and workgroup of one:
   - The subgroup operations are the identity there.
@@ -79,14 +87,17 @@ Source files use the `.bk` extension.
 | `src/lexer.cpp`, `src/parser.cpp` | source to AST |
 | `src/sema*.cpp`, `src/types.cpp` | name resolution, generics, type checking, builtin signatures |
 | `src/lowering_mir.cpp`, `src/lowering_expr.cpp`, `src/lowering_math.cpp` | AST to brass MIR: the GPU entry point and the CPU point / grid functions |
-| `src/stdlib_modules.cpp` | the built-in modules `std::math`, `std::noise`, `std::filter`, `std::sphere`, `std::color` |
-| `tests/` | lexer/parser, sema, modules and generics, SPIR-V stages, CPU/GPU parity (against host references), and the transcendentals against libm on both targets. A GPU test with no Vulkan device exits 77 (skipped). `no_dialogs.cpp` keeps Windows test executables from opening modal dialogs |
+| `src/stdlib_modules.cpp` | the built-in modules `std::math`, `std::noise`, `std::filter`, `std::sphere`, `std::color`. `std::noise` is FastNoise2's nodes ported (its primes, hashes, gradients and bounds): Value, Perlin, Simplex, SuperSimplex, White, Checkerboard, SineWave, the FBm / Ridged / PingPong fractals, the cellular value / distance / lookup nodes, and the gradient and fractal domain warps, in 2D, 3D and 4D, f32 or f64. In f64 a lattice noise rebases on its own cell, so it holds about an origin millions of units out, as FastNoise2's double origins do |
+| `tests/` | lexer/parser, sema, modules and generics, SPIR-V stages, CPU/GPU parity (against host references), the transcendentals against libm on both targets, and `std::noise` against FastNoise2 on both (43 node / dimension cases, to 1e-5; the cellular and warp nodes to 1e-4, FastNoise2 being built relaxed). A GPU test with no Vulkan device exits 77 (skipped). `no_dialogs.cpp` keeps Windows test executables from opening modal dialogs |
+| `bench/bench_hillclimb.cpp` | the hill-climb harness: parity and speed of `std::noise` against FastNoise2 (CPU) and against glslc's SPIR-V of the same node (GPU: Value, Perlin, FBm, Ridged), five stencil kernels against C++ and GLSL, and the planet's noise fields (eight FBm-of-Simplex fields in f64 about a double origin) against FastNoise2, in metres. It prints the geomeans; `--write-golden` records them in `bench/goldens.windows.json` and `--check-golden` fails on a parity failure or a geomean 10% under the golden's. `-DBROKERNEL_BUILD_BENCH=OFF` skips it |
 | `cmake/bro_deps.cmake` | the ecosystem's shared dependency resolver (identical in every repo; `scripts/sync-deps.sh` in bro copies it) |
 
 ## Building
 
 Dependencies resolve like every sibling: an outer project's target, else
-`../brass` beside this checkout, else brass's main fetched at configure.
+`../brass` beside this checkout, else brass's main fetched at configure. The
+tests and the bench also take FastNoise2 (wlejon's fork, `../FastNoise2` or
+fetched) as their oracle; the library itself does not link it.
 
 Windows (Visual Studio generator, one build dir, the config chosen at build
 time):

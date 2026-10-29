@@ -175,10 +175,65 @@ static void test_store_access_modes_and_mutability() {
     }
 }
 
+static void test_64bit_grid_indexing_and_bitcast() {
+    // 1. Grid linear index and total cells use 64-bit integers so grids > 2^31 cells do not overflow.
+    {
+        const char* src = R"(
+            @kernel @grid(2)
+            fn large_grid_idx(g: grid<2>) -> i64 {
+                return g.linear_index() + g.total_cells();
+            }
+        )";
+        auto res = compile_source(src, "large_grid.bk");
+        if (!res.ok) std::cerr << res.error_message() << "\n";
+        assert(res.ok);
+        const auto* k = res.default_kernel();
+        assert(k != nullptr);
+        // 65536 * 65536 = 4,294,967,296 (> 2^31 - 1)
+        // At (x=50000, y=50000), linear_index = 50000 * 65536 + 50000 = 3,276,850,000
+        int64_t out = 0;
+        bool ok = k->eval_grid_point_cpu(50000, 50000, 0, GridShape(65536, 65536, 1), {}, &out);
+        assert(ok);
+        int64_t expected_lin = 50000LL * 65536LL + 50000LL;
+        int64_t expected_tot = 65536LL * 65536LL;
+        assert(out == expected_lin + expected_tot);
+    }
+
+    // 2. Store indexing accepts i64 coordinates and bitcast<T> / is_f64<T>() work on f32 and f64.
+    {
+        const char* src = R"(
+            fn type_tag<T>(x: T) -> i32 {
+                if is_f64<T>() {
+                    return 64;
+                } else {
+                    return bitcast<i32>(x);
+                }
+            }
+
+            @kernel fn test_intrinsics(buf: store<f32, 1>, idx: i64, val: f32) -> i32 {
+                buf[idx] = val;
+                let read_back: f32 = buf[idx];
+                return type_tag<f32>(read_back) + type_tag<f64>(1.0 as f64);
+            }
+        )";
+        auto res = compile_source(src, "intrinsics.bk");
+        if (!res.ok) std::cerr << res.error_message() << "\n";
+        assert(res.ok);
+        const auto* k = res.default_kernel();
+        assert(k != nullptr);
+        std::vector<float> data(16, 0.0f);
+        int32_t got = k->eval_i32({KernelArg::store(data), KernelArg(int64_t(11)), KernelArg(1.0f)});
+        // bitcast<i32>(1.0f) == 0x3f800000 (1065353216)
+        assert(data[11] == 1.0f);
+        assert(got == 0x3f800000 + 64);
+    }
+}
+
 int main() {
     test_f64_precision_discipline();
     test_stencil_validation();
     test_store_access_modes_and_mutability();
+    test_64bit_grid_indexing_and_bitcast();
     std::cout << "test_sema_types: ALL PASSED\n";
     return 0;
 }

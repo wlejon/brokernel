@@ -15,10 +15,16 @@ if(MSVC)
 endif()
 
 option(BROKERNEL_BUILD_TESTS "Build the brokernel test suite" ${PROJECT_IS_TOP_LEVEL})
+option(BROKERNEL_BUILD_BENCH "Build the brokernel hill-climb benchmark harness" ${PROJECT_IS_TOP_LEVEL})
 
 # brass: the code generator kernels lower into (MIR -> SPIR-V for the GPU,
 # x64 / arm64 for the CPU).
 bro_dependency(brass GITHUB wlejon/brass)
+
+if(BROKERNEL_BUILD_TESTS OR BROKERNEL_BUILD_BENCH)
+    bro_dependency(FastNoise2 GITHUB wlejon/FastNoise2 TARGET FastNoise
+        OPTIONS FASTNOISE2_TOOLS=OFF FASTNOISE2_TESTS=OFF FASTNOISE2_UTILITY=OFF)
+endif()
 
 add_library(brokernel STATIC
     src/brokernel.cpp
@@ -41,4 +47,14 @@ target_link_libraries(brokernel PUBLIC brass)
 if(BROKERNEL_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(BROKERNEL_BUILD_BENCH)
+    add_executable(bench_hillclimb bench/bench_hillclimb.cpp tests/no_dialogs.cpp)
+    target_link_libraries(bench_hillclimb PRIVATE brokernel FastNoise)
+    target_compile_definitions(bench_hillclimb PRIVATE
+        BROKERNEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    if(MSVC)
+        target_compile_options(bench_hillclimb PRIVATE /W4 /permissive- /utf-8)
+    endif()
 endif()

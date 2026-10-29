@@ -13,7 +13,7 @@ using namespace brokernel;
 
 static void test_planetary_elevation_f64_parity() {
     const char* src = R"(
-        import std::noise::{fbm, ridged_fbm};
+        import std::noise::{fbm, ridged};
         import std::sphere;
 
         @kernel @grid(2)
@@ -23,7 +23,7 @@ static void test_planetary_elevation_f64_parity() {
             let lon: f64 = (uv.x - 0.5) * 6.283185307179586;
             let dir: vec3<f64> = sphere::latlon_to_unit<f64>(lat, lon);
             let base: f64 = fbm<f64, 3>(dir * freq, 4, 2.0, 0.5);
-            let ridge: f64 = ridged_fbm<f64, 3>(dir * (freq * 1.5), 3, 2.0, 0.5);
+            let ridge: f64 = ridged<f64, 3>(dir * (freq * 1.5), 3, 2.0, 0.5);
             out_elev.write(base * 3000.0 + ridge * 1500.0);
         }
     )";

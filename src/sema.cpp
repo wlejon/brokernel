@@ -529,6 +529,25 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
             }
             return res;
         }
+        case Expr::Kind::Call: {
+            if ((e->name == "is_f64" || e->name == "sizeof") && e->generic_args.size() == 1 && e->args.empty()) {
+                Type t = Type::f32();
+                const auto& ga = e->generic_args[0];
+                if (ga.type_arg) {
+                    t = resolve_type(ga.type_arg.get(), current_mod, genv);
+                } else if (!ga.ident_or_const_name.empty()) {
+                    TypeExpr tmp{ga.span, ga.ident_or_const_name, {}};
+                    t = resolve_type(&tmp, current_mod, genv);
+                }
+                if (e->name == "is_f64") {
+                    bool b = (t.scalar == ScalarKind::F64);
+                    return ConstValue{Type::bool_type(), b ? 1 : 0, b ? 1.0 : 0.0, b};
+                }
+                int64_t sz = static_cast<int64_t>(out->types.byte_size(t));
+                return ConstValue{Type::i32(), sz, static_cast<double>(sz), false};
+            }
+            return std::nullopt;
+        }
         default:
             return std::nullopt;
     }

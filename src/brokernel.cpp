@@ -312,9 +312,18 @@ bool CompiledKernel::dispatch_cpu(
         return_store_out != nullptr ? 1 : 0,
     };
 
+    // With no return store every cell's return is written to one scratch
+    // element (the grid loop selects index 0 rather than branching).
+    std::vector<uint64_t> scratch_ret;
+    void* ret_ptr = return_store_out;
+    if (!ret_ptr) {
+        scratch_ret.resize((std::max<size_t>(return_byte_size, 8) + 7) / 8);
+        ret_ptr = scratch_ret.data();
+    }
+
     using GridFn = void (*)(const uint64_t*, const int32_t*, void*);
     auto fn_ptr = cpu_grid_fn.as<GridFn>();
-    fn_ptr(slots.data(), shape4, return_store_out);
+    fn_ptr(slots.data(), shape4, ret_ptr);
     return true;
 }
 
@@ -809,6 +818,7 @@ CompileResult Compiler::compile_source(
                 brass::codegen::KernelOptions kopts;
                 kopts.opt_level = opts.opt_level;
                 kopts.enable_optimizations = (opts.opt_level > 0);
+                kopts.enable_fma = false;
                 kopts.enable_parallel = false;
                 kopts.enable_superopt = false;
                 kopts.enable_smt_guard_elim = false;

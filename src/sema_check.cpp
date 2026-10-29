@@ -492,8 +492,10 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                     ctx.diags.error(e->span, "store indexing expects " + std::to_string(recv.dimension) + " index argument(s)");
                 }
                 for (auto& a : e->args) {
-                    check_expr(a.get(), Type::i32());
-                    check_assignable(a.get(), Type::i32(), ctx.diags, a->span);
+                    Type at = check_expr(a.get(), Type::i32());
+                    if (!at.is_integer() || !at.is_scalar()) {
+                        ctx.diags.error(a->span, "store index must be a scalar integer, got '" + at.to_string() + "'");
+                    }
                 }
                 Type elem = recv.element_type();
                 mark_type_usage(elem);
@@ -604,8 +606,10 @@ void FnCheckState::check_stmt(Stmt* s) {
                         ctx.diags.error(s->span, "store indexing expects " + std::to_string(recv.dimension) + " coordinate(s)");
                     }
                     for (auto& a : s->assign_target->args) {
-                        check_expr(a.get(), Type::i32());
-                        check_assignable(a.get(), Type::i32(), ctx.diags, a->span);
+                        Type at = check_expr(a.get(), Type::i32());
+                        if (!at.is_integer() || !at.is_scalar()) {
+                            ctx.diags.error(a->span, "store coordinate must be a scalar integer, got '" + at.to_string() + "'");
+                        }
                     }
                     Type elem = recv.element_type();
                     s->assign_target->resolved_type = elem;
