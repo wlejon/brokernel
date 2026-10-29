@@ -1,0 +1,600 @@
+#include "lowering_ops.h"
+
+namespace brokernel::detail {
+
+using brass::Opcode;
+using brass::Type;
+using brass::Value;
+
+namespace {
+
+bool is_64(Type t) { return t.element_type().size_in_bytes() == 8; }
+
+} // namespace
+
+Type Ops::vec_type(Type s) const {
+    if (s.is_vector()) return s;
+    const bool w8 = lanes == 8;
+    if (s == Type::i32()) return w8 ? Type::i32x8() : Type::i32x4();
+    if (s == Type::f32()) return w8 ? Type::f32x8() : Type::f32x4();
+    if (s == Type::i64() || s == Type::f64()) {
+        if (w8) throw NeedNarrowLanes();
+        return s == Type::i64() ? Type::i64x4() : Type::f64x4();
+    }
+    throw VectorUnsupported("a varying " + std::string(s.name()));
+}
+
+void Ops::check_lanes(Type t) const {
+    if (lanes == 8 && t.element_type().size_in_bytes() == 8) throw NeedNarrowLanes();
+}
+
+Value* Ops::widen(Value* v) {
+    if (is_varying(v)) return v;
+    auto m = markers_.find(v);
+    if (m == markers_.end()) return b_.build_vbroadcast(vec_type(v->type()), v);
+    const Type vt = vec_type(Type::i64());
+    Value* steps = b_.build_vzero(vt);
+    for (uint32_t i = 1; i < lanes; ++i) {
+        steps = b_.build_vinsert_lane(steps, b_.build_iconst_i64(static_cast<int64_t>(i) * m->second), i);
+    }
+    return b_.build_vadd(b_.build_vbroadcast(vt, v), steps);
+}
+
+Value* Ops::coerce(Value* v, Type t) {
+    if (t.is_vector() && !is_varying(v)) return widen(v);
+    return v;
+}
+
+Value* Ops::real(Value* v) {
+    return is_index_marker(v) ? widen(v) : v;
+}
+
+Value* Ops::mark(Value* base, int64_t stride) {
+    markers_[base] = stride;
+    return base;
+}
+
+std::optional<Ops::Affine> Ops::affine_of(Value* v) const {
+    auto it = affine_.find(v);
+    if (it == affine_.end()) return std::nullopt;
+    return it->second;
+}
+
+Value* Ops::affine_index(Value* v) {
+    auto a = affine_of(v);
+    if (!a) return nullptr;
+    return mark(b_.build_sext_i64(a->base), a->stride);
+}
+
+Value* Ops::marker_lane(Value* m, uint32_t i) {
+    if (i == 0) return m;
+    return b_.build_add(m, b_.build_iconst_i64(static_cast<int64_t>(i) * markers_.at(m)));
+}
+
+namespace {
+
+std::optional<int64_t> int_constant(Value* v) {
+    const brass::Instruction* d = v->defining_instruction();
+    if (!d) return std::nullopt;
+    if (d->opcode() == Opcode::iconst_i32) return d->imm_i32();
+    if (d->opcode() == Opcode::iconst_i64) return d->imm_i64();
+    return std::nullopt;
+}
+
+} // namespace
+
+Value* Ops::affine_bin(Opcode op, Value* a, Value* c) {
+    if (!vector_mode()) return nullptr;
+    // A stride per operand: a marker's or an affine vector's, 0 for a uniform.
+    auto stride_of = [&](Value* v, bool& known) -> int64_t {
+        if (auto m = markers_.find(v); m != markers_.end()) return m->second;
+        if (auto f = affine_of(v)) return f->stride;
+        known = !is_varying(v);
+        return 0;
+    };
+    auto base_of = [&](Value* v) -> Value* {
+        if (auto f = affine_of(v)) return f->base;
+        return v;   // a marker is its own base, a uniform its own value
+    };
+    bool ka = true, kc = true;
+    const int64_t sa = stride_of(a, ka), sc = stride_of(c, kc);
+    if (!ka || !kc || (sa == 0 && sc == 0)) return nullptr;
+    const bool marker = is_index_marker(a) || is_index_marker(c);
+    if (marker && (is_varying(a) || is_varying(c))) return nullptr;
+    int64_t stride = 0;
+    Value* base = nullptr;
+    switch (op) {
+        case Opcode::vadd:
+            stride = sa + sc;
+            base = b_.build_add(base_of(a), base_of(c));
+            break;
+        case Opcode::vsub:
+            stride = sa - sc;
+            base = b_.build_sub(base_of(a), base_of(c));
+            break;
+        case Opcode::vmul: {
+            // Affine times a constant.
+            auto k = sa == 0 ? int_constant(a) : sc == 0 ? int_constant(c) : std::nullopt;
+            if (!k) return nullptr;
+            stride = (sa == 0 ? sc : sa) * *k;
+            base = b_.build_mul(base_of(a), base_of(c));
+            break;
+        }
+        default: return nullptr;
+    }
+    if (marker) return stride == 0 ? base : mark(base, stride);
+    Value* r = vec_bin(op, a, c);
+    if (stride != 0) affine_[r] = Affine{base, stride};
+    return r;
+}
+
+Value* Ops::iota_i32() {
+    Value* v = b_.build_vzero(vec_type(Type::i32()));
+    for (uint32_t i = 1; i < lanes; ++i) v = b_.build_vinsert_lane(v, b_.build_iconst_i32(static_cast<int32_t>(i)), i);
+    affine_[v] = Affine{b_.build_iconst_i32(0), 1};
+    return v;
+}
+
+Value* Ops::any(Value* m) {
+    return is_varying(m) ? b_.build_vany(m) : m;
+}
+
+Value* Ops::narrow_mask(Value* m) {
+    if (m->type() == Type::i64x4()) return b_.build_vconvert(Type::i32x4(), m);
+    return m;
+}
+
+Value* Ops::mask_for(Value* m, Type t) {
+    m = widen(m);
+    if (is_64(t) && m->type() == Type::i32x4()) return b_.build_vconvert(Type::i64x4(), m);
+    return m;
+}
+
+brass::Instruction* Ops::build_br_if(Value* c, brass::BasicBlock* t, brass::BasicBlock* f) {
+    if (is_varying(c)) throw std::logic_error("brokernel: a branch on a varying condition");
+    return b_.build_br_if(c, t, f);
+}
+
+Value* Ops::lane_of(Value* v, uint32_t i) {
+    if (is_index_marker(v)) return marker_lane(v, i);
+    return is_varying(v) ? b_.build_vextract_lane(v, i) : v;
+}
+
+template <typename F>
+Value* Ops::per_lane(Type res_scalar, std::initializer_list<Value*> operands, F scalar_op) {
+    Value* out = b_.build_vzero(vec_type(res_scalar));
+    std::vector<Value*> s(operands.size());
+    for (uint32_t i = 0; i < lanes; ++i) {
+        size_t k = 0;
+        for (Value* v : operands) s[k++] = lane_of(v, i);
+        out = b_.build_vinsert_lane(out, scalar_op(s), i);
+    }
+    return out;
+}
+
+Value* Ops::vec_bin(Opcode op, Value* a, Value* c) {
+    if (!is_varying(a) && !is_varying(c)) return nullptr;
+    a = widen(a);
+    c = widen(c);
+    switch (op) {
+        case Opcode::vadd: return b_.build_vadd(a, c);
+        case Opcode::vsub: return b_.build_vsub(a, c);
+        case Opcode::vmul: return b_.build_vmul(a, c);
+        case Opcode::vdiv: return b_.build_vdiv(a, c);
+        case Opcode::vmin: return b_.build_vmin(a, c);
+        case Opcode::vmax: return b_.build_vmax(a, c);
+        case Opcode::vand: return b_.build_vand(a, c);
+        case Opcode::vor:  return b_.build_vor(a, c);
+        case Opcode::vxor: return b_.build_vxor(a, c);
+        case Opcode::vshl: return b_.build_vshl(a, c);
+        case Opcode::vlshr: return b_.build_vlshr(a, c);
+        case Opcode::vashr: return b_.build_vashr(a, c);
+        default: throw std::logic_error("brokernel: vec_bin of a non-binary opcode");
+    }
+}
+
+Value* Ops::convert(Type to_scalar, Value* v) {
+    if (v->type() == vec_type(to_scalar)) return v;
+    return b_.build_vconvert(vec_type(to_scalar), v);
+}
+
+Value* Ops::bitcast(Type to_scalar, Value* v) {
+    return b_.build_vbitcast(vec_type(to_scalar), v);
+}
+
+// --- Conversions ------------------------------------------------------------
+
+Value* Ops::build_sext_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sext_i64(v);
+    if (Value* m = affine_index(v)) return m;
+    return convert(Type::i64(), v);
+}
+Value* Ops::build_zext_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_zext_i64(v);
+    return b_.build_vand(convert(Type::i64(), v), widen(b_.build_iconst_i64(0xffffffffll)));
+}
+Value* Ops::build_trunc_i32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_trunc_i32(v);
+    return convert(Type::i32(), v);
+}
+Value* Ops::build_fptosi_i32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fptosi_i32(v);
+    return convert(Type::i32(), v);
+}
+Value* Ops::build_fptosi_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fptosi_i64(v);
+    return per_lane(Type::i64(), {v}, [&](std::vector<Value*>& s) { return b_.build_fptosi_i64(s[0]); });
+}
+Value* Ops::build_fptosi_i32_f32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fptosi_i32_f32(v);
+    return convert(Type::i32(), v);
+}
+Value* Ops::build_fptosi_i64_f32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fptosi_i64_f32(v);
+    check_lanes(Type::i64());
+    return per_lane(Type::i64(), {v}, [&](std::vector<Value*>& s) { return b_.build_fptosi_i64_f32(s[0]); });
+}
+Value* Ops::build_sitofp_f64_i32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sitofp_f64_i32(v);
+    return convert(Type::f64(), v);
+}
+Value* Ops::build_sitofp_f64_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sitofp_f64_i64(v);
+    return per_lane(Type::f64(), {v}, [&](std::vector<Value*>& s) { return b_.build_sitofp_f64_i64(s[0]); });
+}
+Value* Ops::build_sitofp_f32_i32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sitofp_f32_i32(v);
+    return convert(Type::f32(), v);
+}
+Value* Ops::build_sitofp_f32_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sitofp_f32_i64(v);
+    return per_lane(Type::f32(), {v}, [&](std::vector<Value*>& s) { return b_.build_sitofp_f32_i64(s[0]); });
+}
+Value* Ops::build_fptrunc_f32_f64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fptrunc_f32_f64(v);
+    return convert(Type::f32(), v);
+}
+Value* Ops::build_fpext_f64_f32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fpext_f64_f32(v);
+    return convert(Type::f64(), v);
+}
+Value* Ops::build_bitcast_i64_f64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_bitcast_i64_f64(v);
+    return bitcast(Type::i64(), v);
+}
+Value* Ops::build_bitcast_f64_i64(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_bitcast_f64_i64(v);
+    return bitcast(Type::f64(), v);
+}
+Value* Ops::build_bitcast_i32_f32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_bitcast_i32_f32(v);
+    return bitcast(Type::i32(), v);
+}
+Value* Ops::build_bitcast_f32_i32(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_bitcast_f32_i32(v);
+    return bitcast(Type::f32(), v);
+}
+
+// --- Arithmetic and logic -----------------------------------------------------
+
+Value* Ops::build_add(Value* a, Value* c) {
+    if (Value* r = affine_bin(Opcode::vadd, a, c)) return r;
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vadd, a, c)) return r;
+    return b_.build_add(a, c);
+}
+Value* Ops::build_sub(Value* a, Value* c) {
+    if (Value* r = affine_bin(Opcode::vsub, a, c)) return r;
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vsub, a, c)) return r;
+    return b_.build_sub(a, c);
+}
+Value* Ops::build_mul(Value* a, Value* c) {
+    if (Value* r = affine_bin(Opcode::vmul, a, c)) return r;
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_mul(a, c);
+    const Type t = merge_type(a, c);
+    if (t.element_type() == Type::i64()) {   // no 64-bit lane multiply in AVX2
+        return per_lane(Type::i64(), {a, c}, [&](std::vector<Value*>& s) { return b_.build_mul(s[0], s[1]); });
+    }
+    return vec_bin(Opcode::vmul, a, c);
+}
+Value* Ops::build_fma(Value* a, Value* c, Value* d) {
+    a = real(a);
+    c = real(c);
+    d = real(d);
+    if (!is_varying(a) && !is_varying(c) && !is_varying(d)) return b_.build_fma(a, c, d);
+    return b_.build_vfma(widen(a), widen(c), widen(d));
+}
+
+// A divisor no lane traps on: 1 where it is 0, or where a / d is MIN / -1
+// (both undefined; the GPU does not trap either).
+Value* Ops::safe_divisor(Value* a, Value* d) {
+    const bool wide = d->type() == Type::i64();
+    Value* zero = wide ? b_.build_iconst_i64(0) : b_.build_iconst_i32(0);
+    Value* one = wide ? b_.build_iconst_i64(1) : b_.build_iconst_i32(1);
+    Value* minus_one = wide ? b_.build_iconst_i64(-1) : b_.build_iconst_i32(-1);
+    Value* min = wide ? b_.build_iconst_i64(INT64_MIN) : b_.build_iconst_i32(INT32_MIN);
+    Value* bad = b_.build_or(b_.build_eq(d, zero), b_.build_and(b_.build_eq(a, min), b_.build_eq(d, minus_one)));
+    return b_.build_select(bad, one, d);
+}
+
+Value* Ops::build_sdiv(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_sdiv(a, c);
+    const Type t = merge_type(a, c);
+    if (t.element_type().is_float()) return vec_bin(Opcode::vdiv, a, c);
+    return per_lane(t.element_type(), {a, c}, [&](std::vector<Value*>& s) {
+        return b_.build_sdiv(s[0], safe_divisor(s[0], s[1]));
+    });
+}
+Value* Ops::build_udiv(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_udiv(a, c);
+    return per_lane(merge_type(a, c).element_type(), {a, c}, [&](std::vector<Value*>& s) {
+        return b_.build_udiv(s[0], safe_divisor(s[0], s[1]));
+    });
+}
+Value* Ops::build_smod(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_smod(a, c);
+    return per_lane(merge_type(a, c).element_type(), {a, c}, [&](std::vector<Value*>& s) {
+        return b_.build_smod(s[0], safe_divisor(s[0], s[1]));
+    });
+}
+Value* Ops::build_umod(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_umod(a, c);
+    return per_lane(merge_type(a, c).element_type(), {a, c}, [&](std::vector<Value*>& s) {
+        return b_.build_umod(s[0], safe_divisor(s[0], s[1]));
+    });
+}
+Value* Ops::build_neg(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_neg(v);
+    return b_.build_vneg(v);
+}
+Value* Ops::build_not(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_not(v);
+    return b_.build_vnot(v);
+}
+Value* Ops::build_and(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vand, a, c)) return r;
+    return b_.build_and(a, c);
+}
+Value* Ops::build_or(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vor, a, c)) return r;
+    return b_.build_or(a, c);
+}
+Value* Ops::build_xor(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vxor, a, c)) return r;
+    return b_.build_xor(a, c);
+}
+
+// The scalar shifts take the amount modulo the width (x64's shl/shr), the
+// vector ones saturate: a varying amount is masked to agree.
+Value* Ops::build_shl(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_shl(a, c);
+    const bool wide = merge_type(a, c).element_type() == Type::i64();
+    return vec_bin(Opcode::vshl, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
+}
+Value* Ops::build_lshr(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_lshr(a, c);
+    const bool wide = merge_type(a, c).element_type() == Type::i64();
+    return vec_bin(Opcode::vlshr, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
+}
+Value* Ops::build_ashr(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (!is_varying(a) && !is_varying(c)) return b_.build_ashr(a, c);
+    const bool wide = merge_type(a, c).element_type() == Type::i64();
+    return vec_bin(Opcode::vashr, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
+}
+Value* Ops::build_sqrt(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_sqrt(v);
+    return b_.build_vsqrt(v);
+}
+Value* Ops::build_floor(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_floor(v);
+    return b_.build_vfloor(v);
+}
+Value* Ops::build_ceil(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_ceil(v);
+    return b_.build_vceil(v);
+}
+Value* Ops::build_round(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_round(v);
+    return b_.build_vround(v);
+}
+Value* Ops::build_fabs(Value* v) {
+    v = real(v);
+    if (!is_varying(v)) return b_.build_fabs(v);
+    const bool wide = is_64(v->type());
+    Value* bits = wide ? widen(b_.build_iconst_i64(0x7fffffffffffffffll)) : widen(b_.build_iconst_i32(0x7fffffff));
+    return b_.build_vand(v, b_.build_vbitcast(v->type(), bits));
+}
+Value* Ops::build_fmin(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vmin, a, c)) return r;
+    return b_.build_fmin(a, c);
+}
+Value* Ops::build_fmax(Value* a, Value* c) {
+    a = real(a);
+    c = real(c);
+    if (Value* r = vec_bin(Opcode::vmax, a, c)) return r;
+    return b_.build_fmax(a, c);
+}
+
+// --- Compares -------------------------------------------------------------------
+
+Value* Ops::scalar_compare(Cmp c, bool u, Value* a, Value* d) {
+    switch (c) {
+        case Cmp::eq: return b_.build_eq(a, d);
+        case Cmp::ne: return b_.build_ne(a, d);
+        case Cmp::lt: return u ? b_.build_ult(a, d) : b_.build_slt(a, d);
+        case Cmp::le: return u ? b_.build_ule(a, d) : b_.build_sle(a, d);
+        case Cmp::gt: return u ? b_.build_ugt(a, d) : b_.build_sgt(a, d);
+        default:      return u ? b_.build_uge(a, d) : b_.build_sge(a, d);
+    }
+}
+
+Value* Ops::compare(Cmp c, bool u, Value* a, Value* d) {
+    a = real(a);
+    d = real(d);
+    if (!is_varying(a) && !is_varying(d)) {
+        Value* r = scalar_compare(c, u, a, d);
+        return vector_mode() ? bool_to_mask(r) : r;
+    }
+    a = widen(a);
+    d = widen(d);
+    if (u && c != Cmp::eq && c != Cmp::ne) {
+        // Unsigned order is signed order with the sign bits flipped.
+        Value* sign = is_64(a->type()) ? widen(b_.build_iconst_i64(INT64_MIN)) : widen(b_.build_iconst_i32(INT32_MIN));
+        a = b_.build_vxor(a, sign);
+        d = b_.build_vxor(d, sign);
+    }
+    const Opcode op = c == Cmp::eq ? Opcode::vcmp_eq : c == Cmp::ne ? Opcode::vcmp_ne
+                    : c == Cmp::lt ? Opcode::vcmp_lt : c == Cmp::le ? Opcode::vcmp_le
+                    : c == Cmp::gt ? Opcode::vcmp_gt : Opcode::vcmp_ge;
+    return narrow_mask(b_.build_vcmp(op, a, d));
+}
+
+Value* Ops::build_eq(Value* a, Value* c) { return compare(Cmp::eq, false, a, c); }
+Value* Ops::build_ne(Value* a, Value* c) { return compare(Cmp::ne, false, a, c); }
+Value* Ops::build_slt(Value* a, Value* c) { return compare(Cmp::lt, false, a, c); }
+Value* Ops::build_sle(Value* a, Value* c) { return compare(Cmp::le, false, a, c); }
+Value* Ops::build_sgt(Value* a, Value* c) { return compare(Cmp::gt, false, a, c); }
+Value* Ops::build_sge(Value* a, Value* c) { return compare(Cmp::ge, false, a, c); }
+Value* Ops::build_ult(Value* a, Value* c) { return compare(Cmp::lt, true, a, c); }
+Value* Ops::build_ule(Value* a, Value* c) { return compare(Cmp::le, true, a, c); }
+Value* Ops::build_ugt(Value* a, Value* c) { return compare(Cmp::gt, true, a, c); }
+Value* Ops::build_uge(Value* a, Value* c) { return compare(Cmp::ge, true, a, c); }
+
+Value* Ops::build_select(Value* c, Value* t, Value* f) {
+    // A uniform choice of two indices of one stride is an index of that stride.
+    if (!is_varying(c) && is_index_marker(t) && is_index_marker(f) && markers_.at(t) == markers_.at(f)) {
+        return mark(b_.build_select(c, t, f), markers_.at(t));
+    }
+    c = real(c);
+    t = real(t);
+    f = real(f);
+    if (!is_varying(c) && !is_varying(t) && !is_varying(f)) return b_.build_select(c, t, f);
+    const Type vt = is_varying(t) ? t->type() : is_varying(f) ? f->type() : vec_type(t->type());
+    return b_.build_vselect(mask_for(c, vt), coerce(t, vt), coerce(f, vt));
+}
+
+// --- Memory ---------------------------------------------------------------------
+
+Value* Ops::build_load(Type t, Value* base, int32_t offset) {
+    return b_.build_load(t, base, offset);
+}
+
+Value* Ops::build_load_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset) {
+    if (is_index_marker(index) && !mask && markers_.at(index) * scale == static_cast<int64_t>(t.size_in_bytes())) {
+        // The lanes' elements are consecutive.
+        check_lanes(t);
+        Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
+        return b_.build_vload(vec_type(t), addr, offset);
+    }
+    if (!is_varying(index) && !is_index_marker(index)) return b_.build_load_indexed(t, base, index, scale, offset);
+    check_lanes(t);
+    Value* out = b_.build_vzero(vec_type(t));
+    for (uint32_t i = 0; i < lanes; ++i) {
+        Value* idx = lane_of(index, i);
+        if (mask) {
+            Value* zero = idx->type() == Type::i64() ? b_.build_iconst_i64(0) : b_.build_iconst_i32(0);
+            idx = b_.build_select(lane_of(mask, i), idx, zero);
+        }
+        out = b_.build_vinsert_lane(out, b_.build_load_indexed(t, base, idx, scale, offset), i);
+    }
+    return out;
+}
+
+void Ops::build_store_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, Value* val) {
+    val = real(val);
+    const bool marker = is_index_marker(index);
+    if (marker && !mask && markers_.at(index) * scale == static_cast<int64_t>(t.size_in_bytes())) {
+        check_lanes(t);
+        Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
+        b_.build_vstore(vec_type(t), addr, offset, widen(val));
+        return;
+    }
+    if (!mask && !marker && !is_varying(index) && !is_varying(val)) {
+        b_.build_store_indexed(t, base, index, scale, offset, val);
+        return;
+    }
+    if (mask && (offset < 0 || offset > 248)) {
+        throw VectorUnsupported("a masked store at offset " + std::to_string(offset));
+    }
+    Value* zero = index->type().element_type() == Type::i64() ? b_.build_iconst_i64(0) : b_.build_iconst_i32(0);
+    if (!marker && !is_varying(index) && !is_varying(val)) {
+        // One store, by any active lane.
+        Value* on = any(mask);
+        b_.build_store_indexed(t, b_.build_select(on, base, scratch), b_.build_select(on, index, zero), scale,
+                               offset, val);
+        return;
+    }
+    check_lanes(t);
+    for (uint32_t i = 0; i < lanes; ++i) {
+        Value* idx = lane_of(index, i);
+        Value* where = base;
+        if (mask) {
+            Value* m = lane_of(mask, i);
+            where = b_.build_select(m, base, scratch);
+            idx = b_.build_select(m, idx, zero);
+        }
+        b_.build_store_indexed(t, where, idx, scale, offset, lane_of(val, i));
+    }
+}
+
+Value* Ops::build_call(std::string_view callee, Type ret, std::initializer_list<Value*> args) {
+    return build_call(callee, ret, std::vector<Value*>(args));
+}
+Value* Ops::build_call(std::string_view callee, Type ret, const std::vector<Value*>& args) {
+    for (Value* a : args) {
+        if (is_varying(a) || is_index_marker(a)) throw VectorUnsupported("a call to " + std::string(callee) + " with varying arguments");
+    }
+    return b_.build_call(callee, ret, args);
+}
+
+} // namespace brokernel::detail

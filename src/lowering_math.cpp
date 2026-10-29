@@ -20,7 +20,7 @@ namespace brokernel::detail {
 namespace {
 
 struct Math {
-    brass::Builder& b;
+    Ops& b;
     bool d; // f64 (else f32)
 
     brass::Value* c(double v) { return d ? b.build_fconst_f64(v) : b.build_fconst_f32(static_cast<float>(v)); }
@@ -327,7 +327,7 @@ struct Math {
 
 } // namespace
 
-brass::Value* lower_transcendental_1(brass::Builder& b, std::string_view name, brass::Value* x, ScalarKind sk) {
+brass::Value* lower_transcendental_1(Ops& b, std::string_view name, brass::Value* x, ScalarKind sk) {
     if (sk != ScalarKind::F32 && sk != ScalarKind::F64) return nullptr;
     Math m{b, sk == ScalarKind::F64};
     if (name == "sin") return m.sin(x);
@@ -346,7 +346,7 @@ brass::Value* lower_transcendental_1(brass::Builder& b, std::string_view name, b
     return nullptr;
 }
 
-brass::Value* lower_transcendental_2(brass::Builder& b, std::string_view name, brass::Value* x, brass::Value* y,
+brass::Value* lower_transcendental_2(Ops& b, std::string_view name, brass::Value* x, brass::Value* y,
                                      ScalarKind sk) {
     if (sk != ScalarKind::F32 && sk != ScalarKind::F64) return nullptr;
     Math m{b, sk == ScalarKind::F64};
@@ -355,7 +355,7 @@ brass::Value* lower_transcendental_2(brass::Builder& b, std::string_view name, b
     return nullptr;
 }
 
-brass::Value* lower_float_class(brass::Builder& b, std::string_view name, brass::Value* x, ScalarKind sk) {
+brass::Value* lower_float_class(Ops& b, std::string_view name, brass::Value* x, ScalarKind sk) {
     if (sk != ScalarKind::F32 && sk != ScalarKind::F64) return b.build_iconst_i32(0);
     Math m{b, sk == ScalarKind::F64};
     return name == "isnan" ? m.is_nan(x) : m.is_inf(x);

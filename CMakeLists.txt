@@ -39,6 +39,7 @@ add_library(brokernel STATIC
     src/lowering_mir.cpp
     src/lowering_expr.cpp
     src/lowering_math.cpp
+    src/lowering_ops.cpp
 )
 add_library(brokernel::brokernel ALIAS brokernel)
 target_include_directories(brokernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

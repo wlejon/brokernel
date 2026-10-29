@@ -312,12 +312,13 @@ bool CompiledKernel::dispatch_cpu(
         return_store_out != nullptr ? 1 : 0,
     };
 
-    // With no return store every cell's return is written to one scratch
-    // element (the grid loop selects index 0 rather than branching).
+    // With no return store the cells' returns are written to scratch elements
+    // 0 .. cpu_grid_lanes - 1 (the grid loop selects that index rather than
+    // branching).
     std::vector<uint64_t> scratch_ret;
     void* ret_ptr = return_store_out;
     if (!ret_ptr) {
-        scratch_ret.resize((std::max<size_t>(return_byte_size, 8) + 7) / 8);
+        scratch_ret.resize((std::max<size_t>(return_byte_size, 8) * cpu_grid_lanes + 7) / 8);
         ret_ptr = scratch_ret.data();
     }
 
@@ -828,6 +829,7 @@ CompileResult Compiler::compile_source(
 
                 brass::codegen::KernelJit jit_grid(kopts);
                 ck.cpu_grid_fn = jit_grid.compile(*lowered.cpu_grid_function);
+                ck.cpu_grid_lanes = lowered.cpu_grid_lanes ? lowered.cpu_grid_lanes : 1;
             }
         } catch (const std::exception& ex) {
             res.diagnostics.error(fn->span, std::string("backend compilation error: ") + ex.what());

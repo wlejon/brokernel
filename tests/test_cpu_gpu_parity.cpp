@@ -2,6 +2,8 @@
 
 #include "brokernel/brokernel.h"
 
+#include <brass/target/host_cpu.hpp>
+
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
@@ -231,6 +233,69 @@ static void test_3d_voxel_and_control_flow_parity() {
     }
 }
 
+// The CPU grid loop's vector build: 8 lanes for f32 work, 4 for f64, on a
+// ragged width (the scalar remainder), with varying branches and a loop
+// whose trip count differs per lane; and a return kernel dispatched with no
+// return store (the lanes write scratch).
+static void test_vector_grid_lanes() {
+    const char* src = R"(
+        @kernel @grid(2)
+        fn k_f32(g: grid<2>, src: read_store<f32, 2>, out: write_store<f32, 2>, k: f32) -> f32 {
+            let x = g.x();
+            let y = g.y();
+            var v: f32 = src[x, y] * k;
+            if (v > 0.5) { v = v - 1.0; } else { v = v * 2.0; }
+            var n: i32 = 0;
+            for (var i: i32 = 0; i < (x & 7); i += 1) { n += i * 3 + y; }
+            out[x, y] = v + f32(n);
+            return v * 0.5;
+        }
+        @kernel @grid(2)
+        fn k_f64(g: grid<2>, out: write_store<f64, 2>) {
+            let x = g.x();
+            let p = f64(x) * 0.25 + f64(g.y());
+            out[x, g.y()] = select((x % 3) == 1, -p, p * p);
+        }
+    )";
+    auto res = compile_source(src, "vector_grid.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k32 = res.find_kernel("k_f32");
+    const auto* k64 = res.find_kernel("k_f64");
+    assert(k32 && k64);
+    if (brass::host_has_avx2()) {
+        assert(k32->cpu_grid_lanes == 8);
+        assert(k64->cpu_grid_lanes == 4);
+    }
+    const uint32_t W = 37, H = 5;
+    std::vector<float> src_v(W * H);
+    for (uint32_t i = 0; i < W * H; ++i) src_v[i] = static_cast<float>((i * 37) % 101) / 101.0f;
+    std::vector<float> out_cpu(W * H, -9.0f), out_gpu(W * H, -9.0f);
+    std::vector<float> ret_cpu(W * H, -9.0f), ret_gpu(W * H, -9.0f);
+    std::string err;
+    {
+        std::vector<KernelArg> args = {KernelArg::store(src_v), KernelArg::store(out_cpu), KernelArg(0.8f)};
+        assert(k32->dispatch_cpu(GridShape(W, H), args, ret_cpu.data(), &err));
+        std::vector<float> dummy(W * H, -9.0f);
+        std::vector<KernelArg> args2 = {KernelArg::store(src_v), KernelArg::store(dummy), KernelArg(0.8f)};
+        assert(k32->dispatch_cpu(GridShape(W, H), args2, nullptr, &err));
+        assert(dummy == out_cpu);
+    }
+    {
+        std::vector<KernelArg> args = {KernelArg::store(src_v), KernelArg::store(out_gpu), KernelArg(0.8f)};
+        assert(k32->dispatch_gpu(GridShape(W, H), args, ret_gpu.data(), &err));
+    }
+    for (uint32_t i = 0; i < W * H; ++i) {
+        assert(std::abs(out_cpu[i] - out_gpu[i]) <= 1e-5f);
+        assert(std::abs(ret_cpu[i] - ret_gpu[i]) <= 1e-5f);
+    }
+    std::vector<double> d(W * H, -9.0);
+    std::vector<KernelArg> dargs = {KernelArg::store(d)};
+    auto rep = k64->compare_cpu_gpu(GridShape(W, H), dargs, 1e-12, 1e-12);
+    if (!rep.ok) std::cerr << "f64 vector grid parity failed: " << rep.message << "\n";
+    assert(rep.ok);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -240,6 +305,7 @@ int main() {
     test_simplex3d_range_and_parity();
     test_stencil_diffusion_f64_and_point_query();
     test_3d_voxel_and_control_flow_parity();
+    test_vector_grid_lanes();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

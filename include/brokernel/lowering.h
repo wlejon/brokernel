@@ -43,6 +43,9 @@ struct LoweredKernelMir {
     std::unique_ptr<brass::Module> cpu_module;
     brass::Function* cpu_point_function = nullptr;
     brass::Function* cpu_grid_function = nullptr;
+    // The cells the grid function runs at once along x: 8 or 4 (AVX2 lanes),
+    // 0 when it runs one cell at a time.
+    uint32_t cpu_grid_lanes = 0;
 
     std::vector<KernelParamInfo> param_infos;
     uint32_t grid_dim_mir_index = UINT32_MAX;   // Index of __grid_w in GPU MIR params (if grid_dim > 0)

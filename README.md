@@ -68,8 +68,23 @@ general graphics:
   fold to constants at check time, so a generic body can branch on its
   scalar; `bitcast<T>(x)` reinterprets a value's bits as a type of the same
   width (f32 / i32 / u32, f64 / i64 / u64).
-- **CPU builds are for compute kernels.** The CPU runs a kernel cell by cell,
-  as a subgroup and workgroup of one:
+- **The CPU's grid loop is vectorized on AVX2 hosts** (`src/lowering_ops.*`),
+  ISPC-style, 8 cells along x at a time, or 4 when a varying value is 64-bit
+  (f64 work):
+  - A value is uniform (a scalar, the same for every cell) or varying (a
+    brass vector). Bools are lane masks.
+  - A varying `if` runs both arms under masks and merges by select. A loop
+    runs while any lane is still in it. Integer division, 64-bit multiplies
+    and gathers go lane by lane.
+  - An index of the form base + lane × stride (a store read or written at
+    `g.x()`) keeps a uniform 64-bit base. Its loads and stores are
+    contiguous vector ones, or lane by lane at scalar addresses.
+  - A row's last `width % lanes` cells run one at a time.
+  - A kernel with a call on varying arguments or an atomic runs every cell
+    one at a time, as do non-AVX2 hosts. `CompiledKernel::cpu_grid_lanes`
+    says which build it got.
+- **CPU builds are for compute kernels.** The CPU runs a kernel as a subgroup
+  and workgroup of one:
   - The subgroup operations are the identity there.
   - Vertex and fragment stages have no CPU build. Neither do kernels that
     cooperate through barriers or shared memory.

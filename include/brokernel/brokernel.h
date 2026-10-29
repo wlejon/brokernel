@@ -244,6 +244,9 @@ public:
 
     brass::codegen::KernelFunction cpu_point_fn;
     brass::codegen::KernelFunction cpu_grid_fn;
+    // Cells the grid function computes per step along x: 8 or 4 (AVX2
+    // lanes), or 1 when it runs one cell at a time.
+    uint32_t cpu_grid_lanes = 1;
 
     bool valid() const noexcept {
         return !spirv.words.empty() || cpu_point_fn.is_valid() || cpu_grid_fn.is_valid();
