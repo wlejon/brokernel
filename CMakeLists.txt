@@ -45,6 +45,19 @@ add_library(brokernel::brokernel ALIAS brokernel)
 target_include_directories(brokernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(brokernel PUBLIC brass)
 
+# --- The bronze JavaScript API (bro.kernel) ---
+# Off unless asked for: bro, the one consumer that wants it, forces
+# BROKERNEL_ENABLE_API ON, so nothing else needs bronze checked out.
+option(BROKERNEL_ENABLE_API "Build the bronze JavaScript API (bro.kernel)" OFF)
+if(BROKERNEL_ENABLE_API)
+    # bronze (with brass, its code generator) through cmake/bro_deps.cmake: an
+    # outer project's target, else ../bronze beside the top-level project, else
+    # the head of its main, fetched at configure.
+    bro_dependency(bronze GITHUB wlejon/bronze TARGET bronze_runtime_shared
+                   OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
+    add_subdirectory(src/api)
+endif()
+
 if(BROKERNEL_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
