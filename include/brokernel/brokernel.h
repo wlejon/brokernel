@@ -57,6 +57,7 @@ public:
         F32,
         F64,
         Buffer,      // Host pointer + byte size (for store / stencil)
+        Device,      // Device address + byte size + capacity (a store on a GPU, gpu_launch)
         ScalarsF32,  // Multi-component f32 vector/struct
         ScalarsF64,  // Multi-component f64 vector/struct
         ScalarsI32,  // Multi-component i32 vector/struct
@@ -85,6 +86,19 @@ public:
         a.ptr_ = const_cast<void*>(data);
         a.byte_size_ = byte_size;
         a.read_only_ = true;
+        return a;
+    }
+
+    // A store in GPU memory, for gpu_launch: its device address, its bytes
+    // (its elements are bytes / the element size) and the bytes behind the
+    // address, at least one element even for an empty store (a bounded access
+    // outside the store still reads element 0 and discards it).
+    static KernelArg device(uint64_t address, size_t byte_size, size_t capacity) noexcept {
+        KernelArg a;
+        a.kind_ = Kind::Device;
+        a.u64_ = address;
+        a.byte_size_ = byte_size;
+        a.capacity_ = capacity;
         return a;
     }
 
@@ -174,6 +188,8 @@ public:
     void* buffer_ptr() const noexcept { return ptr_; }
     size_t buffer_bytes() const noexcept { return byte_size_; }
     bool is_read_only() const noexcept { return read_only_; }
+    uint64_t device_address() const noexcept { return kind_ == Kind::Device ? u64_ : 0; }
+    size_t device_capacity() const noexcept { return capacity_; }
 
     const std::vector<float>& f32_values() const noexcept { return f32_vals_; }
     const std::vector<double>& f64_values() const noexcept { return f64_vals_; }
@@ -186,6 +202,7 @@ private:
     double f64_ = 0.0;
     void* ptr_ = nullptr;
     size_t byte_size_ = 0;
+    size_t capacity_ = 0;
     bool read_only_ = false;
     std::vector<float> f32_vals_;
     std::vector<double> f64_vals_;
@@ -217,6 +234,16 @@ struct CompileOptions {
     bool compile_cpu = true;
     bool verify_spirv_equivalence = false;
     int opt_level = 2;
+};
+
+/// One GPU dispatch of a kernel (CompiledKernel::gpu_launch): its arguments in
+/// SpirvKernel::params order, the workgroups, and the workgroup size (the
+/// kernel's local size, given to the pipeline as specialization constants 0..2
+/// when SpirvKernel::local_size_spec_constants).
+struct GpuLaunch {
+    std::vector<brass::gpu::VulkanArg> args;
+    uint32_t groups[3] = {1, 1, 1};
+    uint32_t local_size[3] = {1, 1, 1};
 };
 
 /// One compiled kernel with its SPIR-V binary, CPU native builds, and reflection metadata.
@@ -332,6 +359,24 @@ public:
     // -----------------------------------------------------------------------
     // GPU (Vulkan) Dispatch & Point Evaluation
     // -----------------------------------------------------------------------
+
+    // A dispatch on a device the caller owns: `args` with every store a
+    // KernelArg::device, `return_address` the buffer of the per-cell returns
+    // (gpu_return_bytes; ignored for a kernel that returns nothing). Fills
+    // `out` with the push-constant arguments (brass::gpu::pack_push_constants
+    // packs them into the SPIR-V's block) and the workgroups; checks what
+    // dispatch_gpu checks (argument count and kinds, a store accessed at the
+    // cells covering the grid). dispatch_gpu runs on brass's own device
+    // through it.
+    bool gpu_launch(
+        GridShape shape,
+        std::span<const KernelArg> args,
+        uint64_t return_address,
+        GpuLaunch& out,
+        std::string* err = nullptr) const;
+    // Bytes of the per-cell returns of a dispatch over `shape` (0 for a kernel
+    // that returns nothing).
+    size_t gpu_return_bytes(GridShape shape) const noexcept;
 
     bool dispatch_gpu(
         GridShape shape,

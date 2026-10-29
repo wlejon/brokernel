@@ -377,21 +377,24 @@ bool CompiledKernel::dispatch_cpu(
 // GPU (Vulkan) Dispatch & Evaluation
 // ---------------------------------------------------------------------------
 
-bool CompiledKernel::dispatch_gpu(
+size_t CompiledKernel::gpu_return_bytes(GridShape shape) const noexcept {
+    if (return_type.is_void()) return 0;
+    const size_t cells = grid_dim > 0 ? shape.total_points() : 1;
+    return cells * std::max<size_t>(return_byte_size, 4);
+}
+
+bool CompiledKernel::gpu_launch(
     GridShape shape,
     std::span<const KernelArg> args,
-    void* return_store_out,
+    uint64_t return_address,
+    GpuLaunch& out,
     std::string* err) const {
     if (stage != Stage::Compute) {
-        if (err) *err = "dispatch_gpu is only supported for @compute / @kernel stages";
+        if (err) *err = "a GPU dispatch is only supported for @compute / @kernel stages";
         return false;
     }
     if (spirv.words.empty()) {
         if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
-        return false;
-    }
-    if (!brass::gpu::vulkan_available()) {
-        if (err) *err = "no Vulkan compute device available";
         return false;
     }
 
@@ -402,6 +405,96 @@ bool CompiledKernel::dispatch_gpu(
             *err = "kernel '" + name + "' expects " + std::to_string(non_grid) +
                    " argument(s), got " + std::to_string(args.size());
         }
+        return false;
+    }
+
+    std::vector<brass::gpu::VulkanArg>& vk_args = out.args;
+    vk_args.clear();
+    size_t arg_idx = 0;
+    for (const auto& p : params) {
+        if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
+            if (!skip_domain_args) ++arg_idx;
+            continue;
+        }
+        const KernelArg& a = args[arg_idx++];
+        if (p.role == ParamRole::Store || p.role == ParamRole::Stencil) {
+            if (a.kind() != KernelArg::Kind::Device || !a.device_address()) {
+                if (err) *err = "parameter '" + p.name + "' requires a GPU store argument";
+                return false;
+            }
+            const size_t need = std::max<size_t>(a.buffer_bytes(), p.element_bytes);
+            if (a.device_capacity() < need) {
+                if (err) {
+                    *err = "store '" + p.name + "' has " + std::to_string(a.device_capacity()) +
+                           " byte(s) behind its address; it needs " + std::to_string(need);
+                }
+                return false;
+            }
+            if (!store_covers(p, a, shape, err)) return false;
+            vk_args.emplace_back(a.device_address());
+            vk_args.emplace_back(static_cast<int64_t>(store_count(p, a)));
+        } else if (p.role == ParamRole::Scalar) {
+            switch (p.type.scalar) {
+                case ScalarKind::F32: vk_args.emplace_back(a.as_f32()); break;
+                case ScalarKind::F64: vk_args.emplace_back(a.as_f64()); break;
+                case ScalarKind::U32: vk_args.emplace_back(a.as_u32()); break;
+                case ScalarKind::U64: vk_args.emplace_back(a.as_u64()); break;
+                case ScalarKind::I64: vk_args.emplace_back(a.as_i64()); break;
+                default: vk_args.emplace_back(a.as_i32()); break;
+            }
+        } else {
+            // Vector or Struct flattened into scalar push constants
+            if (a.kind() == KernelArg::Kind::ScalarsF32) {
+                for (float v : a.f32_values()) vk_args.emplace_back(v);
+            } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
+                for (double v : a.f64_values()) vk_args.emplace_back(v);
+            } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
+                for (int32_t v : a.i32_values()) vk_args.emplace_back(v);
+            } else {
+                for (uint32_t k = 0; k < p.mir_param_count; ++k) {
+                    if (p.type.scalar == ScalarKind::F64) vk_args.emplace_back(a.as_f64());
+                    else if (p.type.scalar == ScalarKind::F32) vk_args.emplace_back(a.as_f32());
+                    else vk_args.emplace_back(a.as_i32());
+                }
+            }
+        }
+    }
+
+    // Implicit grid extent arguments (__grid_w, __grid_h, __grid_d)
+    const uint32_t w = std::max(1u, shape.width);
+    const uint32_t h = std::max(1u, shape.height);
+    const uint32_t d = std::max(1u, shape.depth);
+    if (grid_dim >= 1) vk_args.emplace_back(static_cast<int32_t>(w));
+    if (grid_dim >= 2) vk_args.emplace_back(static_cast<int32_t>(h));
+    if (grid_dim >= 3) vk_args.emplace_back(static_cast<int32_t>(d));
+
+    // Implicit output buffer argument (__out) when return_type != void
+    if (!return_type.is_void()) {
+        if (!return_address) {
+            if (err) *err = "kernel '" + name + "' returns a value per cell; its dispatch needs a return buffer";
+            return false;
+        }
+        vk_args.emplace_back(return_address);
+    }
+
+    for (int i = 0; i < 3; ++i) out.local_size[i] = std::max(1u, local_size[i]);
+    out.groups[0] = (grid_dim >= 1) ? (w + out.local_size[0] - 1) / out.local_size[0] : 1;
+    out.groups[1] = (grid_dim >= 2) ? (h + out.local_size[1] - 1) / out.local_size[1] : 1;
+    out.groups[2] = (grid_dim >= 3) ? (d + out.local_size[2] - 1) / out.local_size[2] : 1;
+    return true;
+}
+
+bool CompiledKernel::dispatch_gpu(
+    GridShape shape,
+    std::span<const KernelArg> args,
+    void* return_store_out,
+    std::string* err) const {
+    if (spirv.words.empty()) {
+        if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
+        return false;
+    }
+    if (!brass::gpu::vulkan_available()) {
+        if (err) *err = "no Vulkan compute device available";
         return false;
     }
 
@@ -431,75 +524,44 @@ bool CompiledKernel::dispatch_gpu(
         std::vector<BoundBuffer> bound_buffers;
         bound_buffers.reserve(params.size() + 1);
 
-        std::vector<brass::gpu::VulkanArg> vk_args;
+        // Each host store goes into a buffer of brass's device, and its
+        // argument becomes that buffer's address.
+        std::vector<KernelArg> dev_args(args.begin(), args.end());
+        const size_t non_grid = count_non_grid_params(params);
+        const bool skip_domain_args = (args.size() == non_grid && params.size() != non_grid);
         size_t arg_idx = 0;
         for (const auto& p : params) {
             if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
                 if (!skip_domain_args) ++arg_idx;
                 continue;
             }
-            const KernelArg& a = args[arg_idx++];
-            if (p.role == ParamRole::Store || p.role == ParamRole::Stencil) {
-                if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
-                    if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
-                    return false;
-                }
-                if (!store_covers(p, a, shape, err)) return false;
-                // Room for element 0 however small the store (Ops::Bound).
-                size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
-                BoundBuffer bb;
-                bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
-                bb.host_ptr = a.buffer_ptr();
-                bb.byte_size = a.buffer_bytes();
-                bb.write_back = (p.role == ParamRole::Store && can_Write(p.access) && !a.is_read_only());
-                if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
-                    bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
-                } else {
-                    bb.dev_buf.zero();
-                }
-                bound_buffers.push_back(std::move(bb));
-                vk_args.emplace_back(bound_buffers.back().dev_buf);
-                vk_args.emplace_back(static_cast<int64_t>(store_count(p, a)));
-            } else if (p.role == ParamRole::Scalar) {
-                switch (p.type.scalar) {
-                    case ScalarKind::F32: vk_args.emplace_back(a.as_f32()); break;
-                    case ScalarKind::F64: vk_args.emplace_back(a.as_f64()); break;
-                    case ScalarKind::U32: vk_args.emplace_back(a.as_u32()); break;
-                    case ScalarKind::U64: vk_args.emplace_back(a.as_u64()); break;
-                    case ScalarKind::I64: vk_args.emplace_back(a.as_i64()); break;
-                    default: vk_args.emplace_back(a.as_i32()); break;
-                }
-            } else {
-                // Vector or Struct flattened into scalar push constants
-                if (a.kind() == KernelArg::Kind::ScalarsF32) {
-                    for (float v : a.f32_values()) vk_args.emplace_back(v);
-                } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
-                    for (double v : a.f64_values()) vk_args.emplace_back(v);
-                } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
-                    for (int32_t v : a.i32_values()) vk_args.emplace_back(v);
-                } else {
-                    for (uint32_t k = 0; k < p.mir_param_count; ++k) {
-                        if (p.type.scalar == ScalarKind::F64) vk_args.emplace_back(a.as_f64());
-                        else if (p.type.scalar == ScalarKind::F32) vk_args.emplace_back(a.as_f32());
-                        else vk_args.emplace_back(a.as_i32());
-                    }
-                }
+            const size_t i = arg_idx++;
+            if (i >= args.size()) break;  // gpu_launch reports the count
+            if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
+            const KernelArg& a = args[i];
+            if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
+                if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
+                return false;
             }
+            if (!store_covers(p, a, shape, err)) return false;
+            // Room for element 0 however small the store (Ops::Bound).
+            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
+            BoundBuffer bb;
+            bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
+            bb.host_ptr = a.buffer_ptr();
+            bb.byte_size = a.buffer_bytes();
+            bb.write_back = (p.role == ParamRole::Store && can_Write(p.access) && !a.is_read_only());
+            if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
+                bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
+            } else {
+                bb.dev_buf.zero();
+            }
+            bound_buffers.push_back(std::move(bb));
+            dev_args[i] = KernelArg::device(bound_buffers.back().dev_buf.device_address(), a.buffer_bytes(), bytes);
         }
 
-        // Implicit grid extent arguments (__grid_w, __grid_h, __grid_d)
-        uint32_t w = std::max(1u, shape.width);
-        uint32_t h = std::max(1u, shape.height);
-        uint32_t d = std::max(1u, shape.depth);
-        if (grid_dim >= 1) vk_args.emplace_back(static_cast<int32_t>(w));
-        if (grid_dim >= 2) vk_args.emplace_back(static_cast<int32_t>(h));
-        if (grid_dim >= 3) vk_args.emplace_back(static_cast<int32_t>(d));
-
-        // Implicit output buffer argument (__out) when return_type != void
-        size_t ret_total_bytes = 0;
-        if (!return_type.is_void()) {
-            size_t num_pts = (grid_dim > 0) ? shape.total_points() : 1;
-            ret_total_bytes = num_pts * std::max<size_t>(return_byte_size, 4);
+        uint64_t return_address = 0;
+        if (const size_t ret_total_bytes = gpu_return_bytes(shape)) {
             BoundBuffer ret_bb;
             ret_bb.dev_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_total_bytes, 16));
             ret_bb.dev_buf.zero();
@@ -507,25 +569,19 @@ bool CompiledKernel::dispatch_gpu(
             ret_bb.byte_size = ret_total_bytes;
             ret_bb.write_back = (return_store_out != nullptr);
             bound_buffers.push_back(std::move(ret_bb));
-            vk_args.emplace_back(bound_buffers.back().dev_buf);
+            return_address = bound_buffers.back().dev_buf.device_address();
         }
 
-        uint32_t lx = std::max(1u, local_size[0]);
-        uint32_t ly = std::max(1u, local_size[1]);
-        uint32_t lz = std::max(1u, local_size[2]);
-        uint32_t gx = (grid_dim >= 1) ? (w + lx - 1) / lx : 1;
-        uint32_t gy = (grid_dim >= 2) ? (h + ly - 1) / ly : 1;
-        uint32_t gz = (grid_dim >= 3) ? (d + lz - 1) / lz : 1;
+        GpuLaunch launch;
+        if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
 
         brass::gpu::VulkanDispatch disp;
-        disp.grid[0] = gx;
-        disp.grid[1] = gy;
-        disp.grid[2] = gz;
-        disp.block[0] = lx;
-        disp.block[1] = ly;
-        disp.block[2] = lz;
+        for (int i = 0; i < 3; ++i) {
+            disp.grid[i] = launch.groups[i];
+            disp.block[i] = launch.local_size[i];
+        }
 
-        if (!vk.launch(disp, vk_args, &vk_err)) {
+        if (!vk.launch(disp, launch.args, &vk_err)) {
             if (err) *err = vk_err;
             return false;
         }
