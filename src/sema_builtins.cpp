@@ -584,7 +584,10 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
             ctx.diags.error(e->span, "'select(cond, a, b)' expects 3 arguments");
             return Type::f32();
         }
-        check_expr(e->args[0].get(), Type::bool_type());
+        Type ct = check_expr(e->args[0].get(), Type::bool_type());
+        if (!ct.is_bool()) {
+            ctx.diags.error(e->args[0]->span, "'select(cond, a, b)': cond is a " + ct.to_string() + ", not a bool");
+        }
         check_expr(e->args[1].get(), expected);
         check_expr(e->args[2].get(), expected);
         if (!coerce_expr_to_type(e->args[2].get(), e->args[1]->resolved_type)) {
