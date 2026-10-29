@@ -450,6 +450,33 @@ bool CompiledKernel::gpu_launch(
                 for (double v : a.f64_values()) vk_args.emplace_back(v);
             } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
                 for (int32_t v : a.i32_values()) vk_args.emplace_back(v);
+            } else if (a.kind() == KernelArg::Kind::Buffer && a.buffer_ptr()) {
+                // The leaves from raw host bytes, as pack_cpu_args reads them,
+                // each as its push constant's kind.
+                const auto* raw = static_cast<const uint8_t*>(a.buffer_ptr());
+                uint32_t elem_sz = p.type.scalar_size_bytes();
+                if (elem_sz == 0) elem_sz = 4;
+                for (uint32_t k = 0; k < p.mir_param_count; ++k) {
+                    uint64_t word = 0;
+                    const size_t off = size_t{k} * elem_sz;
+                    if (off + elem_sz <= a.buffer_bytes()) std::memcpy(&word, raw + off, elem_sz);
+                    const size_t leaf = p.mir_param_index + k;
+                    const brass::Type lt = leaf < spirv.params.size() ? spirv.params[leaf].type : brass::Type();
+                    if (lt.kind() == brass::TypeKind::F32) {
+                        float f;
+                        const uint32_t bits = static_cast<uint32_t>(word);
+                        std::memcpy(&f, &bits, 4);
+                        vk_args.emplace_back(f);
+                    } else if (lt.kind() == brass::TypeKind::F64) {
+                        double f;
+                        std::memcpy(&f, &word, 8);
+                        vk_args.emplace_back(f);
+                    } else if (lt.is_i32()) {
+                        vk_args.emplace_back(static_cast<uint32_t>(word));
+                    } else {
+                        vk_args.emplace_back(word);
+                    }
+                }
             } else {
                 for (uint32_t k = 0; k < p.mir_param_count; ++k) {
                     if (p.type.scalar == ScalarKind::F64) vk_args.emplace_back(a.as_f64());

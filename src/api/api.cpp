@@ -20,6 +20,10 @@ namespace {
 
 ev::HostClass g_moduleClass;
 ev::HostClass g_kernelClass;
+ev::HostClass g_bufferClass;
+
+// The device this thread's realms dispatch on (setGpuDevice).
+thread_local std::shared_ptr<GpuDevice> t_device;
 
 struct ModuleHandle {
     std::shared_ptr<const CompileResult> result;
@@ -27,6 +31,11 @@ struct ModuleHandle {
 
 struct KernelHandle {
     std::shared_ptr<const CompiledKernel> kernel;  // aliases its CompileResult
+    std::shared_ptr<GpuProgram> program;           // its pipeline, made at the first dispatch
+};
+
+struct BufferHandle {
+    std::shared_ptr<GpuBuffer> buffer;
 };
 
 const CompiledKernel* unwrapKernel(Value self) {
@@ -111,10 +120,11 @@ KernelArg scalarArg(ScalarKind sk, Value v) {
 // typed-array pointer contract (embed_typed_array.h): the constructor reads
 // every value (numbers, arrays of them, a vector's bytes), then bind() takes
 // the stores' pointers last, with nothing allocating between them and the
-// dispatch. A bad argument throws, naming the call.
+// dispatch. A bad argument throws, naming the call. For a GPU dispatch
+// (`gpu`) a store is a KernelBuffer, and nothing needs binding.
 class ArgPack {
 public:
-    ArgPack(const CompiledKernel& k, std::span<const Value> js, const std::string& what) {
+    ArgPack(const CompiledKernel& k, std::span<const Value> js, const std::string& what, bool gpu = false) {
         size_t passed = 0;
         for (const auto& p : k.params) passed += isPassed(p) ? 1 : 0;
         if (js.size() != passed) {
@@ -127,7 +137,12 @@ public:
         for (const auto& p : k.params) {
             if (!isPassed(p)) continue;
             const Value v = js[i];
-            if (isStore(p)) {
+            if (isStore(p) && gpu) {
+                std::shared_ptr<GpuBuffer> b = bufferOf(v);
+                if (!b) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a KernelBuffer");
+                args_[i] = KernelArg::device(b->address(), b->bytes(), b->capacity());
+                buffers_.push_back(std::move(b));
+            } else if (isStore(p)) {
                 if (!ev::isTypedArray(v)) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a typed array");
                 const Type elem = p.type.element_type();
                 const auto want = elem.is_scalar() ? elementKindOf(elem.scalar) : std::nullopt;
@@ -190,8 +205,12 @@ public:
         return args_;
     }
 
+    // A GPU dispatch's arguments (its stores are buffers' addresses).
+    std::span<const KernelArg> gpuArgs() const { return args_; }
+
 private:
     std::vector<KernelArg> args_;
+    std::vector<std::shared_ptr<GpuBuffer>> buffers_;  // a GPU dispatch's stores, held across it
     std::vector<size_t> stores_;
     std::vector<std::vector<uint8_t>> bytes_;
 };
@@ -252,10 +271,10 @@ Value js_eval(Value self, std::span<const Value> args) {
 }
 
 // The grid shape `v` names: a width, or [width, height, depth].
-GridShape shapeArg(Value v, const CompiledKernel& k) {
-    auto extent = [](Value e) -> uint32_t {
+GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
+    auto extent = [&](Value e) -> uint32_t {
         const double d = ev::toDouble(e);
-        if (!(d >= 1.0) || d > 4294967295.0) ev::throwRangeError("Kernel.run: a grid extent is a positive integer");
+        if (!(d >= 1.0) || d > 4294967295.0) ev::throwRangeError(what + ": a grid extent is a positive integer");
         return static_cast<uint32_t>(d);
     };
     GridShape s;
@@ -263,15 +282,15 @@ GridShape shapeArg(Value v, const CompiledKernel& k) {
         s.width = extent(v);
     } else if (ev::isObject(v)) {
         const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
-        if (n < 1 || n > 3) ev::throwTypeError("Kernel.run: the grid is [width, height, depth] (1 to 3 extents)");
+        if (n < 1 || n > 3) ev::throwTypeError(what + ": the grid is [width, height, depth] (1 to 3 extents)");
         s.width = extent(ev::getElement(v, 0));
         if (n >= 2) s.height = extent(ev::getElement(v, 1));
         if (n >= 3) s.depth = extent(ev::getElement(v, 2));
     } else {
-        ev::throwTypeError("Kernel.run: the grid is a width or [width, height, depth]");
+        ev::throwTypeError(what + ": the grid is a width or [width, height, depth]");
     }
     if ((s.height > 1 && k.grid_dim < 2) || (s.depth > 1 && k.grid_dim < 3)) {
-        ev::throwTypeError("Kernel.run: '" + k.name + "' is a " + std::to_string(k.grid_dim) + "D grid kernel");
+        ev::throwTypeError(what + ": '" + k.name + "' is a " + std::to_string(k.grid_dim) + "D grid kernel");
     }
     return s;
 }
@@ -285,7 +304,7 @@ Value js_run(Value self, std::span<const Value> args) {
     if (k->grid_dim == 0) return ev::throwTypeError("Kernel.run: '" + k->name + "' is a point kernel; use eval()");
     if (!k->cpu_grid_fn.is_valid()) return ev::throwTypeError("Kernel.run: '" + k->name + "' has no CPU build");
     if (args.empty()) return ev::throwTypeError("Kernel.run: the first argument is the grid");
-    const GridShape shape = shapeArg(args[0], *k);
+    const GridShape shape = shapeArg(args[0], *k, "Kernel.run");
     const std::span<const Value> kargs = args.subspan(1);
     ArgPack pack(*k, kargs, "Kernel.run");
 
@@ -313,6 +332,131 @@ Value js_run(Value self, std::span<const Value> args) {
     return ev::undefined();
 }
 
+Value makeBuffer(std::shared_ptr<GpuBuffer> buffer) {
+    auto handle = std::make_unique<BufferHandle>();
+    handle->buffer = std::move(buffer);
+    return g_bufferClass.createInstance(std::move(handle));
+}
+
+// kernel.dispatch(grid, ...args): a grid kernel over its grid, on the GPU,
+// after every dispatch so far. Its stores are KernelBuffers; a kernel that
+// returns a value returns a new KernelBuffer of one value per cell.
+Value js_dispatch(Value self, std::span<const Value> args) {
+    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    if (!h) return ev::throwTypeError("Kernel.dispatch: invalid receiver");
+    const CompiledKernel& k = *h->kernel;
+    if (!t_device || !t_device->available()) {
+        return ev::throwError("Kernel.dispatch: this realm has no GPU device (bro.kernel.gpu is false)");
+    }
+    if (k.grid_dim == 0) return ev::throwTypeError("Kernel.dispatch: '" + k.name + "' is a point kernel; use eval()");
+    if (args.empty()) return ev::throwTypeError("Kernel.dispatch: the first argument is the grid");
+    const GridShape shape = shapeArg(args[0], k, "Kernel.dispatch");
+    ArgPack pack(k, args.subspan(1), "Kernel.dispatch", /*gpu=*/true);
+
+    std::string err;
+    if (!h->program) {
+        h->program = t_device->createProgram(k, &err);
+        if (!h->program) return ev::throwError("Kernel.dispatch: " + err);
+    }
+    std::shared_ptr<GpuBuffer> returns;
+    if (const size_t bytes = k.gpu_return_bytes(shape)) {
+        returns = t_device->createBuffer(bytes, &err);
+        if (!returns) return ev::throwError("Kernel.dispatch: " + err);
+    }
+    GpuLaunch launch;
+    if (!k.gpu_launch(shape, pack.gpuArgs(), returns ? returns->address() : 0, launch, &err) ||
+        !t_device->dispatch(*h->program, k, launch, &err)) {
+        return ev::throwError("Kernel.dispatch: " + err);
+    }
+    return returns ? makeBuffer(std::move(returns)) : ev::undefined();
+}
+
+// A byte offset argument (default 0).
+size_t offsetArg(std::span<const Value> args, size_t i, const std::string& what) {
+    if (args.size() <= i || ev::isUndefined(args[i])) return 0;
+    const double d = ev::toDouble(args[i]);
+    if (!(d >= 0.0) || d != static_cast<double>(static_cast<uint64_t>(d))) {
+        ev::throwRangeError(what + ": the byte offset is a non-negative integer");
+    }
+    return static_cast<size_t>(d);
+}
+
+GpuBuffer* unwrapBuffer(Value self, const std::string& what) {
+    auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
+    if (!h) ev::throwTypeError(what + ": invalid receiver");
+    return h->buffer.get();
+}
+
+// buffer.write(source, byteOffset = 0): `source`'s bytes (a typed array),
+// copied now, written after every dispatch so far.
+Value js_bufferWrite(Value self, std::span<const Value> args) {
+    GpuBuffer* b = unwrapBuffer(self, "KernelBuffer.write");
+    if (args.empty() || !ev::isTypedArray(args[0])) return ev::throwTypeError("KernelBuffer.write: the source is a typed array");
+    const size_t offset = offsetArg(args, 1, "KernelBuffer.write");
+    const auto info = ev::typedArrayInfo(args[0]);
+    if (offset > b->bytes() || info.byteLength > b->bytes() - offset) {
+        return ev::throwRangeError("KernelBuffer.write: " + std::to_string(info.byteLength) + " byte(s) at " +
+                                   std::to_string(offset) + " do not fit its " + std::to_string(b->bytes()));
+    }
+    std::string err;
+    if (!b->write(offset, info.data, info.byteLength, &err)) return ev::throwError("KernelBuffer.write: " + err);
+    return ev::undefined();
+}
+
+// buffer.read(target, byteOffset = 0): fills `target` (a typed array) with
+// the bytes at byteOffset, after every dispatch so far; returns it.
+Value js_bufferRead(Value self, std::span<const Value> args) {
+    GpuBuffer* b = unwrapBuffer(self, "KernelBuffer.read");
+    if (args.empty() || !ev::isTypedArray(args[0])) return ev::throwTypeError("KernelBuffer.read: the target is a typed array");
+    const size_t offset = offsetArg(args, 1, "KernelBuffer.read");
+    const auto info = ev::typedArrayInfo(args[0]);
+    if (offset > b->bytes() || info.byteLength > b->bytes() - offset) {
+        return ev::throwRangeError("KernelBuffer.read: " + std::to_string(info.byteLength) + " byte(s) at " +
+                                   std::to_string(offset) + " are outside its " + std::to_string(b->bytes()));
+    }
+    std::string err;
+    if (!b->read(offset, info.data, info.byteLength, &err)) return ev::throwError("KernelBuffer.read: " + err);
+    return args[0];
+}
+
+void decorateBuffer(ev::ObjectBuilder& b) {
+    b.def("write", 1, js_bufferWrite);
+    b.def("read", 1, js_bufferRead);
+    b.accessor("byteLength", [](Value self, std::span<const Value>) -> Value {
+        auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
+        return h ? ev::fromDouble(static_cast<double>(h->buffer->bytes())) : ev::undefined();
+    });
+}
+
+// bro.kernel.createBuffer(byteLength | typedArray): GPU memory for a
+// dispatch's stores, reading zero, or holding the typed array's bytes.
+Value js_createBuffer(Value, std::span<const Value> args) {
+    if (!t_device || !t_device->available()) {
+        return ev::throwError("bro.kernel.createBuffer: this realm has no GPU device (bro.kernel.gpu is false)");
+    }
+    const bool fromArray = !args.empty() && ev::isTypedArray(args[0]);
+    size_t bytes = 0;
+    if (fromArray) {
+        bytes = ev::typedArrayInfo(args[0]).byteLength;
+    } else if (!args.empty() && ev::isNumber(args[0])) {
+        const double d = ev::toDouble(args[0]);
+        if (!(d >= 0.0) || d != static_cast<double>(static_cast<uint64_t>(d))) {
+            return ev::throwRangeError("bro.kernel.createBuffer: the byte length is a non-negative integer");
+        }
+        bytes = static_cast<size_t>(d);
+    } else {
+        return ev::throwTypeError("bro.kernel.createBuffer: takes a byte length or a typed array");
+    }
+    std::string err;
+    std::shared_ptr<GpuBuffer> buffer = t_device->createBuffer(bytes, &err);
+    if (!buffer) return ev::throwError("bro.kernel.createBuffer: " + err);
+    if (fromArray && bytes > 0) {
+        const auto info = ev::typedArrayInfo(args[0]);
+        if (!buffer->write(0, info.data, info.byteLength, &err)) return ev::throwError("bro.kernel.createBuffer: " + err);
+    }
+    return makeBuffer(std::move(buffer));
+}
+
 Value paramInfo(const KernelParamInfo& p) {
     ev::ObjectBuilder b;
     b.set("name", p.name);
@@ -330,6 +474,7 @@ Value paramInfo(const KernelParamInfo& p) {
 void decorateKernel(ev::ObjectBuilder& b) {
     b.def("eval", 0, js_eval);
     b.def("run", 1, js_run);
+    b.def("dispatch", 1, js_dispatch);
     b.accessor("name", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);
         return k ? ev::fromUtf8(k->name) : ev::undefined();
@@ -480,16 +625,28 @@ Value ensureBroKernel() {
 void installKernel() {
     g_moduleClass.install("KernelModule", 0, nullptr, decorateModule, /*global=*/false);
     g_kernelClass.install("Kernel", 0, nullptr, decorateKernel, /*global=*/false);
+    g_bufferClass.install("KernelBuffer", 0, nullptr, decorateBuffer, /*global=*/false);
     ev::Persistent kernelObj(ensureBroKernel());
     ev::ObjectBuilder b(kernelObj.get());
     b.set("available", true);
     b.set("version", version());
+    b.accessor("gpu", [](Value, std::span<const Value>) -> Value {
+        return ev::fromBool(t_device && t_device->available());
+    });
     b.def("compile", 2, js_compile);
+    if (t_device) b.def("createBuffer", 1, js_createBuffer);
 }
+
+void setGpuDevice(std::shared_ptr<GpuDevice> device) { t_device = std::move(device); }
 
 std::shared_ptr<const CompiledKernel> kernelOf(Value v) {
     auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(v));
     return h ? h->kernel : nullptr;
+}
+
+std::shared_ptr<GpuBuffer> bufferOf(Value v) {
+    auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(v));
+    return h ? h->buffer : nullptr;
 }
 
 } // namespace brokernel::api
