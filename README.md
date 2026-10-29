@@ -76,9 +76,14 @@ general graphics:
   - A varying `if` runs both arms under masks and merges by select. A loop
     runs while any lane is still in it. Integer division, 64-bit multiplies
     and gathers go lane by lane.
-  - An index of the form base + lane × stride (a store read or written at
-    `g.x()`) keeps a uniform 64-bit base. Its loads and stores are
-    contiguous vector ones, or lane by lane at scalar addresses.
+  - A 64-bit index is a uniform base plus a varying i32 offset, never an
+    i64 vector, so 8 lanes hold. An index of the form base + lane × stride
+    (a store read or written at `g.x()`) loads and stores contiguously;
+    any other goes lane by lane at scalar addresses.
+  - A group whose stencil reads all land inside the row (its x at least
+    the kernel's x halo from either end) reads them unclamped, so a
+    stencil's neighbours are contiguous loads too; the groups at a row's
+    ends clamp.
   - A row's last `width % lanes` cells run one at a time.
   - A kernel with a call on varying arguments or an atomic runs every cell
     one at a time, as do non-AVX2 hosts. `CompiledKernel::cpu_grid_lanes`
