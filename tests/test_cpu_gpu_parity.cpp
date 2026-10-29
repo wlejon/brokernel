@@ -296,6 +296,59 @@ static void test_vector_grid_lanes() {
     assert(rep.ok);
 }
 
+// A vector build runs a group whose stencil reads all land inside its row
+// without their x clamps, and a group within the halo of a row's end with
+// them: every width here, from none of a row's groups inside (5, 8, 13) to
+// most (64), against the clamped reads on the host and on the GPU.
+static void test_vector_stencil_edges() {
+    const char* src = R"(
+        @kernel @grid(2)
+        fn k_reach(g: grid<2>, s: stencil<f32, 2>, out: write_store<f32, 2>) {
+            let x = g.x();
+            let y = g.y();
+            out[x, y] = s[-3, 0] * 1.0 + s[-1, 1] * 10.0 + s[0, 0] * 100.0 + s[2, -1] * 1000.0 + s[3, 0] * 10000.0;
+        }
+    )";
+    auto res = compile_source(src, "vector_stencil.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_reach");
+    assert(k && k->stencil_halo[0] == 3);
+    if (brass::host_has_avx2() && k->cpu_grid_lanes != 8) {
+        std::cerr << "k_reach runs " << k->cpu_grid_lanes << " lanes\n";
+        assert(false);
+    }
+    const uint32_t H = 3;
+    for (uint32_t W : {5u, 8u, 13u, 16u, 37u, 64u}) {
+        std::vector<float> s(W * H);
+        for (uint32_t i = 0; i < W * H; ++i) s[i] = static_cast<float>(i % 7) + 0.25f * static_cast<float>(i / 7);
+        auto at = [&](int x, int y) {
+            x = std::clamp(x, 0, static_cast<int>(W) - 1);
+            y = std::clamp(y, 0, static_cast<int>(H) - 1);
+            return s[y * W + x];
+        };
+        std::vector<float> out(W * H, -1.0f);
+        std::string err;
+        assert(k->dispatch_cpu(GridShape(W, H), {KernelArg::store(s), KernelArg::store(out)}, nullptr, &err));
+        for (int y = 0; y < static_cast<int>(H); ++y) {
+            for (int x = 0; x < static_cast<int>(W); ++x) {
+                float want = at(x - 3, y) * 1.0f + at(x - 1, y + 1) * 10.0f + at(x, y) * 100.0f +
+                             at(x + 2, y - 1) * 1000.0f + at(x + 3, y) * 10000.0f;
+                if (out[y * W + x] != want) {
+                    std::cerr << "stencil edge: width " << W << " cell (" << x << ", " << y << ") " << out[y * W + x]
+                              << ", want " << want << "\n";
+                    assert(false);
+                }
+            }
+        }
+        std::vector<float> gout(W * H, -1.0f);
+        std::vector<KernelArg> gargs = {KernelArg::store(s), KernelArg::store(gout)};
+        auto rep = k->compare_cpu_gpu(GridShape(W, H), gargs, 0.0, 0.0);
+        if (!rep.ok) std::cerr << "stencil edge parity, width " << W << ": " << rep.message << "\n";
+        assert(rep.ok);
+    }
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -306,6 +359,7 @@ int main() {
     test_stencil_diffusion_f64_and_point_query();
     test_3d_voxel_and_control_flow_parity();
     test_vector_grid_lanes();
+    test_vector_stencil_edges();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

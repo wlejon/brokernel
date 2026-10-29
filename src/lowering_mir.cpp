@@ -407,12 +407,13 @@ struct GridFrame {
 // i32, the cells x .. x + lanes - 1 of row gy, slice gz).
 void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mod, const CheckedFunction& fn,
                       DiagnosticBag& diags, const GridFrame& f, uint32_t lanes, VectorPlan* plan, brass::Value* x,
-                      brass::Value* gy, brass::Value* gz) {
+                      brass::Value* gy, brass::Value* gz, bool x_interior = false) {
     brass::Builder& b = kb.builder();
     MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/false);
     lowerer.b.lanes = lanes;
     lowerer.b.scratch = f.scratch;
     lowerer.vplan = plan;
+    lowerer.x_interior = x_interior;
     lowerer.push_scope();
     lowerer.gw = f.gw;
     lowerer.gh = f.gh;
@@ -518,8 +519,29 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
         b.position_at_end(v_head);
         b.build_br_if(b.build_slt(xv, vec_end), v_body, v_exit);
         b.position_at_end(v_body);
-        lower_grid_cells(kb, mod, fn, diags, f, lanes, plan, xv, gy, gz);
-        b.build_br(v_head, {b.build_add(xv, b.build_iconst_i32(static_cast<int32_t>(lanes)))});
+        brass::Value* x_next = b.build_add(xv, b.build_iconst_i32(static_cast<int32_t>(lanes)));
+        // (With no x halo every group is inside: x + 0 is in the row.)
+        const int32_t halo = fn.stencil_halo[0];
+        if (halo == 0) {
+            lower_grid_cells(kb, mod, fn, diags, f, lanes, plan, xv, gy, gz, /*x_interior=*/true);
+            b.build_br(v_head, {x_next});
+        } else {
+            // A group whose stencil reads all land inside the row runs a
+            // body without their x clamps: xv - halo >= 0 and
+            // xv + lanes - 1 + halo <= gw - 1. The rest (a halo's width at
+            // either end of a row) clamp.
+            brass::BasicBlock* v_inner = new_block(b, "grid_xv_inner");
+            brass::BasicBlock* v_edge = new_block(b, "grid_xv_edge");
+            brass::Value* hv = b.build_iconst_i32(halo);
+            brass::Value* inner = b.build_and(b.build_sge(xv, hv), b.build_sle(b.build_add(x_next, hv), f.gw));
+            b.build_br_if(inner, v_inner, v_edge);
+            b.position_at_end(v_inner);
+            lower_grid_cells(kb, mod, fn, diags, f, lanes, plan, xv, gy, gz, /*x_interior=*/true);
+            b.build_br(v_head, {x_next});
+            b.position_at_end(v_edge);
+            lower_grid_cells(kb, mod, fn, diags, f, lanes, plan, xv, gy, gz);
+            b.build_br(v_head, {x_next});
+        }
         b.position_at_end(v_exit);
         x_start = vec_end;
     }

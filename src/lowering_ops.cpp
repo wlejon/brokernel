@@ -33,9 +33,15 @@ Value* Ops::widen(Value* v) {
     auto m = markers_.find(v);
     if (m == markers_.end()) return b_.build_vbroadcast(vec_type(v->type()), v);
     const Type vt = vec_type(Type::i64());
+    check_lanes(vt);
+    const Marker mk = m->second;
     Value* steps = b_.build_vzero(vt);
-    for (uint32_t i = 1; i < lanes; ++i) {
-        steps = b_.build_vinsert_lane(steps, b_.build_iconst_i64(static_cast<int64_t>(i) * m->second), i);
+    if (mk.off) {
+        steps = b_.build_vmul(convert(Type::i64(), mk.off), b_.build_vbroadcast(vt, b_.build_iconst_i64(mk.stride)));
+    } else {
+        for (uint32_t i = 1; i < lanes; ++i) {
+            steps = b_.build_vinsert_lane(steps, b_.build_iconst_i64(static_cast<int64_t>(i) * mk.stride), i);
+        }
     }
     return b_.build_vadd(b_.build_vbroadcast(vt, v), steps);
 }
@@ -49,8 +55,8 @@ Value* Ops::real(Value* v) {
     return is_index_marker(v) ? widen(v) : v;
 }
 
-Value* Ops::mark(Value* base, int64_t stride) {
-    markers_[base] = stride;
+Value* Ops::mark(Value* base, Marker m) {
+    markers_[base] = m;
     return base;
 }
 
@@ -60,15 +66,17 @@ std::optional<Ops::Affine> Ops::affine_of(Value* v) const {
     return it->second;
 }
 
-Value* Ops::affine_index(Value* v) {
-    auto a = affine_of(v);
-    if (!a) return nullptr;
-    return mark(b_.build_sext_i64(a->base), a->stride);
+Value* Ops::index_marker(Value* v) {
+    if (auto a = affine_of(v)) return mark(b_.build_sext_i64(a->base), Marker{a->stride, nullptr});
+    return mark(b_.build_sext_i64(b_.build_iconst_i32(0)), Marker{1, v});
 }
 
 Value* Ops::marker_lane(Value* m, uint32_t i) {
-    if (i == 0) return m;
-    return b_.build_add(m, b_.build_iconst_i64(static_cast<int64_t>(i) * markers_.at(m)));
+    const Marker mk = markers_.at(m);
+    if (!mk.off) return i == 0 ? m : b_.build_add(m, b_.build_iconst_i64(static_cast<int64_t>(i) * mk.stride));
+    Value* o = b_.build_sext_i64(b_.build_vextract_lane(mk.off, i));
+    if (mk.stride != 1) o = b_.build_mul(o, b_.build_iconst_i64(mk.stride));
+    return b_.build_add(m, o);
 }
 
 namespace {
@@ -87,7 +95,7 @@ Value* Ops::affine_bin(Opcode op, Value* a, Value* c) {
     if (!vector_mode()) return nullptr;
     // A stride per operand: a marker's or an affine vector's, 0 for a uniform.
     auto stride_of = [&](Value* v, bool& known) -> int64_t {
-        if (auto m = markers_.find(v); m != markers_.end()) return m->second;
+        if (auto m = markers_.find(v); m != markers_.end()) return m->second.stride;
         if (auto f = affine_of(v)) return f->stride;
         known = !is_varying(v);
         return 0;
@@ -101,6 +109,14 @@ Value* Ops::affine_bin(Opcode op, Value* a, Value* c) {
     if (!ka || !kc || (sa == 0 && sc == 0)) return nullptr;
     const bool marker = is_index_marker(a) || is_index_marker(c);
     if (marker && (is_varying(a) || is_varying(c))) return nullptr;
+    // Two markers combine only over the same lane function.
+    Value* off = nullptr;
+    if (marker) {
+        Value* const* oa = is_index_marker(a) ? &markers_.at(a).off : nullptr;
+        Value* const* oc = is_index_marker(c) ? &markers_.at(c).off : nullptr;
+        if (oa && oc && *oa != *oc) return nullptr;
+        off = oa ? *oa : *oc;
+    }
     int64_t stride = 0;
     Value* base = nullptr;
     switch (op) {
@@ -122,7 +138,7 @@ Value* Ops::affine_bin(Opcode op, Value* a, Value* c) {
         }
         default: return nullptr;
     }
-    if (marker) return stride == 0 ? base : mark(base, stride);
+    if (marker) return stride == 0 ? base : mark(base, Marker{stride, off});
     Value* r = vec_bin(op, a, c);
     if (stride != 0) affine_[r] = Affine{base, stride};
     return r;
@@ -207,7 +223,7 @@ Value* Ops::bitcast(Type to_scalar, Value* v) {
 Value* Ops::build_sext_i64(Value* v) {
     v = real(v);
     if (!is_varying(v)) return b_.build_sext_i64(v);
-    if (Value* m = affine_index(v)) return m;
+    if (v->type().element_type() == Type::i32()) return index_marker(v);
     return convert(Type::i64(), v);
 }
 Value* Ops::build_zext_i64(Value* v) {
@@ -513,7 +529,8 @@ Value* Ops::build_uge(Value* a, Value* c) { return compare(Cmp::ge, true, a, c);
 Value* Ops::build_select(Value* c, Value* t, Value* f) {
     // A uniform choice of two indices of one stride is an index of that stride.
     if (!is_varying(c) && is_index_marker(t) && is_index_marker(f) && markers_.at(t) == markers_.at(f)) {
-        return mark(b_.build_select(c, t, f), markers_.at(t));
+        const Marker m = markers_.at(t);
+        return mark(b_.build_select(c, t, f), m);
     }
     c = real(c);
     t = real(t);
@@ -529,8 +546,14 @@ Value* Ops::build_load(Type t, Value* base, int32_t offset) {
     return b_.build_load(t, base, offset);
 }
 
+bool Ops::is_contiguous(const Value* index, uint8_t scale, Type t) const {
+    auto m = markers_.find(index);
+    return m != markers_.end() && !mask && !m->second.off &&
+           m->second.stride * scale == static_cast<int64_t>(t.size_in_bytes());
+}
+
 Value* Ops::build_load_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset) {
-    if (is_index_marker(index) && !mask && markers_.at(index) * scale == static_cast<int64_t>(t.size_in_bytes())) {
+    if (is_contiguous(index, scale, t)) {
         // The lanes' elements are consecutive.
         check_lanes(t);
         Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
@@ -553,7 +576,7 @@ Value* Ops::build_load_indexed(Type t, Value* base, Value* index, uint8_t scale,
 void Ops::build_store_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, Value* val) {
     val = real(val);
     const bool marker = is_index_marker(index);
-    if (marker && !mask && markers_.at(index) * scale == static_cast<int64_t>(t.size_in_bytes())) {
+    if (is_contiguous(index, scale, t)) {
         check_lanes(t);
         Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
         b_.build_vstore(vec_type(t), addr, offset, widen(val));

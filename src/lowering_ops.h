@@ -18,13 +18,15 @@
 // lanes never fault or write.
 //
 // An i32 vector known to be base + lane * stride (x + iota, and what adding
-// a uniform or multiplying by a constant makes of it) is affine. Its 64-bit
-// index is not built as a vector: `affine_index` returns the uniform i64
-// base (an index marker), add / sub / mul / select keep markers, a load or
-// store at one is contiguous (stride 1, no mask) or lane by lane at scalar
-// addresses, and any other op given one materializes it as a vector (which
-// at W = 8 throws NeedNarrowLanes). So a grid's store reads and writes at x
-// run at 8 lanes.
+// a uniform or multiplying by a constant makes of it) is affine. A 64-bit
+// index is not built as a vector: an i32 vector sign-extended is an index
+// marker, a uniform i64 base standing for base + stride * off[lane], off the
+// lane number for an affine vector (its base and stride folded in) and the
+// i32 vector itself otherwise. Add / sub / mul / select keep markers, a load
+// or store at one is contiguous (the lane number, stride 1, no mask) or lane
+// by lane at scalar addresses, and any other op given one materializes it as
+// a vector (which at W = 8 throws NeedNarrowLanes). So a grid's store reads
+// and writes at x run at 8 lanes, and so do those at a clamped x.
 
 #include <brass/mir/builder.hpp>
 
@@ -81,9 +83,8 @@ public:
     // A mask over `t`'s lanes for select: 64-bit lanes take the i32 mask widened.
     brass::Value* mask_for(brass::Value* m, brass::Type t);
 
-    // The index marker for i32 vector `v` sign-extended to i64 when v is
-    // affine, else nullptr.
-    brass::Value* affine_index(brass::Value* v);
+    // The index marker for i32 vector `v` sign-extended to i64.
+    brass::Value* index_marker(brass::Value* v);
     bool is_index_marker(const brass::Value* v) const { return markers_.count(v) != 0; }
 
     // Blocks and control flow (always scalar).
@@ -184,16 +185,23 @@ private:
         brass::Value* base;   // uniform, the vector's element type
         int64_t stride;
     };
+    struct Marker {
+        int64_t stride;
+        brass::Value* off;   // an i32 vector, or nullptr for the lane number
+        bool operator==(const Marker& o) const { return stride == o.stride && off == o.off; }
+    };
     std::unordered_map<const brass::Value*, Affine> affine_;    // i32 vectors
-    std::unordered_map<const brass::Value*, int64_t> markers_;  // i64 index marker -> stride
+    std::unordered_map<const brass::Value*, Marker> markers_;   // i64 index markers (each a fresh value)
     // `v` with an index marker materialized as a vector.
     brass::Value* real(brass::Value* v);
-    brass::Value* mark(brass::Value* base, int64_t stride);
+    brass::Value* mark(brass::Value* base, Marker m);
     std::optional<Affine> affine_of(brass::Value* v) const;
     // Marker / affine arithmetic, nullptr when the operands are not that.
     brass::Value* affine_bin(brass::Opcode op, brass::Value* a, brass::Value* c);
     // The scalar index of lane i of marker m.
     brass::Value* marker_lane(brass::Value* m, uint32_t i);
+    // A load or store at `index` reads or writes the lanes' consecutive elements.
+    bool is_contiguous(const brass::Value* index, uint8_t scale, brass::Type t) const;
 
     enum class Cmp { eq, ne, lt, le, gt, ge };
     brass::Value* compare(Cmp c, bool is_unsigned, brass::Value* a, brass::Value* d);

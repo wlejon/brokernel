@@ -107,6 +107,17 @@ brass::Value* MirBodyLowerer::clamp_coord(brass::Value* c, brass::Value* extent)
         brass::Value* c_lo = b.build_select(b.build_slt(c, zero), zero, c);
         return b.build_select(b.build_sgt(c_lo, hi), hi, c_lo);
     }
+ValueList MirBodyLowerer::lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets) {
+        ValueList base = lower_expr(stencil);
+        auto offset = [&](size_t i) -> brass::Value* {
+            return i < offsets.size() ? lower_expr(offsets[i].get())[0] : b.build_iconst_i32(0);
+        };
+        brass::Value* x = b.build_add(gx, offset(0));
+        if (!x_interior) x = clamp_coord(x, gw);
+        brass::Value* y = (st.dimension >= 2) ? clamp_coord(b.build_add(gy, offset(1)), gh) : b.build_iconst_i32(0);
+        brass::Value* z = (st.dimension >= 3) ? clamp_coord(b.build_add(gz, offset(2)), gd) : b.build_iconst_i32(0);
+        return load_element_from_buffer(st.element_type(), base[0], compute_linear_index(st.dimension, x, y, z));
+    }
 brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z) {
         auto to_i64 = [&](brass::Value* v) -> brass::Value* {
             return (v->type() == brass::Type::i64()) ? v : b.build_sext_i64(v);
@@ -514,17 +525,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::Index: {
             const Type& rt = e->lhs->resolved_type;
-            if (rt.is_stencil()) {
-                ValueList base = lower_expr(e->lhs.get());
-                ValueList dx = e->args.size() >= 1 ? lower_expr(e->args[0].get()) : ValueList{b.build_iconst_i32(0)};
-                ValueList dy = e->args.size() >= 2 ? lower_expr(e->args[1].get()) : ValueList{b.build_iconst_i32(0)};
-                ValueList dz = e->args.size() >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
-                brass::Value* x = clamp_coord(b.build_add(gx, dx[0]), gw);
-                brass::Value* y = (rt.dimension >= 2) ? clamp_coord(b.build_add(gy, dy[0]), gh) : b.build_iconst_i32(0);
-                brass::Value* z = (rt.dimension >= 3) ? clamp_coord(b.build_add(gz, dz[0]), gd) : b.build_iconst_i32(0);
-                brass::Value* lin = compute_linear_index(rt.dimension, x, y, z);
-                return load_element_from_buffer(rt.element_type(), base[0], lin);
-            }
+            if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_store()) {
                 ValueList base = lower_expr(e->lhs.get());
                 ValueList x = e->args.size() >= 1 ? lower_expr(e->args[0].get()) : ValueList{b.build_iconst_i32(0)};
@@ -608,17 +609,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     return {uv_comp(gx, gw), uv_comp(gy, gh), uv_comp(gz, gd)};
                 }
             }
-            if (rt.is_stencil()) {
-                ValueList base = lower_expr(e->lhs.get());
-                ValueList dx = e->args.size() >= 1 ? lower_expr(e->args[0].get()) : ValueList{b.build_iconst_i32(0)};
-                ValueList dy = e->args.size() >= 2 ? lower_expr(e->args[1].get()) : ValueList{b.build_iconst_i32(0)};
-                ValueList dz = e->args.size() >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
-                brass::Value* x = clamp_coord(b.build_add(gx, dx[0]), gw);
-                brass::Value* y = (rt.dimension >= 2) ? clamp_coord(b.build_add(gy, dy[0]), gh) : b.build_iconst_i32(0);
-                brass::Value* z = (rt.dimension >= 3) ? clamp_coord(b.build_add(gz, dz[0]), gd) : b.build_iconst_i32(0);
-                brass::Value* lin = compute_linear_index(rt.dimension, x, y, z);
-                return load_element_from_buffer(rt.element_type(), base[0], lin);
-            }
+            if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_store()) {
                 ValueList base = lower_expr(e->lhs.get());
                 uint32_t dim = rt.dimension;

@@ -71,6 +71,10 @@ struct MirBodyLowerer {
 
     VectorPlan* vplan = nullptr;   // set for a vector build (b.lanes != 0)
     int loop_seq = 0;
+    // Every cell this body runs is at least the kernel's stencil halo from
+    // the grid's x edges, so a stencil read's x needs no clamp (and in a
+    // vector build stays x's stride: one contiguous load).
+    bool x_interior = false;
 
     MirBodyLowerer(const CheckedModule& m, const CheckedFunction& f, DiagnosticBag& d,
                    brass::codegen::KernelBuilder& kbuilder, bool gpu)
@@ -91,6 +95,8 @@ struct MirBodyLowerer {
     std::vector<brass::Value*> pack_var_ids(const std::vector<int>& ids) const;
 
     brass::Value* clamp_coord(brass::Value* c, brass::Value* extent);
+    // s[dx, dy, dz]: the cell that far from this one, clamped into the grid.
+    ValueList lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets);
     brass::Value* compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z);
     ValueList load_element_from_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx);
     void store_element_to_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx,
