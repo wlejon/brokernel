@@ -1776,8 +1776,7 @@ std::vector<BenchRow> run_stencil_tier() {
         row.points = N;
 
         std::vector<float> ref_tmp(N), ref_out(N);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double ref_ms = best_cpu_ms([&] {
             for (int y = 0; y < (int)H; ++y) {
                 for (int x = 0; x < (int)W; ++x) {
                     ref_tmp[y * W + x] = h_in[y * W + clamp_i(x - 2, 0, W - 1)] * 0.0625f
@@ -1796,22 +1795,17 @@ std::vector<BenchRow> run_stencil_tier() {
                                        + ref_tmp[clamp_i(y + 2, 0, H - 1) * W + x] * 0.0625f;
                 }
             }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ref_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 5.0;
+        });
         row.cpu_ref_mpts = (N / 1e6) / (std::max(ref_ms, 1e-4) / 1000.0);
 
         const auto* kh = res.find_kernel("k_blur_h");
         const auto* kv = res.find_kernel("k_blur_v");
         std::vector<float> cpu_tmp(N), cpu_out(N), gpu_tmp(N), gpu_out(N);
 
-        auto tc0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double bk_cpu_ms = best_cpu_ms([&] {
             kh->dispatch_cpu(shape2d, {KernelArg::store(h_in), KernelArg::store(cpu_tmp)});
             kv->dispatch_cpu(shape2d, {KernelArg::store(cpu_tmp), KernelArg::store(cpu_out)});
-        }
-        auto tc1 = std::chrono::high_resolution_clock::now();
-        double bk_cpu_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count() / 5.0;
+        });
         row.cpu_bk_mpts = (N / 1e6) / (std::max(bk_cpu_ms, 1e-4) / 1000.0);
 
         kh->dispatch_gpu(shape2d, {KernelArg::store(h_in), KernelArg::store(gpu_tmp)});
@@ -1863,8 +1857,7 @@ void main() {
         row.points = N;
 
         std::vector<float> ref_out(N);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double ref_ms = best_cpu_ms([&] {
             for (int y = 0; y < (int)H; ++y) {
                 for (int x = 0; x < (int)W; ++x) {
                     float dx = 0.5f * (h_in[y * W + clamp_i(x + 1, 0, W - 1)] - h_in[y * W + clamp_i(x - 1, 0, W - 1)]);
@@ -1872,19 +1865,14 @@ void main() {
                     ref_out[y * W + x] = 1.0f / std::sqrt(dx * dx + dy * dy + 1.0f);
                 }
             }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ref_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 5.0;
+        });
         row.cpu_ref_mpts = (N / 1e6) / (std::max(ref_ms, 1e-4) / 1000.0);
 
         const auto* k = res.find_kernel("k_grad_normals");
         std::vector<float> cpu_out(N), gpu_out(N);
-        auto tc0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double bk_cpu_ms = best_cpu_ms([&] {
             k->dispatch_cpu(shape2d, {KernelArg::store(h_in), KernelArg::store(cpu_out)});
-        }
-        auto tc1 = std::chrono::high_resolution_clock::now();
-        double bk_cpu_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count() / 5.0;
+        });
         row.cpu_bk_mpts = (N / 1e6) / (std::max(bk_cpu_ms, 1e-4) / 1000.0);
 
         k->dispatch_gpu(shape2d, {KernelArg::store(h_in), KernelArg::store(gpu_out)});
@@ -1932,40 +1920,40 @@ void main() {
         row.dim = 2;
         row.points = N;
 
-        std::vector<float> cur = h_in, nxt(N);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int iter = 0; iter < 3; ++iter) {
-            for (int y = 0; y < (int)H; ++y) {
-                for (int x = 0; x < (int)W; ++x) {
-                    float hc = cur[y * W + x];
-                    auto flux = [&](float hn) {
-                        float d = hn - hc;
-                        if (d > 0.1f) return d - 0.1f;
-                        if (d < -0.1f) return d + 0.1f;
-                        return 0.0f;
-                    };
-                    float f = flux(cur[y * W + clamp_i(x - 1, 0, W - 1)])
-                            + flux(cur[y * W + clamp_i(x + 1, 0, W - 1)])
-                            + flux(cur[clamp_i(y - 1, 0, H - 1) * W + x])
-                            + flux(cur[clamp_i(y + 1, 0, H - 1) * W + x]);
-                    nxt[y * W + x] = hc + 0.125f * f;
+        std::vector<float> cur, nxt(N);
+        double ref_ms = best_cpu_ms([&] {
+            cur = h_in;
+            for (int iter = 0; iter < 3; ++iter) {
+                for (int y = 0; y < (int)H; ++y) {
+                    for (int x = 0; x < (int)W; ++x) {
+                        float hc = cur[y * W + x];
+                        auto flux = [&](float hn) {
+                            float d = hn - hc;
+                            if (d > 0.1f) return d - 0.1f;
+                            if (d < -0.1f) return d + 0.1f;
+                            return 0.0f;
+                        };
+                        float f = flux(cur[y * W + clamp_i(x - 1, 0, W - 1)])
+                                + flux(cur[y * W + clamp_i(x + 1, 0, W - 1)])
+                                + flux(cur[clamp_i(y - 1, 0, H - 1) * W + x])
+                                + flux(cur[clamp_i(y + 1, 0, H - 1) * W + x]);
+                        nxt[y * W + x] = hc + 0.125f * f;
+                    }
                 }
+                cur.swap(nxt);
             }
-            cur.swap(nxt);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ref_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        });
         row.cpu_ref_mpts = (N / 1e6) / (std::max(ref_ms, 1e-4) / 1000.0);
 
         const auto* k = res.find_kernel("k_thermal_step");
         std::vector<float> cpu_a = h_in, cpu_b(N), gpu_a = h_in, gpu_b(N);
-        auto tc0 = std::chrono::high_resolution_clock::now();
-        for (int iter = 0; iter < 3; ++iter) {
-            k->dispatch_cpu(shape2d, {KernelArg::store(cpu_a), KernelArg::store(cpu_b)});
-            cpu_a.swap(cpu_b);
-        }
-        auto tc1 = std::chrono::high_resolution_clock::now();
-        double bk_cpu_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count();
+        double bk_cpu_ms = best_cpu_ms([&] {
+            cpu_a = h_in;
+            for (int iter = 0; iter < 3; ++iter) {
+                k->dispatch_cpu(shape2d, {KernelArg::store(cpu_a), KernelArg::store(cpu_b)});
+                cpu_a.swap(cpu_b);
+            }
+        });
         row.cpu_bk_mpts = (N / 1e6) / (std::max(bk_cpu_ms, 1e-4) / 1000.0);
 
         for (int iter = 0; iter < 3; ++iter) {
@@ -2024,38 +2012,38 @@ void main() {
         row.dim = 2;
         row.points = N;
 
-        std::vector<float> cur = h_in, nxt(N);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int iter = 0; iter < 3; ++iter) {
-            for (int y = 0; y < (int)H; ++y) {
-                for (int x = 0; x < (int)W; ++x) {
-                    float hc = cur[y * W + x];
-                    float hL = cur[y * W + clamp_i(x - 1, 0, W - 1)];
-                    float hR = cur[y * W + clamp_i(x + 1, 0, W - 1)];
-                    float hD = cur[clamp_i(y - 1, 0, H - 1) * W + x];
-                    float hU = cur[clamp_i(y + 1, 0, H - 1) * W + x];
-                    float dx = hR - hL;
-                    float dy = hU - hD;
-                    float slope = 0.5f * std::sqrt(dx * dx + dy * dy);
-                    float lap = 0.25f * (hL + hR + hD + hU) - hc;
-                    nxt[y * W + x] = hc - 0.05f * (slope * 0.15f) + 0.1f * lap;
+        std::vector<float> cur, nxt(N);
+        double ref_ms = best_cpu_ms([&] {
+            cur = h_in;
+            for (int iter = 0; iter < 3; ++iter) {
+                for (int y = 0; y < (int)H; ++y) {
+                    for (int x = 0; x < (int)W; ++x) {
+                        float hc = cur[y * W + x];
+                        float hL = cur[y * W + clamp_i(x - 1, 0, W - 1)];
+                        float hR = cur[y * W + clamp_i(x + 1, 0, W - 1)];
+                        float hD = cur[clamp_i(y - 1, 0, H - 1) * W + x];
+                        float hU = cur[clamp_i(y + 1, 0, H - 1) * W + x];
+                        float dx = hR - hL;
+                        float dy = hU - hD;
+                        float slope = 0.5f * std::sqrt(dx * dx + dy * dy);
+                        float lap = 0.25f * (hL + hR + hD + hU) - hc;
+                        nxt[y * W + x] = hc - 0.05f * (slope * 0.15f) + 0.1f * lap;
+                    }
                 }
+                cur.swap(nxt);
             }
-            cur.swap(nxt);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ref_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        });
         row.cpu_ref_mpts = (N / 1e6) / (std::max(ref_ms, 1e-4) / 1000.0);
 
         const auto* k = res.find_kernel("k_hydraulic_step");
         std::vector<float> cpu_a = h_in, cpu_b(N), gpu_a = h_in, gpu_b(N);
-        auto tc0 = std::chrono::high_resolution_clock::now();
-        for (int iter = 0; iter < 3; ++iter) {
-            k->dispatch_cpu(shape2d, {KernelArg::store(cpu_a), KernelArg::store(cpu_b)});
-            cpu_a.swap(cpu_b);
-        }
-        auto tc1 = std::chrono::high_resolution_clock::now();
-        double bk_cpu_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count();
+        double bk_cpu_ms = best_cpu_ms([&] {
+            cpu_a = h_in;
+            for (int iter = 0; iter < 3; ++iter) {
+                k->dispatch_cpu(shape2d, {KernelArg::store(cpu_a), KernelArg::store(cpu_b)});
+                cpu_a.swap(cpu_b);
+            }
+        });
         row.cpu_bk_mpts = (N / 1e6) / (std::max(bk_cpu_ms, 1e-4) / 1000.0);
 
         for (int iter = 0; iter < 3; ++iter) {
@@ -2113,8 +2101,7 @@ void main() {
         row.points = N;
 
         std::vector<float> ref_out(N);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double ref_ms = best_cpu_ms([&] {
             for (int y = 0; y < (int)H; ++y) {
                 for (int x = 0; x < (int)W; ++x) {
                     float hc = h_in[y * W + x];
@@ -2131,19 +2118,14 @@ void main() {
                     ref_out[y * W + x] = 1.0f + card + 0.70710678f * diag;
                 }
             }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ref_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 5.0;
+        });
         row.cpu_ref_mpts = (N / 1e6) / (std::max(ref_ms, 1e-4) / 1000.0);
 
         const auto* k = res.find_kernel("k_flow_accum");
         std::vector<float> cpu_out(N), gpu_out(N);
-        auto tc0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 5; ++rep) {
+        double bk_cpu_ms = best_cpu_ms([&] {
             k->dispatch_cpu(shape2d, {KernelArg::store(h_in), KernelArg::store(cpu_out)});
-        }
-        auto tc1 = std::chrono::high_resolution_clock::now();
-        double bk_cpu_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count() / 5.0;
+        });
         row.cpu_bk_mpts = (N / 1e6) / (std::max(bk_cpu_ms, 1e-4) / 1000.0);
 
         k->dispatch_gpu(shape2d, {KernelArg::store(h_in), KernelArg::store(gpu_out)});
