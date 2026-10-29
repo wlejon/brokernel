@@ -1,0 +1,245 @@
+// CPU vs GPU target agreement and point-query parity tests for brokernel.
+
+#include "brokernel/brokernel.h"
+
+#undef NDEBUG
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <iostream>
+#include <vector>
+
+using namespace brokernel;
+
+static void test_planetary_elevation_f64_parity() {
+    const char* src = R"(
+        import std::noise::{fbm, ridged_fbm};
+        import std::sphere;
+
+        @kernel @grid(2)
+        fn bake_planet_tile(g: grid<2>, out_elev: write_store<f64, 2>, freq: f64) {
+            let uv: vec2<f64> = g.uv_f64();
+            let lat: f64 = (uv.y - 0.5) * 3.141592653589793;
+            let lon: f64 = (uv.x - 0.5) * 6.283185307179586;
+            let dir: vec3<f64> = sphere::latlon_to_unit<f64>(lat, lon);
+            let base: f64 = fbm<f64, 3>(dir * freq, 4, 2.0, 0.5);
+            let ridge: f64 = ridged_fbm<f64, 3>(dir * (freq * 1.5), 3, 2.0, 0.5);
+            out_elev.write(base * 3000.0 + ridge * 1500.0);
+        }
+    )";
+
+    auto res = compile_source(src, "planet_tile.bk");
+    if (!res.ok) {
+        std::cerr << res.error_message() << "\n";
+    }
+    assert(res.ok);
+    const auto* k = res.default_kernel();
+    assert(k != nullptr);
+    assert(k->uses_f64);
+    assert(k->grid_dim == 2);
+
+    const uint32_t W = 32, H = 16;
+    std::vector<double> elev(W * H, 0.0);
+    std::vector<KernelArg> args = {KernelArg::store(elev), KernelArg(2.5)};
+
+    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-9, 1e-9);
+    if (!rep.ok) {
+        std::cerr << "planet_tile parity failed: " << rep.message << "\n";
+    }
+    assert(rep.ok && rep.ran_gpu);
+    assert(rep.elements_compared == W * H);
+    // Agreement on a constant (or unwritten) tile proves nothing: the GPU's
+    // heights, written back into elev, must vary and be finite.
+    double lo = elev[0], hi = elev[0];
+    for (double e : elev) {
+        assert(std::isfinite(e));
+        lo = std::min(lo, e);
+        hi = std::max(hi, e);
+    }
+    assert(hi - lo > 100.0);
+}
+
+static void test_simplex3d_range_and_parity() {
+    const char* src = R"(
+        import std::noise::{simplex};
+
+        @kernel @grid(2)
+        fn slice(g: grid<2>, out: write_store<f64, 2>, z: f64) {
+            let uv: vec2<f64> = g.uv_f64();
+            out.write(simplex<f64, 3>(vec3<f64>(uv.x * 23.0, uv.y * 23.0, z), 7));
+        }
+    )";
+    auto res = compile_source(src, "simplex3d.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.default_kernel();
+    const uint32_t W = 128, H = 128;
+    std::vector<double> v(W * H, -99.0);
+    std::vector<KernelArg> args = {KernelArg::store(v), KernelArg(0.37)};
+    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-12, 1e-12);
+    if (!rep.ok) std::cerr << "simplex3d parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+    double lo = 1e9, hi = -1e9, sum = 0.0;
+    for (double x : v) {
+        lo = std::min(lo, x);
+        hi = std::max(hi, x);
+        sum += x;
+    }
+    std::cout << "simplex3d range [" << lo << ", " << hi << "] mean " << sum / v.size() << "\n";
+    assert(lo >= -1.0 && hi <= 1.0);   // within the documented range
+    assert(lo < -0.6 && hi > 0.6);     // and using most of it
+    assert(std::abs(sum / v.size()) < 0.1);
+}
+
+static void test_stencil_diffusion_f64_and_point_query() {
+    const char* src = R"(
+        from std::filter import laplacian2d;
+
+        @kernel @grid(2)
+        fn diffuse_height(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, dt: f64) -> f64 {
+            let next_h: f64 = h.at(0, 0) + dt * laplacian2d(h);
+            out.write(next_h);
+            return next_h;
+        }
+    )";
+
+    auto res = compile_source(src, "diffuse.bk");
+    if (!res.ok) {
+        std::cerr << res.error_message() << "\n";
+    }
+    assert(res.ok);
+    const auto* k = res.default_kernel();
+    assert(k != nullptr);
+
+    const uint32_t W = 24, H = 24;
+    std::vector<double> h_in(W * H);
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            h_in[y * W + x] = std::sin(0.2 * x) * std::cos(0.15 * y) * 100.0;
+        }
+    }
+    std::vector<double> h_out(W * H, 0.0);
+    std::vector<KernelArg> args = {
+        KernelArg::store(h_in),
+        KernelArg::store(h_out),
+        KernelArg(0.125),
+    };
+
+    // 1. Compare full-grid CPU vs GPU dispatch
+    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-11, 1e-11);
+    if (!rep.ok) {
+        std::cerr << "diffuse parity failed: " << rep.message << "\n";
+    }
+    assert(rep.ok && rep.ran_gpu);
+
+    // The GPU's result (written back into h_out) against the host: one
+    // explicit diffusion step, neighbours clamped at the edges.
+    auto at = [&](int x, int y) {
+        x = std::clamp(x, 0, int(W) - 1);
+        y = std::clamp(y, 0, int(H) - 1);
+        return h_in[y * W + x];
+    };
+    for (int y = 0; y < int(H); ++y) {
+        for (int x = 0; x < int(W); ++x) {
+            double lap = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - 4.0 * at(x, y);
+            double want = at(x, y) + 0.125 * lap;
+            assert(std::abs(h_out[y * W + x] - want) < 1e-11);
+        }
+    }
+
+    // 2. Verify single-point CPU query (`eval_point_2d_f64`) matches grid output at every cell
+    std::vector<double> scratch_out(W * H, 0.0);
+    std::vector<KernelArg> pt_args = {
+        KernelArg::store(h_in),
+        KernelArg::store(scratch_out),
+        KernelArg(0.125),
+    };
+    for (uint32_t y = 0; y < H; y += 5) {
+        for (uint32_t x = 0; x < W; x += 5) {
+            double pt_val = k->eval_point_2d_f64(static_cast<int32_t>(x), static_cast<int32_t>(y), W, H, pt_args);
+            assert(std::abs(pt_val - h_out[y * W + x]) < 1e-12);
+        }
+    }
+}
+
+static void test_3d_voxel_and_control_flow_parity() {
+    const char* src = R"(
+        fn march_steps(base: f32, max_iters: i32) -> f32 {
+            if base < 0.0 {
+                return 0.0;
+            }
+            var acc: f32 = base;
+            for i in 0..max_iters {
+                if i == 2 {
+                    continue;
+                }
+                if acc > 50.0 {
+                    break;
+                }
+                acc += (i as f32) * 1.5 + 0.25;
+            }
+            return acc;
+        }
+
+        @kernel @grid(3)
+        fn fill_voxels(out: write_store<f32, 3>, scale: f32, iters: i32) {
+            let x = grid_x() as f32;
+            let y = grid_y() as f32;
+            let z = grid_z() as f32;
+            let seed = (x * 0.5 + y * 0.25 + z * 0.125) * scale;
+            out.write(march_steps(seed, iters));
+        }
+    )";
+
+    auto res = compile_source(src, "voxels.bk");
+    if (!res.ok) {
+        std::cerr << res.error_message() << "\n";
+    }
+    assert(res.ok);
+    const auto* k = res.default_kernel();
+    assert(k != nullptr);
+    assert(k->grid_dim == 3);
+
+    const uint32_t W = 8, H = 8, D = 6;
+    std::vector<float> vox(W * H * D, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(vox), KernelArg(1.2f), KernelArg(7)};
+
+    auto rep = k->compare_cpu_gpu(GridShape(W, H, D), args, 1e-5, 1e-5);
+    if (!rep.ok) {
+        std::cerr << "voxel 3D parity failed: " << rep.message << "\n";
+    }
+    assert(rep.ok && rep.ran_gpu);
+
+    // march_steps on the host, at every voxel (exact: the same f32 operations).
+    auto march = [](float base, int iters) {
+        if (base < 0.0f) return 0.0f;
+        float acc = base;
+        for (int i = 0; i < iters; ++i) {
+            if (i == 2) continue;
+            if (acc > 50.0f) break;
+            acc += float(i) * 1.5f + 0.25f;
+        }
+        return acc;
+    };
+    for (uint32_t z = 0; z < D; ++z) {
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                float seed = (float(x) * 0.5f + float(y) * 0.25f + float(z) * 0.125f) * 1.2f;
+                assert(vox[(z * H + y) * W + x] == march(seed, 7));
+            }
+        }
+    }
+}
+
+int main() {
+    if (!brass::gpu::vulkan_available()) {
+        std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
+        return 77;
+    }
+    test_planetary_elevation_f64_parity();
+    test_simplex3d_range_and_parity();
+    test_stencil_diffusion_f64_and_point_query();
+    test_3d_voxel_and_control_flow_parity();
+    std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
+    return 0;
+}

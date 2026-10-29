@@ -22,6 +22,17 @@ bro_dependency(brass GITHUB wlejon/brass)
 
 add_library(brokernel STATIC
     src/brokernel.cpp
+    src/diagnostics.cpp
+    src/types.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/stdlib_modules.cpp
+    src/sema.cpp
+    src/sema_check.cpp
+    src/sema_builtins.cpp
+    src/lowering_mir.cpp
+    src/lowering_expr.cpp
+    src/lowering_math.cpp
 )
 add_library(brokernel::brokernel ALIAS brokernel)
 target_include_directories(brokernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

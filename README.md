@@ -27,13 +27,7 @@ brass MIR (KernelBuilder)
   (brass `docs/spirv_backend_design.md`, `docs/ptx_kernel_authoring.md`).
   brokernel is a frontend over it, as bronze (JavaScript) and brasslua (Lua)
   are frontends over brass's CPU backends.
-- **bro** links brokernel and exposes general mechanisms only: run a kernel
-  over a grid into a store as world-service work, call a kernel's CPU build,
-  let a kernel supply a surface's height, normal and material inside the
-  engine's own shading. The engine owns scheduling, residency, budgets,
-  level-of-detail invariants and observability; it holds no world's logic.
-- **Worlds** live in apps (broworkshop): kernel sources plus the JavaScript
-  that wires them to the scene. Deleting a world is deleting its folder.
+- Nothing links brokernel yet; its tests drive it directly.
 
 ## The language
 
@@ -53,8 +47,26 @@ general graphics:
   source become both a GPU dispatch and a CPU point query, and lets the
   engine schedule and cache what a kernel makes.
 - **The same semantics on both targets.** A kernel's CPU and GPU builds
-  agree to within each target's floating-point rounding, and a test
-  compares them.
+  run the same operations:
+  - The GPU build is emitted with brass's `precise_float`, so the driver
+    rounds every float add, mul and div as the CPU does. It may not fuse
+    them into FMAs or re-associate them.
+  - The transcendentals (`sin` through `atan2`, `exp`/`log` and their base-2
+    forms, `pow`, the hyperbolics) are lowered as MIR arithmetic
+    (`src/lowering_math.cpp`), not called. That avoids both the host's libm
+    and the driver's GLSL.std.450, and covers f64, which GLSL.std.450 has no
+    transcendentals for.
+  - f64 is within a few ulp of libm, and f32 uses Cephes' single-precision
+    polynomials.
+  - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
+    fails, with `ran_gpu` false, when there is no Vulkan device.
+- **CPU builds are for compute kernels.** The CPU runs a kernel cell by cell,
+  as a subgroup and workgroup of one:
+  - The subgroup operations are the identity there.
+  - Vertex and fragment stages have no CPU build. Neither do kernels that
+    cooperate through barriers or shared memory.
+  - Derivatives, `front_facing` and `discard_fragment` (a demote to helper)
+    are fragment-only.
 
 Source files use the `.bk` extension.
 
@@ -62,9 +74,13 @@ Source files use the `.bk` extension.
 
 | Path | What |
 |------|------|
-| `include/brokernel/brokernel.h` | the public API (`brokernel::version()`) |
-| `src/` | the library |
-| `tests/` | `test_smoke` (the library links, brass's SPIR-V target is reachable); `no_dialogs.cpp` keeps Windows test executables from opening modal dialogs |
+| `include/brokernel/brokernel.h` | the public API: `compile_source` / `compile_file` / `Compiler`, `CompiledKernel` (CPU and GPU dispatch, point evaluation, `compare_cpu_gpu`), `KernelArg`, `GridShape` |
+| `include/brokernel/{ast,types,sema,lowering,module_loader,diagnostics}.h` | the compiler's stages |
+| `src/lexer.cpp`, `src/parser.cpp` | source to AST |
+| `src/sema*.cpp`, `src/types.cpp` | name resolution, generics, type checking, builtin signatures |
+| `src/lowering_mir.cpp`, `src/lowering_expr.cpp`, `src/lowering_math.cpp` | AST to brass MIR: the GPU entry point and the CPU point / grid functions |
+| `src/stdlib_modules.cpp` | the built-in modules `std::math`, `std::noise`, `std::filter`, `std::sphere`, `std::color` |
+| `tests/` | lexer/parser, sema, modules and generics, SPIR-V stages, CPU/GPU parity (against host references), and the transcendentals against libm on both targets. A GPU test with no Vulkan device exits 77 (skipped). `no_dialogs.cpp` keeps Windows test executables from opening modal dialogs |
 | `cmake/bro_deps.cmake` | the ecosystem's shared dependency resolver (identical in every repo; `scripts/sync-deps.sh` in bro copies it) |
 
 ## Building
