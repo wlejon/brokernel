@@ -142,9 +142,39 @@ size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcep
     return c;
 }
 
+// A store's element count: what every access to it is bounded by.
+uint64_t store_count(const KernelParamInfo& p, const KernelArg& a) {
+    return p.element_bytes ? a.buffer_bytes() / p.element_bytes : 0;
+}
+
+// A store the kernel accesses at the grid's cells holds them all
+// (KernelParamInfo::grid_cover_dim): those accesses are not bounded.
+bool store_covers(const KernelParamInfo& p, const KernelArg& a, GridShape shape, std::string* err) {
+    if (p.grid_cover_dim == 0) return true;
+    uint64_t cells = std::max(1u, shape.width);
+    if (p.grid_cover_dim >= 2) cells *= std::max(1u, shape.height);
+    if (p.grid_cover_dim >= 3) cells *= std::max(1u, shape.depth);
+    const uint64_t count = store_count(p, a);
+    if (count >= cells) return true;
+    if (err) {
+        *err = "store '" + p.name + "' has " + std::to_string(count) + " element(s); the kernel accesses it at the grid's " +
+               std::to_string(cells) + " cell(s)";
+    }
+    return false;
+}
+
+// What an empty store (or one smaller than an element) points at: an access
+// outside a store still reads its element 0 and discards it, so there has to
+// be an element there.
+const void* empty_store_block() {
+    alignas(64) static const uint8_t zeros[4096] = {};
+    return zeros;
+}
+
 bool pack_cpu_args(
     const CompiledKernel& kernel,
     std::span<const KernelArg> args,
+    GridShape shape,
     std::vector<uint64_t>& slots_out,
     std::string* err) {
     const size_t non_grid = count_non_grid_params(kernel.params);
@@ -170,7 +200,10 @@ bool pack_cpu_args(
                 if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
                 return false;
             }
-            slots_out.push_back(reinterpret_cast<uint64_t>(a.buffer_ptr()));
+            if (!store_covers(p, a, shape, err)) return false;
+            const uint64_t count = store_count(p, a);
+            slots_out.push_back(reinterpret_cast<uint64_t>(count ? a.buffer_ptr() : empty_store_block()));
+            slots_out.push_back(count);
         } else if (p.role == ParamRole::Scalar) {
             switch (p.type.scalar) {
                 case ScalarKind::F32: slots_out.push_back(pack_f32_bits(a.as_f32())); break;
@@ -231,8 +264,16 @@ bool CompiledKernel::eval_grid_point_cpu(
     // camera), so its argument slots reuse one buffer per thread rather than
     // allocating per call. Kernels do not call back into the host, so the
     // buffer is never in use twice on one thread.
+    // The cell's own coordinates index its stores unbounded, so it has to
+    // be one of the shape's.
+    if (gx < 0 || gy < 0 || gz < 0 || uint32_t(gx) >= std::max(1u, shape.width) ||
+        uint32_t(gy) >= std::max(1u, shape.height) || uint32_t(gz) >= std::max(1u, shape.depth)) {
+        if (err) *err = "cell (" + std::to_string(gx) + ", " + std::to_string(gy) + ", " + std::to_string(gz) +
+                        ") is outside the grid";
+        return false;
+    }
     thread_local std::vector<uint64_t> slots;
-    if (!pack_cpu_args(*this, args, slots, err)) return false;
+    if (!pack_cpu_args(*this, args, shape, slots, err)) return false;
 
     const int32_t coords_shape[6] = {
         gx, gy, gz,
@@ -307,7 +348,7 @@ bool CompiledKernel::dispatch_cpu(
         return false;
     }
     std::vector<uint64_t> slots;
-    if (!pack_cpu_args(*this, args, slots, err)) return false;
+    if (!pack_cpu_args(*this, args, shape, slots, err)) return false;
 
     const int32_t shape4[4] = {
         static_cast<int32_t>(std::max(1u, shape.width)),
@@ -403,7 +444,9 @@ bool CompiledKernel::dispatch_gpu(
                     if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
                     return false;
                 }
-                size_t bytes = std::max<size_t>(a.buffer_bytes(), 16);
+                if (!store_covers(p, a, shape, err)) return false;
+                // Room for element 0 however small the store (Ops::Bound).
+                size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
                 BoundBuffer bb;
                 bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
                 bb.host_ptr = a.buffer_ptr();
@@ -416,6 +459,7 @@ bool CompiledKernel::dispatch_gpu(
                 }
                 bound_buffers.push_back(std::move(bb));
                 vk_args.emplace_back(bound_buffers.back().dev_buf);
+                vk_args.emplace_back(static_cast<int64_t>(store_count(p, a)));
             } else if (p.role == ParamRole::Scalar) {
                 switch (p.type.scalar) {
                     case ScalarKind::F32: vk_args.emplace_back(a.as_f32()); break;

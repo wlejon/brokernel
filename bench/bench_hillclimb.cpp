@@ -197,10 +197,28 @@ brass::gpu::VulkanModule load_glsl_vulkan_module(
 }
 
 // Time a compiled brokernel on GPU using Vulkan timestamp queries (with pre-uploaded device buffers)
+// A device dispatch argument: a buffer, or a scalar. A brokernel kernel takes
+// a store as its address and element count; a GLSL baseline takes the
+// address alone (glsl_args).
+struct GpuArg {
+    GpuArg(const brass::gpu::VulkanBuffer& b) : buf(&b), arg(b) {}  // NOLINT
+    GpuArg(int32_t v) : arg(v) {}                                    // NOLINT
+    GpuArg(float v) : arg(v) {}                                      // NOLINT
+    GpuArg(double v) : arg(v) {}                                     // NOLINT
+    const brass::gpu::VulkanBuffer* buf = nullptr;
+    brass::gpu::VulkanArg arg;
+};
+
+std::vector<brass::gpu::VulkanArg> glsl_args(const std::vector<GpuArg>& args) {
+    std::vector<brass::gpu::VulkanArg> out;
+    for (const auto& a : args) out.push_back(a.arg);
+    return out;
+}
+
 double time_bk_gpu_ms(
     const CompiledKernel* k,
     GridShape shape,
-    const std::vector<brass::gpu::VulkanArg>& vk_args_without_grid_and_out,
+    const std::vector<GpuArg>& args_without_grid_and_out,
     uint32_t repeat = kGpuRepeat) {
     std::string err;
     auto vk_mod = brass::gpu::VulkanModule::load(k->spirv, &err);
@@ -209,7 +227,20 @@ double time_bk_gpu_ms(
         return 1e9;
     }
 
-    std::vector<brass::gpu::VulkanArg> full_args = vk_args_without_grid_and_out;
+    // The buffers are the kernel's stores, in order.
+    std::vector<uint32_t> store_elem_bytes;
+    for (const auto& p : k->params) {
+        if (p.role == ParamRole::Store || p.role == ParamRole::Stencil) store_elem_bytes.push_back(p.element_bytes);
+    }
+    std::vector<brass::gpu::VulkanArg> full_args;
+    size_t store_i = 0;
+    for (const auto& a : args_without_grid_and_out) {
+        full_args.push_back(a.arg);
+        if (a.buf) {
+            const uint32_t eb = store_i < store_elem_bytes.size() ? store_elem_bytes[store_i++] : 4;
+            full_args.emplace_back(static_cast<int64_t>(a.buf->size() / std::max(eb, 1u)));
+        }
+    }
     uint32_t w = std::max(1u, shape.width);
     uint32_t h = std::max(1u, shape.height);
     uint32_t d = std::max(1u, shape.depth);
@@ -1548,7 +1579,7 @@ BenchRow run_planet_flow_row(const CompileResult& res, uint32_t W, uint32_t H, c
     bufs[1].upload(t0.z.data(), NT * sizeof(float));
     bufs[2].upload(t0.w.data(), NT * sizeof(float));
     bufs[3].upload(t0.wl.data(), NT * sizeof(float));
-    std::vector<brass::gpu::VulkanArg> vk_args;
+    std::vector<GpuArg> vk_args;
     for (auto& b : bufs) vk_args.emplace_back(b);
     vk_args.emplace_back(kPlanetFlowCell);
     double bk_gpu_ms = time_bk_gpu_ms(k, GridShape(TW, TH), vk_args);
@@ -1562,7 +1593,7 @@ BenchRow run_planet_flow_row(const CompileResult& res, uint32_t W, uint32_t H, c
     auto vmod = load_glsl_vulkan_module(spv, layout, 8, 8, 1);
     vk_args.emplace_back(static_cast<int32_t>(TW));
     vk_args.emplace_back(static_cast<int32_t>(TH));
-    double glsl_ms = time_glsl_gpu_ms(vmod, TW / 8, TH / 8, 1, 8, 8, 1, vk_args);
+    double glsl_ms = time_glsl_gpu_ms(vmod, TW / 8, TH / 8, 1, 8, 8, 1, glsl_args(vk_args));
     row.gpu_glsl_mpts = mpts(NT, std::max(glsl_ms, 1e-4));
 
     const bool pass = row.cpu_pass && row.gpu_pass;
@@ -2432,7 +2463,7 @@ int main(int argc, char** argv) {
         row.cpu_ref_mpts = mpts(N, fn_ms);
 
         std::vector<KernelArg> cargs, gargs;
-        std::vector<brass::gpu::VulkanArg> vk_args;
+        std::vector<GpuArg> vk_args;
         if (dim == 2) {
             cargs = {KernelArg::store(px), KernelArg::store(py), KernelArg::store(cpu_out), KernelArg(kSeed)};
             gargs = {KernelArg::store(px), KernelArg::store(py), KernelArg::store(gpu_out), KernelArg(kSeed)};
@@ -2457,7 +2488,7 @@ int main(int argc, char** argv) {
         // is not precise, so the driver fuses multiply-adds, and Simplex's
         // small output bound turns that into ~1e-4. A wrong node is off by O(1).
         if (baseline) {
-            std::vector<brass::gpu::VulkanArg> bargs(vk_args.begin(), vk_args.end());
+            std::vector<brass::gpu::VulkanArg> bargs = glsl_args(vk_args);
             bargs.emplace_back(static_cast<int32_t>(NT));
             double glsl_ms = time_glsl_gpu_ms(*baseline, NT / 64, 1, 1, 64, 1, 1, bargs);
             d_out.download(glsl_out.data(), N * sizeof(float));

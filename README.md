@@ -60,6 +60,18 @@ general graphics:
     polynomials.
   - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
     fails, with `ran_gpu` false, when there is no Vulkan device.
+- **A store access never leaves its store.** A kernel's store takes its
+  element count with its address, on both targets:
+  - An access at the grid's cells (a stencil read, `read()` / `write()`, or
+    an index of the cell's own coordinates: `g.x()`, `g.y()`, `g.z()` in
+    their places, or `g.linear_index()` into a 1D store) is bounded by the
+    dispatch. The store must hold the grid's cells over its axes
+    (`KernelParamInfo::grid_cover_dim`), or the dispatch fails naming it.
+  - Any other access is bounded where it is made: outside the store a read
+    is zero, a write and an atomic do nothing. In the CPU's vector loop a
+    contiguous access tests its whole group once and goes lane by lane only
+    when the group runs past the store's end.
+  - A point query's cell has to lie in its grid.
 - **Grid indices are 64-bit.** `g.linear_index()`, `g.total_cells()` (and
   `grid_linear_index()`, `grid_total_cells()`) are i64, stores take i32 or
   i64 coordinates, and the CPU's grid loop indexes in i64, so a grid may

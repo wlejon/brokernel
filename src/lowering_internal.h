@@ -8,6 +8,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace brokernel::detail {
@@ -76,9 +77,34 @@ struct MirBodyLowerer {
     // vector build stays x's stride: one contiguous load).
     bool x_interior = false;
 
+    // Which store accesses the dispatch bounds rather than the access. One
+    // at a cell of the grid (a stencil read, read() / write(), or an index
+    // of the cell's own coordinates: g.x(), g.y(), g.z() in their places,
+    // or g.linear_index() into a 1D store) is in bounds whenever its store
+    // covers the grid's first `dim` axes, which the host checks once per
+    // dispatch (KernelParamInfo::grid_cover_dim); any other access is
+    // bounded (Ops::Bound). Only a compute kernel over a grid, with the
+    // GPU's grid guard (no barriers), has its cells' coordinates in the
+    // grid: a point kernel's or a barrier kernel's invocations run past it,
+    // so their accesses are all bounded but a stencil's clamped reads. Every
+    // build of a kernel decides alike, so grid_cover holds for all of them.
+    bool cell_coords_in_grid = true;
+    std::unordered_map<const brass::Value*, size_t> store_param;   // a store parameter's pointer -> its index
+    std::vector<uint32_t> grid_cover;                              // per parameter
+    std::unordered_set<const brass::Value*> linear_indices;        // values of g.linear_index()
+    // A store parameter's leaves, its pointer recorded.
+    void bind_store_param(size_t index, const ValueList& store) { store_param[store[0]] = index; }
+    // `store` accessed at a cell, covering `dim` axes: its pointer alone.
+    ValueList at_cells(const ValueList& store, uint32_t dim);
+    // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are
+    // the cell's coordinates, else the store bounded.
+    ValueList store_access(const ValueList& store, uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z);
+
     MirBodyLowerer(const CheckedModule& m, const CheckedFunction& f, DiagnosticBag& d,
                    brass::codegen::KernelBuilder& kbuilder, bool gpu)
-        : mod(m), root_fn(f), diags(d), kb(kbuilder), b(kbuilder.builder()), is_gpu(gpu) {}
+        : mod(m), root_fn(f), diags(d), kb(kbuilder), b(kbuilder.builder()), is_gpu(gpu),
+          cell_coords_in_grid(f.stage == Stage::Compute && f.grid_dim > 0 && !f.uses_barriers_or_shared),
+          grid_cover(f.params.size(), 0) {}
 
     void push_scope() { scopes.emplace_back(); }
     void pop_scope() {
@@ -98,8 +124,12 @@ struct MirBodyLowerer {
     // s[dx, dy, dz]: the cell that far from this one, clamped into the grid.
     ValueList lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets);
     brass::Value* compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z);
-    ValueList load_element_from_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx);
-    void store_element_to_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx,
+    // An element of a store: `store` is its leaves, the pointer and, for a
+    // kernel's store parameter, its element count, against which the access
+    // is bounded (Ops::Bound). The return store the host sizes is the
+    // pointer alone.
+    ValueList load_element_from_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx);
+    void store_element_to_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx,
                                  const ValueList& vals);
 
     brass::Value* lower_scalar_cast(brass::Value* v, ScalarKind from_sk, ScalarKind to_sk);

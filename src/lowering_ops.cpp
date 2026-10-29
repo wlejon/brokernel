@@ -2,6 +2,7 @@
 
 namespace brokernel::detail {
 
+using brass::BasicBlock;
 using brass::Opcode;
 using brass::Type;
 using brass::Value;
@@ -552,62 +553,161 @@ bool Ops::is_contiguous(const Value* index, uint8_t scale, Type t) const {
            m->second.stride * scale == static_cast<int64_t>(t.size_in_bytes());
 }
 
-Value* Ops::build_load_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset) {
-    if (is_contiguous(index, scale, t)) {
-        // The lanes' elements are consecutive.
-        check_lanes(t);
-        Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
-        return b_.build_vload(vec_type(t), addr, offset);
-    }
-    if (!is_varying(index) && !is_index_marker(index)) return b_.build_load_indexed(t, base, index, scale, offset);
+static Value* zero_index(brass::Builder& b, const Value* index) {
+    return index->type().element_type() == Type::i64() ? b.build_iconst_i64(0) : b.build_iconst_i32(0);
+}
+
+static Value* zero_scalar(brass::Builder& b, Type t) {
+    if (t == Type::f32()) return b.build_fconst_f32(0.0f);
+    if (t == Type::f64()) return b.build_fconst_f64(0.0);
+    if (t == Type::i64()) return b.build_iconst_i64(0);
+    return b.build_iconst_i32(0);
+}
+
+Value* Ops::in_bounds(Value* index, const Bound& bound) {
+    // Unsigned, so a negative index is out too.
+    return b_.build_ult(index, bound.count);
+}
+
+Value* Ops::group_in_bounds(const Bound& bound) {
+    auto m = markers_.find(bound.index);
+    if (m == markers_.end() || m->second.off || m->second.stride <= 0) return nullptr;
+    Value* last = b_.build_add(bound.index, b_.build_iconst_i64(m->second.stride * (lanes - 1)));
+    return b_.build_and(in_bounds(bound.index, bound), in_bounds(last, bound));
+}
+
+BasicBlock* Ops::side_block(std::string_view name) {
+    BasicBlock* prev = b_.current_block();
+    BasicBlock* bb = b_.append_block(name);
+    if (prev) b_.position_at_end(prev);
+    return bb;
+}
+
+Value* Ops::load_lanes(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, const Bound* bound) {
     check_lanes(t);
     Value* out = b_.build_vzero(vec_type(t));
     for (uint32_t i = 0; i < lanes; ++i) {
         Value* idx = lane_of(index, i);
-        if (mask) {
-            Value* zero = idx->type() == Type::i64() ? b_.build_iconst_i64(0) : b_.build_iconst_i32(0);
-            idx = b_.build_select(lane_of(mask, i), idx, zero);
+        Value* on = mask ? lane_of(mask, i) : nullptr;
+        if (bound) {
+            Value* in = in_bounds(lane_of(bound->index, i), *bound);
+            on = on ? b_.build_select(in, on, b_.build_iconst_i32(0)) : in;
         }
-        out = b_.build_vinsert_lane(out, b_.build_load_indexed(t, base, idx, scale, offset), i);
+        if (on) idx = b_.build_select(on, idx, zero_index(b_, idx));
+        Value* v = b_.build_load_indexed(t, base, idx, scale, offset);
+        if (bound) v = b_.build_select(on, v, zero_scalar(b_, t));
+        out = b_.build_vinsert_lane(out, v, i);
     }
     return out;
 }
 
-void Ops::build_store_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, Value* val) {
-    val = real(val);
-    const bool marker = is_index_marker(index);
+Value* Ops::build_load_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, const Bound* bound) {
     if (is_contiguous(index, scale, t)) {
+        // The lanes' elements are consecutive.
         check_lanes(t);
         Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
-        b_.build_vstore(vec_type(t), addr, offset, widen(val));
-        return;
+        Value* ok = bound ? group_in_bounds(*bound) : nullptr;
+        if (!bound) return b_.build_vload(vec_type(t), addr, offset);
+        if (ok) {
+            // One test for the group; only a group running past its store
+            // goes lane by lane.
+            BasicBlock* fast = side_block("bounded_load_group");
+            BasicBlock* slow = side_block("bounded_load_lanes");
+            BasicBlock* join = side_block("bounded_load_join");
+            Value* v = b_.add_block_param(join, vec_type(t));
+            b_.build_br_if(ok, fast, slow);
+            b_.position_at_end(fast);
+            b_.build_br(join, {b_.build_vload(vec_type(t), addr, offset)});
+            b_.position_at_end(slow);
+            b_.build_br(join, {load_lanes(t, base, index, scale, offset, bound)});
+            b_.position_at_end(join);
+            return v;
+        }
     }
-    if (!mask && !marker && !is_varying(index) && !is_varying(val)) {
-        b_.build_store_indexed(t, base, index, scale, offset, val);
-        return;
+    if (!is_varying(index) && !is_index_marker(index) && !(bound && is_varying(bound->index))) {
+        if (!bound) return b_.build_load_indexed(t, base, index, scale, offset);
+        Value* in = in_bounds(bound->index, *bound);
+        Value* v = b_.build_load_indexed(t, base, b_.build_select(in, index, zero_index(b_, index)), scale, offset);
+        return b_.build_select(in, v, zero_scalar(b_, t));
     }
-    if (mask && (offset < 0 || offset > 248)) {
-        throw VectorUnsupported("a masked store at offset " + std::to_string(offset));
-    }
-    Value* zero = index->type().element_type() == Type::i64() ? b_.build_iconst_i64(0) : b_.build_iconst_i32(0);
-    if (!marker && !is_varying(index) && !is_varying(val)) {
-        // One store, by any active lane.
-        Value* on = any(mask);
-        b_.build_store_indexed(t, b_.build_select(on, base, scratch), b_.build_select(on, index, zero), scale,
-                               offset, val);
-        return;
-    }
+    return load_lanes(t, base, index, scale, offset, bound);
+}
+
+void Ops::store_lanes(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, Value* val,
+                      const Bound* bound) {
     check_lanes(t);
     for (uint32_t i = 0; i < lanes; ++i) {
         Value* idx = lane_of(index, i);
         Value* where = base;
-        if (mask) {
-            Value* m = lane_of(mask, i);
-            where = b_.build_select(m, base, scratch);
-            idx = b_.build_select(m, idx, zero);
+        Value* on = mask ? lane_of(mask, i) : nullptr;
+        if (bound) {
+            Value* in = in_bounds(lane_of(bound->index, i), *bound);
+            on = on ? b_.build_select(in, on, b_.build_iconst_i32(0)) : in;
+        }
+        if (on) {
+            where = b_.build_select(on, base, scratch);
+            idx = b_.build_select(on, idx, zero_index(b_, idx));
         }
         b_.build_store_indexed(t, where, idx, scale, offset, lane_of(val, i));
     }
+}
+
+void Ops::build_store_indexed(Type t, Value* base, Value* index, uint8_t scale, int32_t offset, Value* val,
+                              const Bound* bound) {
+    val = real(val);
+    const bool marker = is_index_marker(index);
+    if ((mask || bound) && vector_mode() && (offset < 0 || offset > 248)) {
+        throw VectorUnsupported("a masked store at offset " + std::to_string(offset));
+    }
+    if (is_contiguous(index, scale, t)) {
+        check_lanes(t);
+        Value* addr = b_.build_add(base, b_.build_mul(index, b_.build_iconst_i64(scale)));
+        Value* ok = bound ? group_in_bounds(*bound) : nullptr;
+        if (!bound) {
+            b_.build_vstore(vec_type(t), addr, offset, widen(val));
+            return;
+        }
+        if (ok) {
+            BasicBlock* fast = side_block("bounded_store_group");
+            BasicBlock* slow = side_block("bounded_store_lanes");
+            BasicBlock* join = side_block("bounded_store_join");
+            b_.build_br_if(ok, fast, slow);
+            b_.position_at_end(fast);
+            b_.build_vstore(vec_type(t), addr, offset, widen(val));
+            b_.build_br(join);
+            b_.position_at_end(slow);
+            store_lanes(t, base, index, scale, offset, val, bound);
+            b_.build_br(join);
+            b_.position_at_end(join);
+            return;
+        }
+    }
+    const bool uniform = !marker && !is_varying(index) && !is_varying(val) && !(bound && is_varying(bound->index));
+    if (uniform && !mask) {
+        if (!bound) {
+            b_.build_store_indexed(t, base, index, scale, offset, val);
+            return;
+        }
+        // Stored only in bounds: a branch (the GPU has no scratch slot to
+        // send it to).
+        BasicBlock* store_bb = side_block("bounded_store");
+        BasicBlock* done_bb = side_block("bounded_store_done");
+        b_.build_br_if(in_bounds(bound->index, *bound), store_bb, done_bb);
+        b_.position_at_end(store_bb);
+        b_.build_store_indexed(t, base, index, scale, offset, val);
+        b_.build_br(done_bb);
+        b_.position_at_end(done_bb);
+        return;
+    }
+    if (uniform) {
+        // One store, by any active lane.
+        Value* on = any(mask);
+        if (bound) on = b_.build_select(in_bounds(bound->index, *bound), on, b_.build_iconst_i32(0));
+        b_.build_store_indexed(t, b_.build_select(on, base, scratch), b_.build_select(on, index, zero_index(b_, index)),
+                               scale, offset, val);
+        return;
+    }
+    store_lanes(t, base, index, scale, offset, val, bound);
 }
 
 Value* Ops::build_call(std::string_view callee, Type ret, std::initializer_list<Value*> args) {

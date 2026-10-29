@@ -235,13 +235,14 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
                 ValueList y = dim >= 2 ? lower_expr(s->assign_target->args[1].get()) : ValueList{b.build_iconst_i32(0)};
                 ValueList z = dim >= 3 ? lower_expr(s->assign_target->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                 brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
+                base = store_access(base, dim, x[0], y[0], z[0]);
                 if (s->compound_op.has_value()) {
-                    ValueList old_v = load_element_from_buffer(elem_t, base[0], lin);
+                    ValueList old_v = load_element_from_buffer(elem_t, base, lin);
                     for (size_t k = 0; k < old_v.size() && k < rhs.size(); ++k) {
                         rhs[k] = lower_scalar_binary(*s->compound_op, old_v[k], rhs[k], elem_t.scalar);
                     }
                 }
-                store_element_to_buffer(elem_t, base[0], lin, rhs);
+                store_element_to_buffer(elem_t, base, lin, rhs);
                 return;
             }
             // 2. Local variable (or vector swizzle / struct field / array element of local variable)
@@ -428,6 +429,8 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     }
     for (size_t i = 0; i < fn.params.size(); ++i) {
         lowerer.alloc_var(fn.params[i].name, f.params[i]);
+        const ParamRole role = fn.params[i].role;
+        if (role == ParamRole::Store || role == ParamRole::Stencil) lowerer.bind_store_param(i, f.params[i]);
     }
     lowerer.lower_stmt_list(fn.body);
     if (lowerer.ret_val_var_id < 0) return;
@@ -442,7 +445,7 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     brass::Value* zero = b.build_iconst_i32(0);
     brass::Value* first = lanes ? lowerer.compute_linear_index(dim, ops.iota_i32(), zero, zero)
                                 : b.build_iconst_i64(0);
-    lowerer.store_element_to_buffer(fn.return_type, f.out_ret, ops.build_select(has_out, lin, first), ret);
+    lowerer.store_element_to_buffer(fn.return_type, {f.out_ret}, ops.build_select(has_out, lin, first), ret);
 }
 
 // The CPU grid function:
@@ -474,8 +477,9 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
         if (cp.role == ParamRole::Grid || cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) {
             f.params.push_back({b.build_iconst_i32(0)});
         } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
-            f.params.push_back({b.build_load(brass::Type::ptr(), args_pack, slot * 8)});
-            slot += 1;
+            f.params.push_back({b.build_load(brass::Type::ptr(), args_pack, slot * 8),
+                                b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8)});
+            slot += 2;
         } else {
             auto kinds = mod.types.flatten_scalars(cp.type);
             ValueList leaves;
@@ -613,10 +617,14 @@ LoweredKernelMir lower_kernel_to_mir(
                 pinfo.mir_param_count = 0;
                 lowerer.alloc_var(cp.name, {b.build_iconst_i32(0)});
             } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
-                pinfo.mir_param_count = 1;
+                // Its address and its element count (the bound of every access).
+                pinfo.mir_param_count = 2;
+                pinfo.element_bytes = mod.types.byte_size(cp.type.element_type());
                 brass::Value* ptr_p = b.add_param(brass::Type::ptr());
-                lowerer.alloc_var(cp.name, {ptr_p});
-                mir_idx += 1;
+                brass::Value* count_p = b.add_param(brass::Type::i64());
+                lowerer.alloc_var(cp.name, {ptr_p, count_p});
+                lowerer.bind_store_param(out.param_infos.size(), {ptr_p, count_p});
+                mir_idx += 2;
             } else if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) {
                 pinfo.mir_param_count = 0;
                 lowerer.alloc_var(cp.name, {b.build_iconst_i32(static_cast<int32_t>(cp.descriptor_binding))});
@@ -702,11 +710,14 @@ LoweredKernelMir lower_kernel_to_mir(
             b.position_at_end(body_bb);
         }
         lowerer.lower_stmt_list(fn.body);
+        for (size_t i = 0; i < out.param_infos.size(); ++i) {
+            out.param_infos[i].grid_cover_dim = lowerer.grid_cover[i];
+        }
         if (gpu_out_ptr && lowerer.ret_val_var_id >= 0) {
             brass::Value* lin = (fn.grid_dim > 0)
                                     ? lowerer.compute_linear_index(fn.grid_dim, lowerer.gx, lowerer.gy, lowerer.gz)
                                     : b.build_iconst_i32(0);
-            lowerer.store_element_to_buffer(fn.return_type, gpu_out_ptr, lin, lowerer.var_values[lowerer.ret_val_var_id]);
+            lowerer.store_element_to_buffer(fn.return_type, {gpu_out_ptr}, lin, lowerer.var_values[lowerer.ret_val_var_id]);
         }
         if (done_bb) {
             b.build_br(done_bb);
@@ -755,8 +766,10 @@ LoweredKernelMir lower_kernel_to_mir(
                 lowerer.alloc_var(cp.name, {b.build_iconst_i32(0)});
             } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
                 brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
-                lowerer.alloc_var(cp.name, {ptr_v});
-                slot += 1;
+                brass::Value* count_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
+                lowerer.alloc_var(cp.name, {ptr_v, count_v});
+                lowerer.bind_store_param(static_cast<size_t>(&cp - fn.params.data()), {ptr_v, count_v});
+                slot += 2;
             } else {
                 auto kinds = mod.types.flatten_scalars(cp.type);
                 ValueList leaves;
@@ -770,7 +783,7 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         lowerer.lower_stmt_list(fn.body);
         if (lowerer.ret_val_var_id >= 0) {
-            lowerer.store_element_to_buffer(fn.return_type, out_ret, b.build_iconst_i32(0),
+            lowerer.store_element_to_buffer(fn.return_type, {out_ret}, b.build_iconst_i32(0),
                                             lowerer.var_values[lowerer.ret_val_var_id]);
         }
         b.build_ret_void();

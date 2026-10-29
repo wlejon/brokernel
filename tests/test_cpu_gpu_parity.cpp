@@ -349,6 +349,104 @@ static void test_vector_stencil_edges() {
     }
 }
 
+// Store accesses outside the store: a read is zero, a write does nothing, on
+// every path (a gather and scatter lane by lane, a contiguous group running
+// past its store's end, a uniform index), the vector loop, its scalar tail
+// and the GPU alike. Accesses at the cells are bounded by the dispatch
+// instead: a store too small for the grid is refused.
+static void test_store_bounds() {
+    const char* src = R"(
+        @kernel @grid(1)
+        fn k_bounds(g: grid<1>, table: read_store<f32, 1>, idx: read_store<i32, 1>,
+                    out_a: write_store<f32, 1>, out_b: write_store<f32, 1>,
+                    scatter: write_store<f32, 1>, edge: write_store<f32, 1>, tail: write_store<f32, 1>) {
+            let i = g.x();
+            let j = idx[i];
+            out_a[i] = table[j];
+            out_b[i] = table[i + 2] + table[3] * 100.0 + table[64] * 1000.0;
+            scatter[j] = f32(i) + 1.0;
+            edge[i - 3] = f32(i);
+            tail[5] = 7.0;
+            tail[1] = 2.0;
+        }
+    )";
+    auto res = compile_source(src, "store_bounds.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_bounds");
+    assert(k);
+    assert(k->find_param("idx")->grid_cover_dim == 1);
+    assert(k->find_param("out_a")->grid_cover_dim == 1);
+    assert(k->find_param("table")->grid_cover_dim == 0);
+    assert(k->find_param("scatter")->grid_cover_dim == 0);
+    if (brass::host_has_avx2() && k->cpu_grid_lanes != 8) {
+        std::cerr << "k_bounds runs " << k->cpu_grid_lanes << " lanes\n";
+        assert(false);
+    }
+    std::vector<float> table(10);
+    for (size_t t = 0; t < table.size(); ++t) table[t] = 1.0f + static_cast<float>(t);
+    for (uint32_t W : {5u, 8u, 13u, 37u, 64u}) {
+        std::vector<int32_t> idx(W);
+        for (uint32_t i = 0; i < W; ++i) idx[i] = static_cast<int32_t>(i) * 3 - 7;
+        std::vector<float> out_a(W, -1.0f), out_b(W, -1.0f), scatter(20, -1.0f), edge(12, -1.0f), tail(3, -1.0f);
+        std::vector<KernelArg> args = {KernelArg::store(table), KernelArg::store(idx), KernelArg::store(out_a),
+                                       KernelArg::store(out_b), KernelArg::store(scatter), KernelArg::store(edge),
+                                       KernelArg::store(tail)};
+        std::string err;
+        if (!k->dispatch_cpu(GridShape(W), args, nullptr, &err)) {
+            std::cerr << "store bounds: " << err << "\n";
+            assert(false);
+        }
+        auto fail = [&](const char* what, size_t at, float got, float want) {
+            std::cerr << "store bounds, width " << W << ": " << what << "[" << at << "] " << got << ", want " << want << "\n";
+            assert(false);
+        };
+        for (uint32_t i = 0; i < W; ++i) {
+            const int32_t j = idx[i];
+            const float a = (j >= 0 && j < 10) ? table[j] : 0.0f;
+            const float b = (i + 2 < 10 ? table[i + 2] : 0.0f) + table[3] * 100.0f;
+            if (out_a[i] != a) fail("out_a", i, out_a[i], a);
+            if (out_b[i] != b) fail("out_b", i, out_b[i], b);
+        }
+        for (int32_t s = 0; s < 20; ++s) {
+            const bool hit = (s + 7) % 3 == 0 && static_cast<uint32_t>((s + 7) / 3) < W;
+            const float want = hit ? static_cast<float>((s + 7) / 3) + 1.0f : -1.0f;
+            if (scatter[s] != want) fail("scatter", s, scatter[s], want);
+        }
+        for (uint32_t e = 0; e < 12; ++e) {
+            const float want = e + 3 < W ? static_cast<float>(e + 3) : -1.0f;
+            if (edge[e] != want) fail("edge", e, edge[e], want);
+        }
+        if (tail[0] != -1.0f || tail[1] != 2.0f || tail[2] != -1.0f) fail("tail", 0, tail[0], -1.0f);
+
+        // (The GPU zeroes a write-only store, so these start at zero.)
+        std::vector<float> g_a(W), g_b(W), g_s(20), g_e(12), g_t(3);
+        std::vector<KernelArg> gargs = {KernelArg::store(table), KernelArg::store(idx), KernelArg::store(g_a),
+                                        KernelArg::store(g_b), KernelArg::store(g_s), KernelArg::store(g_e),
+                                        KernelArg::store(g_t)};
+        auto rep = k->compare_cpu_gpu(GridShape(W), gargs, 0.0, 0.0);
+        if (!rep.ok) std::cerr << "store bounds parity, width " << W << ": " << rep.message << "\n";
+        assert(rep.ok);
+
+        // A store accessed at the cells, one element short of the grid.
+        std::vector<float> short_a(W - 1);
+        std::vector<KernelArg> bad = args;
+        bad[2] = KernelArg::store(short_a);
+        err.clear();
+        assert(!k->dispatch_cpu(GridShape(W), bad, nullptr, &err) && err.find("out_a") != std::string::npos);
+        err.clear();
+        assert(!k->dispatch_gpu(GridShape(W), bad, nullptr, &err) && err.find("out_a") != std::string::npos);
+    }
+    // A point query's cell is one of its grid's.
+    std::vector<int32_t> idx1(4, 0);
+    std::vector<float> o1(4), o2(4), o3(20), o4(12), o5(3);
+    std::vector<KernelArg> args1 = {KernelArg::store(table), KernelArg::store(idx1), KernelArg::store(o1),
+                                    KernelArg::store(o2), KernelArg::store(o3), KernelArg::store(o4), KernelArg::store(o5)};
+    std::string err;
+    assert(k->eval_grid_point_cpu(3, 0, 0, GridShape(4), args1, nullptr, &err));
+    assert(!k->eval_grid_point_cpu(4, 0, 0, GridShape(4), args1, nullptr, &err));
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -360,6 +458,7 @@ int main() {
     test_3d_voxel_and_control_flow_parity();
     test_vector_grid_lanes();
     test_vector_stencil_edges();
+    test_store_bounds();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

@@ -29,7 +29,15 @@ struct KernelParamInfo {
     int32_t halo[3] = {0, 0, 0};       // Max |offset| per axis (x, y, z)
     std::vector<StencilOffset> stencil_offsets;
     uint32_t mir_param_index = 0;      // Starting index in SpirvKernel::params
-    uint32_t mir_param_count = 1;      // Number of lowered scalar/ptr MIR params
+    uint32_t mir_param_count = 1;      // Number of lowered scalar/ptr MIR params (a store: its address and element count)
+    uint32_t element_bytes = 0;        // A store's element size: its count is its bytes / this
+    // A store the kernel reads or writes at the grid's cells (a stencil, or
+    // at the cell's own coordinates), over the grid's first this-many axes:
+    // the dispatch requires it to hold at least that many cells (width,
+    // times height from 2, times depth at 3). Its other accesses are
+    // bounded: outside the store a read is zero and a write does nothing.
+    // 0 when no access is at the cells.
+    uint32_t grid_cover_dim = 0;
     uint32_t push_constant_offset = 0; // Byte offset in Vulkan push-constant block
     uint32_t push_constant_size = 0;   // Byte size in Vulkan push-constant block
     uint32_t descriptor_set = 0;       // For Image / Sampler

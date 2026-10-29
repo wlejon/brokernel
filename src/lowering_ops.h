@@ -91,6 +91,8 @@ public:
     void position_at_end(brass::BasicBlock* bb) { b_.position_at_end(bb); }
     brass::BasicBlock* current_block() const { return b_.current_block(); }
     brass::BasicBlock* append_block(std::string_view name) { return b_.append_block(name); }
+    // A block appended to the function, the insertion point left where it was.
+    brass::BasicBlock* side_block(std::string_view name);
     brass::Value* add_block_param(brass::BasicBlock* bb, brass::Type t) { return b_.add_block_param(bb, t); }
     brass::Value* add_param(brass::Type t) { return b_.add_param(t); }
     brass::Instruction* build_br(brass::BasicBlock* t) { return b_.build_br(t); }
@@ -163,11 +165,22 @@ public:
     brass::Value* build_select(brass::Value* c, brass::Value* t, brass::Value* f);
 
     // Memory.
+    //
+    // A store's bound: the element an access is at (an i64 index, possibly
+    // varying or a marker) and the store's element count (a uniform i64).
+    // A bounded access outside [0, count) reads zero and writes nothing; an
+    // out-of-bounds load reads element 0 (the leaf at `offset` of it) and
+    // discards it, so a store the host passes has room for one element even
+    // when its count is 0.
+    struct Bound {
+        brass::Value* index;
+        brass::Value* count;
+    };
     brass::Value* build_load(brass::Type t, brass::Value* base, int32_t offset);
     brass::Value* build_load_indexed(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale,
-                                     int32_t offset = 0);
+                                     int32_t offset = 0, const Bound* bound = nullptr);
     void build_store_indexed(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale,
-                             int32_t offset, brass::Value* val);
+                             int32_t offset, brass::Value* val, const Bound* bound = nullptr);
     void build_store_indexed(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale,
                              brass::Value* val) {
         build_store_indexed(t, base, index, scale, 0, val);
@@ -202,6 +215,17 @@ private:
     brass::Value* marker_lane(brass::Value* m, uint32_t i);
     // A load or store at `index` reads or writes the lanes' consecutive elements.
     bool is_contiguous(const brass::Value* index, uint8_t scale, brass::Type t) const;
+    // Whether element `index` (a scalar i64) is in [0, count): an i32 bool.
+    brass::Value* in_bounds(brass::Value* index, const Bound& bound);
+    // For a contiguous access, the uniform test that every lane's element is
+    // in bounds; nullptr when the bound's index is not a lane-number marker.
+    brass::Value* group_in_bounds(const Bound& bound);
+    // The lane-by-lane forms (also the bounded path of a contiguous access
+    // whose group runs past its store).
+    brass::Value* load_lanes(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale,
+                             int32_t offset, const Bound* bound);
+    void store_lanes(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale, int32_t offset,
+                     brass::Value* val, const Bound* bound);
 
     enum class Cmp { eq, ne, lt, le, gt, ge };
     brass::Value* compare(Cmp c, bool is_unsigned, brass::Value* a, brass::Value* d);

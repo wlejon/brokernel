@@ -107,6 +107,19 @@ brass::Value* MirBodyLowerer::clamp_coord(brass::Value* c, brass::Value* extent)
         brass::Value* c_lo = b.build_select(b.build_slt(c, zero), zero, c);
         return b.build_select(b.build_sgt(c_lo, hi), hi, c_lo);
     }
+ValueList MirBodyLowerer::at_cells(const ValueList& store, uint32_t dim) {
+        auto it = store_param.find(store[0]);
+        if (it == store_param.end()) return store;
+        grid_cover[it->second] = std::max(grid_cover[it->second], dim);
+        return {store[0]};
+    }
+ValueList MirBodyLowerer::store_access(const ValueList& store, uint32_t dim, brass::Value* x, brass::Value* y,
+                                       brass::Value* z) {
+        if (!cell_coords_in_grid) return store;
+        if (dim == 1 && linear_indices.count(x)) return at_cells(store, std::max(1u, root_fn.grid_dim));
+        if (x != gx || (dim >= 2 && y != gy) || (dim >= 3 && z != gz)) return store;
+        return at_cells(store, dim);
+    }
 ValueList MirBodyLowerer::lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets) {
         ValueList base = lower_expr(stencil);
         auto offset = [&](size_t i) -> brass::Value* {
@@ -116,7 +129,9 @@ ValueList MirBodyLowerer::lower_stencil_read(const Expr* stencil, const Type& st
         if (!x_interior) x = clamp_coord(x, gw);
         brass::Value* y = (st.dimension >= 2) ? clamp_coord(b.build_add(gy, offset(1)), gh) : b.build_iconst_i32(0);
         brass::Value* z = (st.dimension >= 3) ? clamp_coord(b.build_add(gz, offset(2)), gd) : b.build_iconst_i32(0);
-        return load_element_from_buffer(st.element_type(), base[0], compute_linear_index(st.dimension, x, y, z));
+        // Clamped (or interior), a stencil read is always at a cell.
+        return load_element_from_buffer(st.element_type(), at_cells(base, st.dimension),
+                                        compute_linear_index(st.dimension, x, y, z));
     }
 brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z) {
         auto to_i64 = [&](brass::Value* v) -> brass::Value* {
@@ -134,14 +149,17 @@ brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x
         brass::Value* zy = b.build_add(b.build_mul(z64, gh64), y64);
         return b.build_add(b.build_mul(zy, gw64), x64);
     }
-ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx) {
+ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx) {
+        brass::Value* base_ptr = store[0];
         brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
+        const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
+        const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
         auto kinds = mod.types.flatten_scalars(elem_type);
         ValueList res;
         res.reserve(kinds.size());
         if (kinds.size() == 1) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            res.push_back(b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes())));
+            res.push_back(b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, bound));
             return res;
         }
         // Check if all leaves have identical scalar kind
@@ -155,7 +173,7 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass:
             brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size(); ++i) {
                 brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                res.push_back(b.build_load_indexed(mt, base_ptr, idx_i, scale));
+                res.push_back(b.build_load_indexed(mt, base_ptr, idx_i, scale, 0, bound));
             }
             return res;
         }
@@ -165,18 +183,21 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, brass:
         uint32_t cur_off = 0;
         for (ScalarKind sk : kinds) {
             brass::Type mt = to_mir_scalar_type(sk);
-            res.push_back(b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off)));
+            res.push_back(b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), bound));
             cur_off += static_cast<uint32_t>(mt.size_in_bytes());
         }
         return res;
     }
-void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, brass::Value* base_ptr, brass::Value* linear_idx,
+void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx,
                                  const ValueList& vals) {
+        brass::Value* base_ptr = store[0];
         brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
+        const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
+        const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
         auto kinds = mod.types.flatten_scalars(elem_type);
         if (kinds.size() == 1 && !vals.empty()) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), vals[0]);
+            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, vals[0], bound);
             return;
         }
         bool uniform = true;
@@ -189,7 +210,7 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, brass::Value
             brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
                 brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                b.build_store_indexed(mt, base_ptr, idx_i, scale, vals[i]);
+                b.build_store_indexed(mt, base_ptr, idx_i, scale, 0, vals[i], bound);
             }
             return;
         }
@@ -198,7 +219,7 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, brass::Value
         uint32_t cur_off = 0;
         for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
             brass::Type mt = to_mir_scalar_type(kinds[i]);
-            b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), vals[i]);
+            b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), vals[i], bound);
             cur_off += static_cast<uint32_t>(mt.size_in_bytes());
         }
     }
@@ -532,7 +553,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList y = e->args.size() >= 2 ? lower_expr(e->args[1].get()) : ValueList{b.build_iconst_i32(0)};
                 ValueList z = e->args.size() >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                 brass::Value* lin = compute_linear_index(rt.dimension, x[0], y[0], z[0]);
-                return load_element_from_buffer(rt.element_type(), base[0], lin);
+                return load_element_from_buffer(rt.element_type(), store_access(base, rt.dimension, x[0], y[0], z[0]), lin);
             }
             // Vector or array indexing
             ValueList recv = lower_expr(e->lhs.get());
@@ -577,7 +598,9 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 if (m == "height") return {gh};
                 if (m == "depth") return {gd};
                 if (m == "linear_index") {
-                    return {compute_linear_index(rt.dimension, gx, gy, gz)};
+                    brass::Value* lin = compute_linear_index(rt.dimension, gx, gy, gz);
+                    linear_indices.insert(lin);
+                    return {lin};
                 }
                 if (m == "total_cells") {
                     brass::Value* total = b.build_sext_i64(gw);
@@ -616,12 +639,12 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 Type elem_t = rt.element_type();
                 if (m == "read") {
                     brass::Value* lin = compute_linear_index(dim, gx, gy, gz);
-                    return load_element_from_buffer(elem_t, base[0], lin);
+                    return load_element_from_buffer(elem_t, store_access(base, dim, gx, gy, gz), lin);
                 }
                 if (m == "write") {
                     ValueList val = lower_expr(e->args[0].get());
                     brass::Value* lin = compute_linear_index(dim, gx, gy, gz);
-                    store_element_to_buffer(elem_t, base[0], lin, val);
+                    store_element_to_buffer(elem_t, store_access(base, dim, gx, gy, gz), lin, val);
                     return {};
                 }
                 if (m == "load") {
@@ -629,7 +652,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     ValueList y = dim >= 2 ? lower_expr(e->args[1].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList z = dim >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                     brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
-                    return load_element_from_buffer(elem_t, base[0], lin);
+                    return load_element_from_buffer(elem_t, store_access(base, dim, x[0], y[0], z[0]), lin);
                 }
                 if (m == "store") {
                     ValueList x = dim >= 1 ? lower_expr(e->args[0].get()) : ValueList{b.build_iconst_i32(0)};
@@ -637,7 +660,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     ValueList z = dim >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList val = lower_expr(e->args[dim].get());
                     brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
-                    store_element_to_buffer(elem_t, base[0], lin, val);
+                    store_element_to_buffer(elem_t, store_access(base, dim, x[0], y[0], z[0]), lin, val);
                     return {};
                 }
                 if (m == "atomic_add" || m == "atomic_min" || m == "atomic_max" || m == "atomic_exchange") {
@@ -646,25 +669,40 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     ValueList z = dim >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList val = lower_expr(e->args[dim].get());
                     brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
+                    base = store_access(base, dim, x[0], y[0], z[0]);
                     if (is_gpu) {
                         uint32_t esz = elem_t.scalar_size_bytes();
                         brass::Value* lin64 = (lin->type() == brass::Type::i64()) ? lin : b.build_sext_i64(lin);
                         brass::Value* byte_off = b.build_mul(lin64, b.build_iconst_i64(esz));
                         brass::Value* addr = b.build_add(base[0], byte_off);
-                        if (m == "atomic_add") {
-                            return {elem_t.is_f32() ? kb.atom_add_f32(addr, val[0]) : kb.atom_add_i32(addr, val[0])};
-                        }
-                        if (m == "atomic_min") return {b.build_call("ptx_atom_min_i32", brass::Type::i32(), {addr, val[0]})};
-                        if (m == "atomic_max") return {b.build_call("ptx_atom_max_i32", brass::Type::i32(), {addr, val[0]})};
-                        return {b.build_call("ptx_atom_exch_i32", brass::Type::i32(), {addr, val[0]})};
+                        auto atomic = [&]() -> brass::Value* {
+                            if (m == "atomic_add") {
+                                return elem_t.is_f32() ? kb.atom_add_f32(addr, val[0]) : kb.atom_add_i32(addr, val[0]);
+                            }
+                            if (m == "atomic_min") return b.build_call("ptx_atom_min_i32", brass::Type::i32(), {addr, val[0]});
+                            if (m == "atomic_max") return b.build_call("ptx_atom_max_i32", brass::Type::i32(), {addr, val[0]});
+                            return b.build_call("ptx_atom_exch_i32", brass::Type::i32(), {addr, val[0]});
+                        };
+                        if (base.size() < 2) return {atomic()};
+                        // Bounded: outside the store the atomic does nothing
+                        // and returns zero, as a load there reads it.
+                        brass::BasicBlock* atom_bb = b.side_block("bounded_atomic");
+                        brass::BasicBlock* done_bb = b.side_block("bounded_atomic_done");
+                        brass::Value* old = b.add_block_param(done_bb, to_mir_scalar_type(elem_t.scalar));
+                        brass::Value* zero = elem_t.is_f32() ? b.build_fconst_f32(0.0f) : b.build_iconst_i32(0);
+                        b.builder().build_br_if(b.build_ult(lin64, base[1]), atom_bb, {}, done_bb, {zero});
+                        b.position_at_end(atom_bb);
+                        b.build_br(done_bb, {atomic()});
+                        b.position_at_end(done_bb);
+                        return {old};
                     } else {
                         // Sequential CPU evaluation of atomic op
-                        ValueList old_v = load_element_from_buffer(elem_t, base[0], lin);
+                        ValueList old_v = load_element_from_buffer(elem_t, base, lin);
                         brass::Value* new_v = val[0];
                         if (m == "atomic_add") new_v = b.build_add(old_v[0], val[0]);
                         else if (m == "atomic_min") new_v = lower_scalar_math_2("min", old_v[0], val[0], elem_t.scalar);
                         else if (m == "atomic_max") new_v = lower_scalar_math_2("max", old_v[0], val[0], elem_t.scalar);
-                        store_element_to_buffer(elem_t, base[0], lin, {new_v});
+                        store_element_to_buffer(elem_t, base, lin, {new_v});
                         return old_v;
                     }
                 }
