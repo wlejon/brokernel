@@ -1,0 +1,12 @@
+function(brokernel_add_test name)
+    add_executable(${name} ${name}.cpp no_dialogs.cpp)
+    target_link_libraries(${name} PRIVATE brokernel)
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4 /permissive- /utf-8)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+brokernel_add_test(test_smoke)

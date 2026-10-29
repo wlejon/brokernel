@@ -1,0 +1,8 @@
+build/
+build-*/
+.vs/
+out/
+*.user
+*.tar.gz
+*.suo
+compile_commands.json
