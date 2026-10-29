@@ -227,7 +227,11 @@ bool CompiledKernel::eval_grid_point_cpu(
         if (err) *err = "kernel '" + name + "' was not compiled with CPU support";
         return false;
     }
-    std::vector<uint64_t> slots;
+    // A point query is a call per position (a height for physics or the
+    // camera), so its argument slots reuse one buffer per thread rather than
+    // allocating per call. Kernels do not call back into the host, so the
+    // buffer is never in use twice on one thread.
+    thread_local std::vector<uint64_t> slots;
     if (!pack_cpu_args(*this, args, slots, err)) return false;
 
     const int32_t coords_shape[6] = {

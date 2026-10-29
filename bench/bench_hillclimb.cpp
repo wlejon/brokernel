@@ -2282,15 +2282,14 @@ FastNoise::SmartNode<> planet_fields_tree() {
 // The same fields as one brokernel kernel, in f64 about a double origin. Its
 // constants are FastNoise2's floats (1 / scale, 2.03, the gains) widened, so
 // both evaluate the same lattice positions.
+// The grid kernel k_planet_fields over position stores, and the point kernel
+// k_planet_point at one position (what a height query for physics or the
+// camera calls), both summing the fields at p in planet_height.
 std::string planet_fields_source() {
     std::ostringstream ss;
     ss << std::setprecision(17);
     ss << "import std::noise::*;\n"
-          "@kernel @grid(1)\n"
-          "fn k_planet_fields(g: grid<1>, px: read_store<f32, 1>, py: read_store<f32, 1>, pz: read_store<f32, 1>,\n"
-          "                   out: write_store<f32, 1>, ox: f64, oy: f64, oz: f64, seed: i32) {\n"
-          "    let i = g.x();\n"
-          "    let p = vec3<f64>((px[i] as f64) + ox, (py[i] as f64) + oy, (pz[i] as f64) + oz);\n";
+          "fn planet_height(p: vec3<f64>, seed: i32) -> f32 {\n";
     bool first = true;
     for (const auto& f : kPlanetFields) {
         ss << (first ? "    var h: f32 = " : "    h = h + ");
@@ -2300,7 +2299,17 @@ std::string planet_fields_source() {
         ss << ";\n";
         first = false;
     }
-    ss << "    out[i] = h;\n}\n";
+    ss << "    return h;\n}\n"
+          "@kernel @grid(1)\n"
+          "fn k_planet_fields(g: grid<1>, px: read_store<f32, 1>, py: read_store<f32, 1>, pz: read_store<f32, 1>,\n"
+          "                   out: write_store<f32, 1>, ox: f64, oy: f64, oz: f64, seed: i32) {\n"
+          "    let i = g.x();\n"
+          "    out[i] = planet_height(vec3<f64>((px[i] as f64) + ox, (py[i] as f64) + oy, (pz[i] as f64) + oz), seed);\n"
+          "}\n"
+          "@kernel\n"
+          "fn k_planet_point(x: f64, y: f64, z: f64, seed: i32) -> f32 {\n"
+          "    return planet_height(vec3<f64>(x, y, z), seed);\n"
+          "}\n";
     return ss.str();
 }
 
@@ -2713,6 +2722,42 @@ int main(int argc, char** argv) {
         row.gpu_pass = gs.pass; row.gpu_max_abs = gs.max_abs; row.gpu_max_ulp = gs.max_ulp;
         row.cpu_ratio = (row.cpu_pass && row.gpu_pass) ? (row.cpu_bk_mpts / row.cpu_ref_mpts) : 0.0;
         all_rows.push_back(row);
+
+        // The same fields one position at a time, as physics, the camera and
+        // placement ask for a height: k_planet_point's eval_f32 per call
+        // against FastNoise2's GenSingle3D on the same tree. Its rate is the
+        // call's whole cost, argument packing included. The GPU column is the
+        // grid row's, which has no single-point form.
+        BenchRow prow;
+        prow.tier = "Point";
+        prow.name = "PlanetPoint_3D_f64";
+        prow.dim = 3;
+        constexpr uint32_t kPoints = 1u << 14;
+        prow.points = kPoints;
+        const auto* kp = planet_res.find_kernel("k_planet_point");
+        std::vector<double> wx(kPoints), wy(kPoints), wz(kPoints);
+        for (uint32_t i = 0; i < kPoints; ++i) {
+            wx[i] = ox + double(qx[i]);
+            wy[i] = oy + double(qy[i]);
+            wz[i] = oz + double(qz[i]);
+        }
+        std::vector<float> pref(kPoints), pbk(kPoints);
+        double pfn_ms = best_cpu_ms([&] {
+            for (uint32_t i = 0; i < kPoints; ++i) pref[i] = tree->GenSingle3D(wx[i], wy[i], wz[i], kSeed);
+        });
+        double pbk_ms = best_cpu_ms([&] {
+            for (uint32_t i = 0; i < kPoints; ++i) {
+                pbk[i] = kp->eval_f32({KernelArg(wx[i]), KernelArg(wy[i]), KernelArg(wz[i]), KernelArg(kSeed)});
+            }
+        });
+        prow.cpu_ref_mpts = mpts(kPoints, pfn_ms);
+        prow.cpu_bk_mpts = mpts(kPoints, pbk_ms);
+        prow.gpu_bk_mpts = row.gpu_bk_mpts;
+        auto ps = compare_buffers(pbk, pref, 1e-3f);
+        prow.cpu_pass = ps.pass; prow.cpu_max_abs = ps.max_abs; prow.cpu_max_ulp = ps.max_ulp;
+        prow.gpu_pass = row.gpu_pass; prow.gpu_max_abs = row.gpu_max_abs; prow.gpu_max_ulp = row.gpu_max_ulp;
+        prow.cpu_ratio = (prow.cpu_pass && prow.gpu_pass) ? (prow.cpu_bk_mpts / prow.cpu_ref_mpts) : 0.0;
+        all_rows.push_back(prow);
     }
 
     auto suite_t1 = std::chrono::high_resolution_clock::now();
@@ -2779,7 +2824,8 @@ int main(int argc, char** argv) {
         compute_count++;
     }
     double geomean_gpu_compute = compute_count > 0 ? std::exp(log_sum_compute / compute_count) : 0.0;
-    const auto& capstone = all_rows.back();
+    const auto& capstone = *std::find_if(all_rows.begin(), all_rows.end(),
+                                         [](const BenchRow& r) { return r.tier == "Capstone"; });
 
     std::printf("============================================================================================================================\n");
     std::printf("ROLL-UP SCORES:\n");
