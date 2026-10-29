@@ -8,7 +8,9 @@
 //     ~130,000 Mpt/s on a 4090 either way; the fractal, cellular and warp rows are the
 //     ones whose ratio measures the code.
 // - Tier 2: Stencil & Grid Kernels (Separable Blur, Gradient/Normals, Thermal Erosion,
-//           Hydraulic Erosion, Flow Accumulation)
+//           Hydraulic Erosion, Flow Accumulation, and the planet's rivers: PlanetFlow,
+//           its erosion pass, five fields read at eight neighbours). On the GPU the
+//           planet's flow is memory-bound per iteration (~36 bytes a cell).
 //   * Parity oracle & CPU speed baseline: Plain C++ reference
 //   * GPU speed baseline: Hand-written GLSL 450 compute shader compiled by glslc (-O)
 // - Capstone: the planet's noise fields (broworkshop 1fbd228^:demos/planet/terrain.js),
@@ -1337,6 +1339,239 @@ std::string make_glsl_noise_shader(int dim, const std::string& expr) {
 // ============================================================================
 // Tier 2: Stencil & Grid Kernels
 // ============================================================================
+// The planet's flow state: per cell the ground h, drainage a, the drainage
+// handed on a unit of weight z, the steepest slope down w, the water level wl.
+struct FlowState {
+    std::vector<float> h, a, z, w, wl;
+    explicit FlowState(size_t n) : h(n), a(n), z(n), w(n), wl(n) {}
+};
+
+constexpr int kPlanetFlowIters = 8;
+constexpr float kPlanetFlowCell = 19500.0f;   // the global grid's cells, metres
+
+// The start procInit leaves: the ground in metres, the water high over the
+// land (it drains from the coasts), nothing routed yet.
+FlowState planet_flow_start(const std::vector<float>& field) {
+    FlowState s(field.size());
+    for (size_t i = 0; i < field.size(); ++i) {
+        s.h[i] = field[i] * 100.0f;
+        s.a[i] = 1.0f;
+        s.wl[i] = s.h[i] < 0.0f ? s.h[i] : 1e5f;
+    }
+    return s;
+}
+
+// k_planet_flow in C++, the same operations in the same order.
+void planet_flow_ref(const FlowState& in, FlowState& out, int W, int H, float cell) {
+    const int nbx[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    const int nby[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    const float nd[8] = {1.41421356f, 1.0f, 1.41421356f, 1.0f, 1.0f, 1.41421356f, 1.0f, 1.41421356f};
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            const size_t c = static_cast<size_t>(y) * W + x;
+            float h = in.h[c];
+            const float w = in.wl[c];
+            const bool sea = h < 0.0f;
+            float wn[8], a = 1.0f, rest = 1e30f, mean4 = 0.0f;
+            for (int k = 0; k < 8; ++k) {
+                const size_t n = static_cast<size_t>(std::clamp(y + nby[k], 0, H - 1)) * W + std::clamp(x + nbx[k], 0, W - 1);
+                const float dist = nd[k] * cell;
+                wn[k] = in.wl[n];
+                if (wn[k] > w && in.w[n] > 0.0f) {
+                    float t = std::min((wn[k] - w) / dist / in.w[n], 1.0f);
+                    a += in.z[n] * ((t * t) * (t * t));
+                }
+                rest = std::min(rest, wn[k] + 2e-4f * dist);
+                if (nd[k] == 1.0f) mean4 += 0.25f * in.h[n];
+            }
+            if (!sea) {
+                if (w - h < 1.0f) {
+                    float drop = 0.0f;
+                    for (int k = 0; k < 8; ++k) drop = std::max(drop, (h - wn[k]) / nd[k]);
+                    float e = 2.5e-4f * std::sqrt(a);
+                    float hc = (h - drop * e / (1.0f + e)) + 0.0015f * (mean4 - h);
+                    h = std::max(hc, std::min(h, 1.0f));
+                } else {
+                    h = h + 0.01f * (w - h);
+                }
+            }
+            const float wl = sea ? h : std::max(h, rest);
+            float smax = 0.0f, s = 0.0f;
+            for (int k = 0; k < 8; ++k) smax = std::max(smax, (wl - wn[k]) / (nd[k] * cell));
+            if (!sea && smax > 0.0f) {
+                for (int k = 0; k < 8; ++k) {
+                    float down = (wl - wn[k]) / (nd[k] * cell);
+                    if (down > 0.0f) { float t = down / smax; s += (t * t) * (t * t); }
+                }
+            }
+            out.h[c] = h;
+            out.a[c] = a;
+            out.z[c] = s > 0.0f ? a / s : 0.0f;
+            out.w[c] = sea ? 0.0f : smax;
+            out.wl[c] = wl;
+        }
+    }
+}
+
+const char* kGlslPlanetFlow = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_ARB_gpu_shader_int64 : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuf { float v[]; };
+layout(push_constant) uniform PC {
+    uint64_t h; uint64_t z; uint64_t w; uint64_t wl;
+    uint64_t h_out; uint64_t a_out; uint64_t z_out; uint64_t w_out; uint64_t wl_out;
+    float cell; int width; int height;
+} pc;
+const ivec2 NB[8] = ivec2[8](ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0),
+                             ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));
+const float ND[8] = float[8](1.41421356, 1.0, 1.41421356, 1.0, 1.0, 1.41421356, 1.0, 1.41421356);
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    int c = p.y * pc.width + p.x;
+    float L = pc.cell;
+    float h = FloatBuf(pc.h).v[c];
+    float W = FloatBuf(pc.wl).v[c];
+    bool sea = h < 0.0;
+    float Wn[8];
+    float A = 1.0, rest = 1e30, mean4 = 0.0;
+    for (int k = 0; k < 8; ++k) {
+        ivec2 q = clamp(p + NB[k], ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+        int n = q.y * pc.width + q.x;
+        float dist = ND[k] * L;
+        Wn[k] = FloatBuf(pc.wl).v[n];
+        float nw = FloatBuf(pc.w).v[n];
+        if (Wn[k] > W && nw > 0.0) {
+            float t = min((Wn[k] - W) / dist / nw, 1.0);
+            A += FloatBuf(pc.z).v[n] * ((t * t) * (t * t));
+        }
+        rest = min(rest, Wn[k] + 2e-4 * dist);
+        if (ND[k] == 1.0) mean4 += 0.25 * FloatBuf(pc.h).v[n];
+    }
+    if (!sea) {
+        if (W - h < 1.0) {
+            float drop = 0.0;
+            for (int k = 0; k < 8; ++k) drop = max(drop, (h - Wn[k]) / ND[k]);
+            float e = 2.5e-4 * sqrt(A);
+            float hc = (h - drop * e / (1.0 + e)) + 0.0015 * (mean4 - h);
+            h = max(hc, min(h, 1.0));
+        } else {
+            h += 0.01 * (W - h);
+        }
+    }
+    W = sea ? h : max(h, rest);
+    float smax = 0.0, S = 0.0;
+    for (int k = 0; k < 8; ++k) smax = max(smax, (W - Wn[k]) / (ND[k] * L));
+    if (!sea && smax > 0.0)
+        for (int k = 0; k < 8; ++k) {
+            float down = (W - Wn[k]) / (ND[k] * L);
+            if (down > 0.0) { float t = down / smax; S += (t * t) * (t * t); }
+        }
+    FloatBuf(pc.h_out).v[c] = h;
+    FloatBuf(pc.a_out).v[c] = A;
+    FloatBuf(pc.z_out).v[c] = S > 0.0 ? A / S : 0.0;
+    FloatBuf(pc.w_out).v[c] = sea ? 0.0 : smax;
+    FloatBuf(pc.wl_out).v[c] = W;
+}
+)GLSL";
+
+BenchRow run_planet_flow_row(const CompileResult& res, uint32_t W, uint32_t H, const std::vector<float>& field,
+                             uint32_t TW, uint32_t TH, const std::vector<float>& field_time) {
+    BenchRow row;
+    row.tier = "Stencil";
+    row.name = "PlanetFlow_2D";
+    row.dim = 2;
+    const size_t N = static_cast<size_t>(W) * H;
+    row.points = N;
+    const GridShape shape(W, H);
+
+    FlowState ref = planet_flow_start(field), ref_next(N);
+    double ref_ms = best_cpu_ms([&] {
+        FlowState a = planet_flow_start(field), b(N);
+        for (int it = 0; it < kPlanetFlowIters; ++it) {
+            planet_flow_ref(a, b, W, H, kPlanetFlowCell);
+            std::swap(a, b);
+        }
+        ref = std::move(a);
+    });
+    row.cpu_ref_mpts = mpts(N * kPlanetFlowIters, ref_ms);
+
+    const auto* k = res.find_kernel("k_planet_flow");
+    auto args = [&](FlowState& in, FlowState& out) {
+        return std::vector<KernelArg>{KernelArg::store(in.h), KernelArg::store(in.z), KernelArg::store(in.w),
+                                      KernelArg::store(in.wl), KernelArg::store(out.h), KernelArg::store(out.a),
+                                      KernelArg::store(out.z), KernelArg::store(out.w), KernelArg::store(out.wl),
+                                      KernelArg(kPlanetFlowCell)};
+    };
+    FlowState cpu = planet_flow_start(field);
+    double bk_cpu_ms = best_cpu_ms([&] {
+        FlowState a = planet_flow_start(field), b(N);
+        for (int it = 0; it < kPlanetFlowIters; ++it) {
+            k->dispatch_cpu(shape, args(a, b));
+            std::swap(a, b);
+        }
+        cpu = std::move(a);
+    });
+    row.cpu_bk_mpts = mpts(N * kPlanetFlowIters, bk_cpu_ms);
+
+    FlowState gpu = planet_flow_start(field), gpu_b(N);
+    for (int it = 0; it < kPlanetFlowIters; ++it) {
+        k->dispatch_gpu(shape, args(gpu, gpu_b));
+        std::swap(gpu, gpu_b);
+    }
+
+    // Heights to a millimetre (they are hundreds of metres), the drainage
+    // to 1e-4 of a cell, the water's level as the heights.
+    auto check = [&](const FlowState& got, bool& pass, float& max_abs, uint32_t& max_ulp) {
+        pass = true;
+        max_abs = 0.0f;
+        max_ulp = 0;
+        for (const auto& [g, r, tol] : {std::tuple{&got.h, &ref.h, 1e-3f}, std::tuple{&got.a, &ref.a, 1e-4f},
+                                        std::tuple{&got.wl, &ref.wl, 1e-3f}}) {
+            auto s = compare_buffers(*g, *r, tol);
+            pass = pass && s.pass;
+            max_abs = std::max(max_abs, s.max_abs);
+            max_ulp = std::max(max_ulp, s.max_ulp);
+        }
+    };
+    check(cpu, row.cpu_pass, row.cpu_max_abs, row.cpu_max_ulp);
+    check(gpu, row.gpu_pass, row.gpu_max_abs, row.gpu_max_ulp);
+
+    // The GPU timed an iteration on the TW x TH field, from its start.
+    const size_t NT = static_cast<size_t>(TW) * TH;
+    FlowState t0 = planet_flow_start(field_time);
+    std::vector<brass::gpu::VulkanBuffer> bufs;
+    for (int i = 0; i < 9; ++i) bufs.push_back(brass::gpu::VulkanBuffer::alloc(NT * sizeof(float)));
+    bufs[0].upload(t0.h.data(), NT * sizeof(float));
+    bufs[1].upload(t0.z.data(), NT * sizeof(float));
+    bufs[2].upload(t0.w.data(), NT * sizeof(float));
+    bufs[3].upload(t0.wl.data(), NT * sizeof(float));
+    std::vector<brass::gpu::VulkanArg> vk_args;
+    for (auto& b : bufs) vk_args.emplace_back(b);
+    vk_args.emplace_back(kPlanetFlowCell);
+    double bk_gpu_ms = time_bk_gpu_ms(k, GridShape(TW, TH), vk_args);
+    row.gpu_bk_mpts = mpts(NT, std::max(bk_gpu_ms, 1e-4));
+
+    auto spv = compile_glsl_compute(kGlslPlanetFlow, "stencil_planet_flow");
+    std::vector<brass::Type> layout(9, brass::Type::ptr());
+    layout.push_back(brass::Type::f32());
+    layout.push_back(brass::Type::i32());
+    layout.push_back(brass::Type::i32());
+    auto vmod = load_glsl_vulkan_module(spv, layout, 8, 8, 1);
+    vk_args.emplace_back(static_cast<int32_t>(TW));
+    vk_args.emplace_back(static_cast<int32_t>(TH));
+    double glsl_ms = time_glsl_gpu_ms(vmod, TW / 8, TH / 8, 1, 8, 8, 1, vk_args);
+    row.gpu_glsl_mpts = mpts(NT, std::max(glsl_ms, 1e-4));
+
+    const bool pass = row.cpu_pass && row.gpu_pass;
+    row.cpu_ratio = pass ? (row.cpu_bk_mpts / row.cpu_ref_mpts) : 0.0;
+    row.has_gpu_baseline = true;
+    row.gpu_ratio = pass ? (row.gpu_bk_mpts / row.gpu_glsl_mpts) : 0.0;
+    return row;
+}
+
 std::vector<BenchRow> run_stencil_tier() {
     std::vector<BenchRow> rows;
     const uint32_t W = 256, H = 256;
@@ -1426,6 +1661,85 @@ std::vector<BenchRow> run_stencil_tier() {
                      + max(0.0, h[-1,  1] - hc)
                      + max(0.0, h[ 1,  1] - hc);
             dst[x, y] = 1.0 + card + 0.70710678 * diag;
+        }
+
+        // The planet's rivers (broworkshop 1fbd228^:demos/planet/terrain.js,
+        // flow() as erode ran it on the global grid: no region edge, seedA
+        // and ks 0, so its bed and slide clamps do nothing; FLOW_P 4 and M
+        // 0.5 as squares and a root). Water level W drains from the sea
+        // inward (Planchon-Darboux), drainage A is the cell and what its
+        // higher neighbours hand it by slope^4, and land out of the water is
+        // cut by implicit stream power and crept by diffusion.
+        fn flow_in(wn: f32, nz: f32, nw: f32, w: f32, dist: f32) -> f32 {
+            if wn > w && nw > 0.0 {
+                let t = min((wn - w) / dist / nw, 1.0);
+                return nz * ((t * t) * (t * t));
+            }
+            return 0.0;
+        }
+        fn flow_share(w: f32, wn: f32, dist: f32, smax: f32) -> f32 {
+            let down = (w - wn) / dist;
+            if down > 0.0 {
+                let t = down / smax;
+                return (t * t) * (t * t);
+            }
+            return 0.0;
+        }
+
+        @kernel @grid(2)
+        fn k_planet_flow(g: grid<2>, hs: stencil<f32, 2>, zs: stencil<f32, 2>, ws: stencil<f32, 2>, wl: stencil<f32, 2>,
+                         h_out: write_store<f32, 2>, a_out: write_store<f32, 2>, z_out: write_store<f32, 2>,
+                         w_out: write_store<f32, 2>, wl_out: write_store<f32, 2>, cell: f32) {
+            let x = g.x();
+            let y = g.y();
+            let fill = 2e-4;
+            let k_rate = 2.5e-4;
+            let creep = 0.0015;
+            let silt = 0.01;
+            var h = hs[0, 0];
+            let w = wl[0, 0];
+            let sea = h < 0.0;
+            let d1 = cell;
+            let d2 = 1.41421356 * cell;
+            let w0 = wl[-1, -1]; let w1 = wl[0, -1]; let w2 = wl[1, -1]; let w3 = wl[-1, 0];
+            let w4 = wl[1, 0]; let w5 = wl[-1, 1]; let w6 = wl[0, 1]; let w7 = wl[1, 1];
+            var a = 1.0;
+            a += flow_in(w0, zs[-1, -1], ws[-1, -1], w, d2);
+            a += flow_in(w1, zs[0, -1], ws[0, -1], w, d1);
+            a += flow_in(w2, zs[1, -1], ws[1, -1], w, d2);
+            a += flow_in(w3, zs[-1, 0], ws[-1, 0], w, d1);
+            a += flow_in(w4, zs[1, 0], ws[1, 0], w, d1);
+            a += flow_in(w5, zs[-1, 1], ws[-1, 1], w, d2);
+            a += flow_in(w6, zs[0, 1], ws[0, 1], w, d1);
+            a += flow_in(w7, zs[1, 1], ws[1, 1], w, d2);
+            let rest = min(min(min(w0 + fill * d2, w1 + fill * d1), min(w2 + fill * d2, w3 + fill * d1)),
+                           min(min(w4 + fill * d1, w5 + fill * d2), min(w6 + fill * d1, w7 + fill * d2)));
+            let mean4 = ((0.25 * hs[0, -1] + 0.25 * hs[-1, 0]) + 0.25 * hs[1, 0]) + 0.25 * hs[0, 1];
+            if !sea {
+                if w - h < 1.0 {
+                    let drop = max(max(max(max(0.0, (h - w0) / 1.41421356), h - w1), max((h - w2) / 1.41421356, h - w3)),
+                                   max(max(h - w4, (h - w5) / 1.41421356), max(h - w6, (h - w7) / 1.41421356)));
+                    let e = k_rate * sqrt(a);
+                    let hc = (h - drop * e / (1.0 + e)) + creep * (mean4 - h);
+                    h = max(hc, min(h, 1.0));
+                } else {
+                    h = h + silt * (w - h);
+                }
+            }
+            let wn = sea ? h : max(h, rest);
+            let smax = max(max(max(max(0.0, (wn - w0) / d2), (wn - w1) / d1), max((wn - w2) / d2, (wn - w3) / d1)),
+                           max(max((wn - w4) / d1, (wn - w5) / d2), max((wn - w6) / d1, (wn - w7) / d2)));
+            var s = 0.0;
+            if !sea && smax > 0.0 {
+                s = flow_share(wn, w0, d2, smax) + flow_share(wn, w1, d1, smax) + flow_share(wn, w2, d2, smax)
+                  + flow_share(wn, w3, d1, smax) + flow_share(wn, w4, d1, smax) + flow_share(wn, w5, d2, smax)
+                  + flow_share(wn, w6, d1, smax) + flow_share(wn, w7, d2, smax);
+            }
+            h_out[x, y] = h;
+            a_out[x, y] = a;
+            z_out[x, y] = s > 0.0 ? a / s : 0.0;
+            w_out[x, y] = sea ? 0.0 : smax;
+            wl_out[x, y] = wn;
         }
     )BK";
 
@@ -1873,6 +2187,10 @@ void main() {
         row.gpu_ratio = (row.cpu_pass && row.gpu_pass) ? (row.gpu_bk_mpts / row.gpu_glsl_mpts) : 0.0;
         rows.push_back(row);
     }
+
+    // 6. The planet's rivers (k_planet_flow), kPlanetFlowIters iterations
+    // from the sea-drained start, over the field in metres (half of it sea).
+    rows.push_back(run_planet_flow_row(res, W, H, h_in, TW, TH, h_time));
 
     return rows;
 }
