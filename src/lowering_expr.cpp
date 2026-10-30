@@ -159,7 +159,9 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const 
         res.reserve(kinds.size());
         if (kinds.size() == 1) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            res.push_back(b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, bound));
+            brass::Value* v = b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, bound);
+            if (kinds[0] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+            res.push_back(v);
             return res;
         }
         // Check if all leaves have identical scalar kind
@@ -173,7 +175,9 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const 
             brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size(); ++i) {
                 brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                res.push_back(b.build_load_indexed(mt, base_ptr, idx_i, scale, 0, bound));
+                brass::Value* v = b.build_load_indexed(mt, base_ptr, idx_i, scale, 0, bound);
+                if (kinds[i] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+                res.push_back(v);
             }
             return res;
         }
@@ -183,7 +187,9 @@ ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const 
         uint32_t cur_off = 0;
         for (ScalarKind sk : kinds) {
             brass::Type mt = to_mir_scalar_type(sk);
-            res.push_back(b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), bound));
+            brass::Value* v = b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), bound);
+            if (sk == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+            res.push_back(v);
             cur_off += static_cast<uint32_t>(mt.size_in_bytes());
         }
         return res;
@@ -195,9 +201,12 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueL
         const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
         const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
         auto kinds = mod.types.flatten_scalars(elem_type);
+        auto norm_bool = [&](ScalarKind sk, brass::Value* v) -> brass::Value* {
+            return (sk == ScalarKind::Bool && b.vector_mode()) ? b.build_and(v, b.build_iconst_i32(1)) : v;
+        };
         if (kinds.size() == 1 && !vals.empty()) {
             brass::Type mt = to_mir_scalar_type(kinds[0]);
-            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, vals[0], bound);
+            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, norm_bool(kinds[0], vals[0]), bound);
             return;
         }
         bool uniform = true;
@@ -210,7 +219,7 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueL
             brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
             for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
                 brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                b.build_store_indexed(mt, base_ptr, idx_i, scale, 0, vals[i], bound);
+                b.build_store_indexed(mt, base_ptr, idx_i, scale, 0, norm_bool(kinds[i], vals[i]), bound);
             }
             return;
         }
@@ -219,7 +228,7 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueL
         uint32_t cur_off = 0;
         for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
             brass::Type mt = to_mir_scalar_type(kinds[i]);
-            b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), vals[i], bound);
+            b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), norm_bool(kinds[i], vals[i]), bound);
             cur_off += static_cast<uint32_t>(mt.size_in_bytes());
         }
     }
@@ -230,6 +239,9 @@ brass::Value* MirBodyLowerer::lower_scalar_cast(brass::Value* v, ScalarKind from
             if (from_sk == ScalarKind::F64) return b.build_ne(v, b.build_fconst_f64(0.0));
             if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_ne(v, b.build_iconst_i64(0));
             return b.build_ne(v, b.build_iconst_i32(0));
+        }
+        if (from_sk == ScalarKind::Bool && b.vector_mode()) {
+            v = b.build_and(v, b.build_iconst_i32(1));
         }
         if (to_sk == ScalarKind::F32) {
             if (from_sk == ScalarKind::F64) return b.build_fptrunc_f32_f64(v);
@@ -454,7 +466,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return {b.build_fconst_f32(static_cast<float>(e->float_val))};
         }
         case Expr::Kind::BoolLit:
-            return {b.build_iconst_i32(e->bool_val ? 1 : 0)};
+            return {e->bool_val ? b.true_value() : b.build_iconst_i32(0)};
         case Expr::Kind::Ident: {
             int id = lookup_var_id(e->name);
             if (id >= 0) return var_values[id];

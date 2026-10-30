@@ -447,6 +447,88 @@ static void test_store_bounds() {
     assert(!k->eval_grid_point_cpu(4, 0, 0, GridShape(4), args1, nullptr, &err));
 }
 
+static void test_vector_bool_masks() {
+    const char* src = R"(
+        const CONST_TRUE: bool = 2 < 5;
+        const CONST_FALSE: bool = 2 > 5;
+
+        @kernel @grid(1)
+        fn k_bool_masks(g: grid<1>, out: write_store<f32, 1>, flag_on: bool, flag_off: bool) -> f32 {
+            let x = g.x();
+            let a = f32(x) + 10.0;
+            let b = f32(x) + 100.0;
+            let odd = (x & 1) != 0;
+
+            var acc: f32 = 0.0;
+            // BoolLit in select over varying lanes
+            acc += select(true, a, b);
+            acc += select(false, a, b);
+            // Folded bool constants and is_f64<T>() in select over varying lanes
+            acc += select(CONST_TRUE, a, b);
+            acc += select(CONST_FALSE, a, b);
+            acc += select(!is_f64<f32>(), a, b);
+            // Kernel bool parameters in select over varying lanes
+            acc += select(flag_on, a, b);
+            acc += select(flag_off, a, b);
+
+            // if (true && varying) and if (param && varying) over varying lanes
+            if true && odd {
+                acc += a * 2.0;
+            } else {
+                acc += b * 3.0;
+            }
+            if CONST_TRUE && flag_on && odd {
+                acc += 5.0;
+            }
+            if flag_off || !odd {
+                acc += 7.0;
+            }
+            out[x] = acc;
+            return acc;
+        }
+    )";
+
+    auto res = compile_source(src, "bool_masks.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_bool_masks");
+    assert(k != nullptr);
+    if (brass::host_has_avx2()) {
+        assert(k->cpu_grid_lanes == 8);
+    }
+
+    // Width 29 exercises 3 full 8-wide AVX2 groups (0..23) plus a 5-lane scalar tail (24..28).
+    const uint32_t W = 29;
+    std::vector<float> out_store(W, 0.0f);
+    std::vector<float> out_ret(W, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out_store), KernelArg(true), KernelArg(false)};
+
+    std::string err;
+    assert(k->dispatch_cpu(GridShape(W), args, out_ret.data(), &err));
+
+    for (uint32_t x = 0; x < W; ++x) {
+        const float a = static_cast<float>(x) + 10.0f;
+        const float b = static_cast<float>(x) + 100.0f;
+        const bool odd = (x & 1u) != 0u;
+        float want = 4.0f * a + 3.0f * b;
+        want += odd ? (a * 2.0f + 5.0f) : (b * 3.0f + 7.0f);
+        assert(out_store[x] == want);
+        assert(out_ret[x] == want);
+
+        // Verify scalar point query path agrees identically.
+        float pt = 0.0f;
+        assert(k->eval_grid_point_cpu(static_cast<int32_t>(x), 0, 0, GridShape(W), args, &pt, &err));
+        assert(pt == want);
+    }
+
+    // Verify CPU vs GPU parity.
+    std::vector<float> gpu_store(W, 0.0f);
+    std::vector<KernelArg> gargs = {KernelArg::store(gpu_store), KernelArg(true), KernelArg(false)};
+    auto rep = k->compare_cpu_gpu(GridShape(W), gargs, 0.0, 0.0);
+    if (!rep.ok) std::cerr << "k_bool_masks parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -459,6 +541,7 @@ int main() {
     test_vector_grid_lanes();
     test_vector_stencil_edges();
     test_store_bounds();
+    test_vector_bool_masks();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

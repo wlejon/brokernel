@@ -428,7 +428,16 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
         lowerer.ret_val_var_id = lowerer.alloc_var("__ret_val", lowerer.make_zero_leaves(fn.return_type));
     }
     for (size_t i = 0; i < fn.params.size(); ++i) {
-        lowerer.alloc_var(fn.params[i].name, f.params[i]);
+        ValueList pvals = f.params[i];
+        if (lanes) {
+            auto kinds = mod.types.flatten_scalars(fn.params[i].type);
+            for (size_t k = 0; k < pvals.size() && k < kinds.size(); ++k) {
+                if (kinds[k] == ScalarKind::Bool) {
+                    pvals[k] = lowerer.b.build_ne(pvals[k], b.build_iconst_i32(0));
+                }
+            }
+        }
+        lowerer.alloc_var(fn.params[i].name, pvals);
         const ParamRole role = fn.params[i].role;
         if (role == ParamRole::Store || role == ParamRole::Stencil) lowerer.bind_store_param(i, f.params[i]);
     }
