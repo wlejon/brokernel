@@ -58,7 +58,9 @@ static void test_vertex_stage_spirv() {
         }
     )";
 
-    auto res = compile_source(src, "planet_vs.bk");
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "planet_vs.bk", opts);
     if (!res.ok) {
         std::cerr << res.error_message() << "\n";
     }
@@ -89,7 +91,9 @@ static void test_fragment_stage_spirv() {
         }
     )";
 
-    auto res = compile_source(src, "atmosphere_fs.bk");
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "atmosphere_fs.bk", opts);
     if (!res.ok) {
         std::cerr << res.error_message() << "\n";
     }
@@ -105,7 +109,7 @@ static void test_fragment_stage_spirv() {
     assert(k->spirv_disassembly.find("OpDPdy") != std::string::npos);
     assert(k->spirv_disassembly.find("OpDemoteToHelperInvocation") != std::string::npos);
     // A fragment stage has no CPU build.
-    assert(!k->cpu_point_fn.is_valid() && !k->cpu_grid_fn.is_valid());
+    assert(!k->has_cpu_build() && !k->cpu_point_fn().is_valid() && !k->cpu_grid_fn().is_valid());
 }
 
 static void test_builtin_type_diagnostics() {

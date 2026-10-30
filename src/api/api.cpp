@@ -260,7 +260,7 @@ Value js_eval(Value self, std::span<const Value> args) {
     const CompiledKernel* k = unwrapKernel(self);
     if (!k) return ev::throwTypeError("Kernel.eval: invalid receiver");
     if (k->grid_dim != 0) return ev::throwTypeError("Kernel.eval: '" + k->name + "' is a grid kernel; use run()");
-    if (!k->cpu_point_fn.is_valid()) return ev::throwTypeError("Kernel.eval: '" + k->name + "' has no CPU build");
+    if (!k->cpu_point_fn().is_valid()) return ev::throwTypeError("Kernel.eval: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
     ArgPack pack(*k, args, "Kernel.eval");
     alignas(16) uint8_t ret[256] = {};
     std::string err;
@@ -302,7 +302,7 @@ Value js_run(Value self, std::span<const Value> args) {
     const CompiledKernel* k = unwrapKernel(self);
     if (!k) return ev::throwTypeError("Kernel.run: invalid receiver");
     if (k->grid_dim == 0) return ev::throwTypeError("Kernel.run: '" + k->name + "' is a point kernel; use eval()");
-    if (!k->cpu_grid_fn.is_valid()) return ev::throwTypeError("Kernel.run: '" + k->name + "' has no CPU build");
+    if (!k->cpu_grid_fn().is_valid()) return ev::throwTypeError("Kernel.run: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
     if (args.empty()) return ev::throwTypeError("Kernel.run: the first argument is the grid");
     const GridShape shape = shapeArg(args[0], *k, "Kernel.run");
     const std::span<const Value> kargs = args.subspan(1);

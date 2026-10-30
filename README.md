@@ -107,6 +107,11 @@ general graphics:
     cooperate through barriers or shared memory.
   - Derivatives, `front_facing` and `discard_fragment` (a demote to helper)
     are fragment-only.
+  - A kernel's native code is compiled the first time something runs it on
+    the CPU (`cpu_point_fn()` / `cpu_grid_fn()`), so a module whose kernels
+    only run on the GPU compiles in the time its SPIR-V takes. A failure
+    then is in `cpu_error()`. SPIR-V disassembly is only made on request
+    (`CompileOptions::emit_spirv_disassembly`).
 
 Source files use the `.bk` extension.
 

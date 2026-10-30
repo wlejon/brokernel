@@ -229,7 +229,7 @@ struct CompileOptions {
     bool local_size_spec_constants = true;
     uint32_t spirv_version = 0x00010500u; // 0x00010500 (SPIR-V 1.5) or 0x00010600 (SPIR-V 1.6)
     bool emit_spirv = true;
-    bool emit_spirv_disassembly = true;
+    bool emit_spirv_disassembly = false;
     bool emit_ptx = false;
     bool compile_cpu = true;
     bool verify_spirv_equivalence = false;
@@ -269,14 +269,33 @@ public:
     std::string ptx;
     bool spirv_equivalent = false;
 
-    brass::codegen::KernelFunction cpu_point_fn;
-    brass::codegen::KernelFunction cpu_grid_fn;
+    // The CPU builds: the point function and the grid function, compiled the
+    // first time either is asked for (most kernels only ever run on the GPU,
+    // and the native code is most of a compile). Invalid when the kernel has
+    // no CPU build or its compilation failed (cpu_error() says why).
+    const brass::codegen::KernelFunction& cpu_point_fn() const;
+    const brass::codegen::KernelFunction& cpu_grid_fn() const;
+    const std::string& cpu_error() const;
+    bool has_cpu_build() const noexcept { return cpu_ != nullptr; }
     // Cells the grid function computes per step along x: 8 or 4 (AVX2
     // lanes), or 1 when it runs one cell at a time.
     uint32_t cpu_grid_lanes = 1;
 
+    // The lowered CPU functions and their builds once made (compile_source).
+    struct CpuBuild {
+        std::once_flag once;
+        std::unique_ptr<brass::Module> module;
+        brass::Function* point = nullptr;
+        brass::Function* grid = nullptr;
+        brass::codegen::KernelOptions options;
+        brass::codegen::KernelFunction point_fn;
+        brass::codegen::KernelFunction grid_fn;
+        std::string error;
+    };
+    std::shared_ptr<CpuBuild> cpu_;
+
     bool valid() const noexcept {
-        return !spirv.words.empty() || cpu_point_fn.is_valid() || cpu_grid_fn.is_valid();
+        return !spirv.words.empty() || cpu_ != nullptr;
     }
     bool has_return_value() const noexcept { return !return_type.is_void(); }
 

@@ -248,7 +248,42 @@ bool pack_cpu_args(
     return true;
 }
 
+// A kernel's CPU builds, made once, the first time either is asked for.
+const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::CpuBuild>& cpu) {
+    if (!cpu) return nullptr;
+    std::call_once(cpu->once, [&] {
+        try {
+            brass::codegen::KernelJit jit_point(cpu->options);
+            cpu->point_fn = jit_point.compile(*cpu->point);
+            brass::codegen::KernelJit jit_grid(cpu->options);
+            cpu->grid_fn = jit_grid.compile(*cpu->grid);
+        } catch (const std::exception& ex) {
+            cpu->error = std::string("backend compilation error: ") + ex.what();
+        }
+        cpu->module.reset();
+    });
+    return cpu.get();
+}
+
+const brass::codegen::KernelFunction kNoFunction{};
+const std::string kNoError;
+
 } // namespace
+
+const brass::codegen::KernelFunction& CompiledKernel::cpu_point_fn() const {
+    const CpuBuild* cpu = cpu_build(cpu_);
+    return cpu ? cpu->point_fn : kNoFunction;
+}
+
+const brass::codegen::KernelFunction& CompiledKernel::cpu_grid_fn() const {
+    const CpuBuild* cpu = cpu_build(cpu_);
+    return cpu ? cpu->grid_fn : kNoFunction;
+}
+
+const std::string& CompiledKernel::cpu_error() const {
+    const CpuBuild* cpu = cpu_build(cpu_);
+    return cpu ? cpu->error : kNoError;
+}
 
 bool CompiledKernel::eval_grid_point_cpu(
     int32_t gx, int32_t gy, int32_t gz,
@@ -256,8 +291,8 @@ bool CompiledKernel::eval_grid_point_cpu(
     std::span<const KernelArg> args,
     void* out_return,
     std::string* err) const {
-    if (!cpu_point_fn.is_valid()) {
-        if (err) *err = "kernel '" + name + "' was not compiled with CPU support";
+    if (!cpu_point_fn().is_valid()) {
+        if (err) *err = "kernel '" + name + "' has no CPU build" + (cpu_error().empty() ? std::string() : ": " + cpu_error());
         return false;
     }
     // A point query is a call per position (a height for physics or the
@@ -286,7 +321,7 @@ bool CompiledKernel::eval_grid_point_cpu(
     void* ret_ptr = out_return ? out_return : static_cast<void*>(scratch_ret);
 
     using PointFn = void (*)(const uint64_t*, const int32_t*, void*);
-    auto fn_ptr = cpu_point_fn.as<PointFn>();
+    auto fn_ptr = cpu_point_fn().as<PointFn>();
     fn_ptr(slots.data(), coords_shape, ret_ptr);
     return true;
 }
@@ -343,8 +378,8 @@ bool CompiledKernel::dispatch_cpu(
     std::span<const KernelArg> args,
     void* return_store_out,
     std::string* err) const {
-    if (!cpu_grid_fn.is_valid()) {
-        if (err) *err = "kernel '" + name + "' was not compiled with CPU support";
+    if (!cpu_grid_fn().is_valid()) {
+        if (err) *err = "kernel '" + name + "' has no CPU build" + (cpu_error().empty() ? std::string() : ": " + cpu_error());
         return false;
     }
     std::vector<uint64_t> slots;
@@ -368,7 +403,7 @@ bool CompiledKernel::dispatch_cpu(
     }
 
     using GridFn = void (*)(const uint64_t*, const int32_t*, void*);
-    auto fn_ptr = cpu_grid_fn.as<GridFn>();
+    auto fn_ptr = cpu_grid_fn().as<GridFn>();
     fn_ptr(slots.data(), shape4, ret_ptr);
     return true;
 }
@@ -946,20 +981,19 @@ CompileResult Compiler::compile_source(
                 ck.ptx = brass::target::PtxTarget::emit_function(*lowered.gpu_function);
             }
 
+            // The CPU builds wait for their first use (cpu_point_fn()).
             if (opts.compile_cpu && lowered.cpu_point_function) {
-                brass::codegen::KernelOptions kopts;
-                kopts.opt_level = opts.opt_level;
-                kopts.enable_optimizations = (opts.opt_level > 0);
-                kopts.enable_fma = false;
-                kopts.enable_parallel = false;
-                kopts.enable_superopt = false;
-                kopts.enable_smt_guard_elim = false;
-
-                brass::codegen::KernelJit jit_point(kopts);
-                ck.cpu_point_fn = jit_point.compile(*lowered.cpu_point_function);
-
-                brass::codegen::KernelJit jit_grid(kopts);
-                ck.cpu_grid_fn = jit_grid.compile(*lowered.cpu_grid_function);
+                auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
+                cpu->options.opt_level = opts.opt_level;
+                cpu->options.enable_optimizations = (opts.opt_level > 0);
+                cpu->options.enable_fma = false;
+                cpu->options.enable_parallel = false;
+                cpu->options.enable_superopt = false;
+                cpu->options.enable_smt_guard_elim = false;
+                cpu->point = lowered.cpu_point_function;
+                cpu->grid = lowered.cpu_grid_function;
+                cpu->module = std::move(lowered.cpu_module);
+                ck.cpu_ = std::move(cpu);
                 ck.cpu_grid_lanes = lowered.cpu_grid_lanes ? lowered.cpu_grid_lanes : 1;
             }
         } catch (const std::exception& ex) {
