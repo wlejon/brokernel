@@ -506,7 +506,10 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 if (e->args.size() != 1) {
                     ctx.diags.error(e->span, "indexing expects 1 index expression");
                 } else {
-                    check_expr(e->args[0].get(), Type::i32());
+                    Type at = check_expr(e->args[0].get(), Type::i32());
+                    if (!at.is_integer() || !at.is_scalar()) {
+                        ctx.diags.error(e->args[0]->span, "index must be a scalar integer, got '" + at.to_string() + "'");
+                    }
                 }
                 Type elem = recv.element_type();
                 e->resolved_type = elem;
@@ -612,26 +615,70 @@ void FnCheckState::check_stmt(Stmt* s) {
                         }
                     }
                     Type elem = recv.element_type();
+                    if (s->compound_op.has_value() && !elem.is_numeric()) {
+                        ctx.diags.error(s->span, "compound assignment on store requires numeric scalar or vector element type");
+                    }
                     s->assign_target->resolved_type = elem;
                     check_expr(s->assign_value.get(), elem);
+                    if (s->compound_op.has_value() && elem.is_vector()) {
+                        Type elem_s = Type::scalar_type(elem.scalar);
+                        if (s->assign_value->resolved_type == elem_s || coerce_expr_to_type(s->assign_value.get(), elem_s)) {
+                            coerce_expr_to_type(s->assign_value.get(), elem);
+                        }
+                    }
                     check_assignable(s->assign_value.get(), elem, ctx.diags, s->span);
                     mark_type_usage(elem);
                     return;
                 }
             }
-            // Check mutability on base identifier
+            // Validate lvalue chain and mutability on base identifier
             const Expr* base = s->assign_target.get();
             while (base && (base->kind == Expr::Kind::Field || base->kind == Expr::Kind::Index)) {
                 base = base->lhs.get();
             }
-            if (base && base->kind == Expr::Kind::Ident) {
-                if (LocalVar* lv = lookup_var(base->name)) {
-                    if (!lv->is_mutable) {
-                        ctx.diags.error(s->span, "cannot assign to immutable variable '" + base->name + "' (declare with 'var' instead of 'let')");
+            if (!base || base->kind != Expr::Kind::Ident) {
+                ctx.diags.error(s->span, "invalid assignment target");
+                if (s->assign_value) check_expr(s->assign_value.get());
+                return;
+            }
+            LocalVar* lv = lookup_var(base->name);
+            if (!lv) {
+                ctx.diags.error(s->span, "cannot assign to '" + base->name + "'");
+                if (s->assign_value) check_expr(s->assign_value.get());
+                return;
+            }
+            if (lv->type.is_stencil()) {
+                ctx.diags.error(s->span, "cannot write to read-only stencil");
+                return;
+            }
+            if (lv->type.is_store()) {
+                ctx.diags.error(s->span, "cannot assign to sub-element of store '" + base->name + "' directly; assign a full store element");
+                return;
+            }
+            if (!lv->is_mutable) {
+                ctx.diags.error(s->span, "cannot assign to immutable variable '" + base->name + "' (declare with 'var' instead of 'let')");
+            }
+            Type target_t = check_expr(s->assign_target.get());
+            for (const Expr* cur = s->assign_target.get();
+                 cur && (cur->kind == Expr::Kind::Field || cur->kind == Expr::Kind::Index);
+                 cur = cur->lhs.get()) {
+                if (cur->kind == Expr::Kind::Field && cur->lhs && cur->lhs->resolved_type.is_vector() && cur->name.size() > 1) {
+                    uint32_t seen_mask = 0;
+                    for (char c : cur->name) {
+                        uint32_t idx = (c == 'x' || c == 'r' || c == 's') ? 0 :
+                                       (c == 'y' || c == 'g' || c == 't') ? 1 :
+                                       (c == 'z' || c == 'b' || c == 'p') ? 2 : 3;
+                        if (seen_mask & (1u << idx)) {
+                            ctx.diags.error(cur->span, "cannot assign to vector swizzle with duplicate components '." + cur->name + "'");
+                            break;
+                        }
+                        seen_mask |= (1u << idx);
                     }
                 }
             }
-            Type target_t = check_expr(s->assign_target.get());
+            if (s->compound_op.has_value() && !target_t.is_numeric()) {
+                ctx.diags.error(s->span, "compound assignment requires a numeric scalar or vector target, got '" + target_t.to_string() + "'");
+            }
             check_expr(s->assign_value.get(), target_t);
             if (s->compound_op.has_value() && target_t.is_vector()) {
                 // Allow `vec *= scalar`

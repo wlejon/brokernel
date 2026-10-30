@@ -529,6 +529,122 @@ static void test_vector_bool_masks() {
     assert(rep.ok && rep.ran_gpu);
 }
 
+static void test_assignment_targets_parity() {
+    const char* src = R"(
+        struct Leaf {
+            c: f32,
+            v: vec3<f32>,
+        }
+        struct Branch {
+            b: Leaf,
+            weights: array<f32, 3>,
+        }
+        struct Root {
+            b: Branch,
+        }
+
+        @kernel @grid(1)
+        fn k_assign_targets(g: grid<1>, out: write_store<f32, 1>) -> f32 {
+            let x = g.x();
+            let dyn_i = x % 4;
+            let dyn_v = x % 3;
+
+            // 1. Local array<T, N> element writes (static + dynamic indices + compound assignment)
+            var arr: array<f32, 4>;
+            arr[0] = 1.0;
+            arr[1] = 2.0;
+            arr[2] = 3.0;
+            arr[3] = 4.0;
+            arr[dyn_i] = f32(x) + 10.0;
+            arr[(x + 1) % 4] += 5.0;
+
+            // 2. Vector element writes (v[i] = ..., v[i] += ...) and multi-component swizzle writes (v.xy = ..., v.yz += ...)
+            var v: vec4<f32> = vec4<f32>(1.0, 2.0, 3.0, 4.0);
+            v[dyn_v] = f32(x) * 2.0;
+            v[(x + 2) % 4] += 7.0;
+            v.xy = vec2<f32>(v.x + 1.0, v.y + 3.0);
+            v.yzw += vec3<f32>(10.0, 20.0, 30.0);
+
+            // 3. Nested field writes (a.b.c = ..., a.b.v.xz += ..., a.b.weights[i] += ...)
+            var a: Root;
+            a.b.b.c = 12.0;
+            a.b.b.c += f32(x);
+            a.b.b.v = vec3<f32>(1.0, 2.0, 3.0);
+            a.b.b.v[dyn_v] = 9.0;
+            a.b.b.v.xz += vec2<f32>(4.0, 6.0);
+            a.b.weights[0] = 0.5;
+            a.b.weights[1] = 1.5;
+            a.b.weights[2] = 2.5;
+            a.b.weights[dyn_v] += f32(x);
+
+            let total = (arr[0] + arr[1] + arr[2] + arr[3])
+                      + (v.x + v.y + v.z + v.w)
+                      + a.b.b.c
+                      + (a.b.b.v.x + a.b.b.v.y + a.b.b.v.z)
+                      + (a.b.weights[0] + a.b.weights[1] + a.b.weights[2]);
+            out[x] = total;
+            return total;
+        }
+    )";
+
+    auto res = compile_source(src, "assign_targets.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_assign_targets");
+    assert(k != nullptr);
+    if (brass::host_has_avx2()) {
+        assert(k->cpu_grid_lanes == 8);
+    }
+
+    const uint32_t W = 29;
+    std::vector<float> out_store(W, 0.0f);
+    std::vector<float> out_ret(W, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out_store)};
+
+    std::string err;
+    assert(k->dispatch_cpu(GridShape(W), args, out_ret.data(), &err));
+
+    for (uint32_t x = 0; x < W; ++x) {
+        const uint32_t dyn_i = x % 4;
+        const uint32_t dyn_v = x % 3;
+
+        float arr[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        arr[dyn_i] = static_cast<float>(x) + 10.0f;
+        arr[(x + 1) % 4] += 5.0f;
+
+        float v[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        v[dyn_v] = static_cast<float>(x) * 2.0f;
+        v[(x + 2) % 4] += 7.0f;
+        v[0] = v[0] + 1.0f;
+        v[1] = v[1] + 3.0f;
+        v[1] += 10.0f;
+        v[2] += 20.0f;
+        v[3] += 30.0f;
+
+        float c = 12.0f + static_cast<float>(x);
+        float bv[3] = {1.0f, 2.0f, 3.0f};
+        bv[dyn_v] = 9.0f;
+        bv[0] += 4.0f;
+        bv[2] += 6.0f;
+        float w[3] = {0.5f, 1.5f, 2.5f};
+        w[dyn_v] += static_cast<float>(x);
+
+        float want = (arr[0] + arr[1] + arr[2] + arr[3])
+                   + (v[0] + v[1] + v[2] + v[3])
+                   + c
+                   + (bv[0] + bv[1] + bv[2])
+                   + (w[0] + w[1] + w[2]);
+        assert(out_store[x] == want);
+        assert(out_ret[x] == want);
+    }
+
+    std::vector<float> gpu_store(W, 0.0f);
+    std::vector<KernelArg> gargs = {KernelArg::store(gpu_store)};
+    auto rep = k->compare_cpu_gpu(GridShape(W), gargs, 0.0, 0.0);
+    if (!rep.ok) std::cerr << "k_assign_targets parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -542,6 +658,7 @@ int main() {
     test_vector_stencil_edges();
     test_store_bounds();
     test_vector_bool_masks();
+    test_assignment_targets_parity();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

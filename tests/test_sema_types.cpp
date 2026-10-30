@@ -173,6 +173,30 @@ static void test_store_access_modes_and_mutability() {
         assert(!res.ok);
         assert(res.error_message().find("recursive") != std::string::npos);
     }
+
+    // 5. Invalid assignment targets (duplicate swizzle components, store sub-element, non-lvalue) are rejected
+    {
+        const char* src = R"(
+            @kernel fn bad_swizzle(x: f32) -> f32 {
+                var v: vec3<f32> = vec3<f32>(x, x, x);
+                v.xx = vec2<f32>(1.0, 2.0);
+                return v.x;
+            }
+        )";
+        auto res = compile_source(src, "bad_swizzle.bk");
+        assert(!res.ok);
+        assert(res.error_message().find("duplicate components") != std::string::npos);
+    }
+    {
+        const char* src = R"(
+            @kernel fn bad_store_sub(s: rw_store<vec3<f32>, 1>) {
+                s[0].x = 1.0;
+            }
+        )";
+        auto res = compile_source(src, "bad_store_sub.bk");
+        assert(!res.ok);
+        assert(res.error_message().find("sub-element of store") != std::string::npos);
+    }
 }
 
 static void test_64bit_grid_indexing_and_bitcast() {

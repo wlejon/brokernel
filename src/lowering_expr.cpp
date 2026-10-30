@@ -571,6 +571,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             ValueList recv = lower_expr(e->lhs.get());
             if (rt.is_scalar() || recv.size() <= 1) return recv;
             ValueList idx_v = lower_expr(e->args[0].get());
+            brass::Value* idx = idx_v.empty() ? b.build_iconst_i32(0) : idx_v[0];
+            if (idx->type() == brass::Type::i64()) idx = b.build_trunc_i32(idx);
             Type elem_t = rt.element_type();
             uint32_t elem_leaves = mod.types.flat_leaf_count(elem_t);
             uint32_t count = rt.dimension;
@@ -578,7 +580,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             for (uint32_t k = 0; k < elem_leaves; ++k) {
                 brass::Value* acc = recv[k];
                 for (uint32_t i = 1; i < count; ++i) {
-                    brass::Value* eq = b.build_eq(idx_v[0], b.build_iconst_i32(static_cast<int32_t>(i)));
+                    brass::Value* eq = b.build_eq(idx, b.build_iconst_i32(static_cast<int32_t>(i)));
                     acc = b.build_select(eq, recv[i * elem_leaves + k], acc);
                 }
                 res[k] = acc;

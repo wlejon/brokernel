@@ -245,55 +245,122 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
                 store_element_to_buffer(elem_t, base, lin, rhs);
                 return;
             }
-            // 2. Local variable (or vector swizzle / struct field / array element of local variable)
-            if (s->assign_target->kind == Expr::Kind::Ident) {
-                int id = lookup_var_id(s->assign_target->name);
-                if (id >= 0) {
-                    if (s->compound_op.has_value()) {
-                        auto& cur = var_values[id];
-                        ScalarKind sk = s->assign_target->resolved_type.scalar;
-                        for (size_t k = 0; k < cur.size() && k < rhs.size(); ++k) {
-                            cur[k] = lower_scalar_binary(*s->compound_op, cur[k], rhs[k], sk);
-                        }
-                    } else {
-                        var_values[id] = std::move(rhs);
+            // 2. Local variable (or nested field / vector swizzle / vector or array element of local variable)
+            std::function<void(const Expr*, const std::function<ValueList(const ValueList&)>&)> update_lvalue;
+            update_lvalue = [&](const Expr* target, const std::function<ValueList(const ValueList&)>& write_fn) {
+                if (!target) return;
+                if (target->kind == Expr::Kind::Ident) {
+                    int id = lookup_var_id(target->name);
+                    if (id >= 0) {
+                        var_values[id] = write_fn(var_values[id]);
                     }
+                    return;
                 }
-                return;
-            }
-            if (s->assign_target->kind == Expr::Kind::Field &&
-                s->assign_target->lhs->kind == Expr::Kind::Ident) {
-                int id = lookup_var_id(s->assign_target->lhs->name);
-                if (id < 0) return;
-                auto& cur = var_values[id];
-                const Type& base_t = s->assign_target->lhs->resolved_type;
-                if (base_t.is_vector()) {
-                    const std::string& swz = s->assign_target->name;
-                    for (size_t k = 0; k < swz.size() && k < rhs.size(); ++k) {
-                        uint32_t idx = swizzle_index(swz[k]);
-                        if (idx < cur.size()) {
-                            cur[idx] = s->compound_op.has_value()
-                                           ? lower_scalar_binary(*s->compound_op, cur[idx], rhs[k], base_t.scalar)
-                                           : rhs[k];
-                        }
+                if (target->kind == Expr::Kind::Field && target->lhs) {
+                    const Type& base_t = target->lhs->resolved_type;
+                    if (base_t.is_scalar()) {
+                        update_lvalue(target->lhs.get(), write_fn);
+                        return;
                     }
-                } else if (base_t.is_struct()) {
-                    const StructDef* sdef = mod.types.find_struct(base_t.struct_id);
-                    if (sdef) {
-                        if (const StructField* sf = sdef->find_field(s->assign_target->name)) {
-                            for (uint32_t k = 0; k < sf->flat_leaf_count && k < rhs.size(); ++k) {
+                    if (base_t.is_vector()) {
+                        const std::string& swz = target->name;
+                        update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
+                            ValueList old_sub;
+                            old_sub.reserve(swz.size());
+                            for (char c : swz) {
+                                uint32_t idx = swizzle_index(c);
+                                old_sub.push_back(idx < cur.size() ? cur[idx] : cur[0]);
+                            }
+                            ValueList new_sub = write_fn(old_sub);
+                            ValueList next = cur;
+                            for (size_t k = 0; k < swz.size() && k < new_sub.size(); ++k) {
+                                uint32_t idx = swizzle_index(swz[k]);
+                                if (idx < next.size()) {
+                                    next[idx] = new_sub[k];
+                                }
+                            }
+                            return next;
+                        });
+                        return;
+                    }
+                    if (base_t.is_struct()) {
+                        const StructDef* sdef = mod.types.find_struct(base_t.struct_id);
+                        const StructField* sf = sdef ? sdef->find_field(target->name) : nullptr;
+                        if (!sf) return;
+                        update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
+                            ValueList old_sub;
+                            old_sub.reserve(sf->flat_leaf_count);
+                            for (uint32_t k = 0; k < sf->flat_leaf_count; ++k) {
                                 uint32_t idx = sf->flat_leaf_offset + k;
-                                if (idx < cur.size()) {
-                                    cur[idx] = s->compound_op.has_value()
-                                                   ? lower_scalar_binary(*s->compound_op, cur[idx], rhs[k], sf->type.scalar)
-                                                   : rhs[k];
+                                old_sub.push_back(idx < cur.size() ? cur[idx] : cur[0]);
+                            }
+                            ValueList new_sub = write_fn(old_sub);
+                            ValueList next = cur;
+                            for (uint32_t k = 0; k < sf->flat_leaf_count && k < new_sub.size(); ++k) {
+                                uint32_t idx = sf->flat_leaf_offset + k;
+                                if (idx < next.size()) {
+                                    next[idx] = new_sub[k];
+                                }
+                            }
+                            return next;
+                        });
+                        return;
+                    }
+                    return;
+                }
+                if (target->kind == Expr::Kind::Index && target->lhs && !target->args.empty()) {
+                    const Type& base_t = target->lhs->resolved_type;
+                    if (base_t.is_scalar()) {
+                        update_lvalue(target->lhs.get(), write_fn);
+                        return;
+                    }
+                    ValueList idx_v = lower_expr(target->args[0].get());
+                    brass::Value* idx = idx_v.empty() ? b.build_iconst_i32(0) : idx_v[0];
+                    if (idx->type() == brass::Type::i64()) {
+                        idx = b.build_trunc_i32(idx);
+                    }
+                    Type elem_t = base_t.element_type();
+                    uint32_t elem_leaves = mod.types.flat_leaf_count(elem_t);
+                    uint32_t count = base_t.dimension;
+                    update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
+                        if (cur.empty() || elem_leaves == 0 || count == 0) return cur;
+                        ValueList old_sub(elem_leaves, cur[0]);
+                        for (uint32_t k = 0; k < elem_leaves; ++k) {
+                            brass::Value* acc = k < cur.size() ? cur[k] : cur[0];
+                            for (uint32_t i = 1; i < count; ++i) {
+                                uint32_t off = i * elem_leaves + k;
+                                if (off < cur.size()) {
+                                    brass::Value* eq = b.build_eq(idx, b.build_iconst_i32(static_cast<int32_t>(i)));
+                                    acc = b.build_select(eq, cur[off], acc);
+                                }
+                            }
+                            old_sub[k] = acc;
+                        }
+                        ValueList new_sub = write_fn(old_sub);
+                        ValueList next = cur;
+                        for (uint32_t i = 0; i < count; ++i) {
+                            brass::Value* eq = b.build_eq(idx, b.build_iconst_i32(static_cast<int32_t>(i)));
+                            for (uint32_t k = 0; k < elem_leaves && k < new_sub.size(); ++k) {
+                                uint32_t off = i * elem_leaves + k;
+                                if (off < next.size()) {
+                                    next[off] = b.build_select(eq, new_sub[k], next[off]);
                                 }
                             }
                         }
-                    }
+                        return next;
+                    });
+                    return;
                 }
-                return;
-            }
+            };
+            ScalarKind sk = s->assign_target->resolved_type.scalar;
+            update_lvalue(s->assign_target.get(), [&](const ValueList& old_v) -> ValueList {
+                if (!s->compound_op.has_value()) return rhs;
+                ValueList res = old_v;
+                for (size_t k = 0; k < res.size() && k < rhs.size(); ++k) {
+                    res[k] = lower_scalar_binary(*s->compound_op, res[k], rhs[k], sk);
+                }
+                return res;
+            });
             break;
         }
         case Stmt::Kind::If: {
