@@ -95,4 +95,8 @@ std::shared_ptr<const CompiledKernel> kernelOf(bronze::Value v);
 /// The GPU buffer a `KernelBuffer` object holds; nullptr for any other value.
 std::shared_ptr<GpuBuffer> bufferOf(bronze::Value v);
 
+/// A `KernelBuffer` object over a buffer the host made (a view into memory
+/// it owns, say), in the current realm; undefined for null.
+bronze::Value bufferValue(std::shared_ptr<GpuBuffer> buffer);
+
 } // namespace brokernel::api

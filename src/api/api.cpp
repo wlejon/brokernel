@@ -649,4 +649,8 @@ std::shared_ptr<GpuBuffer> bufferOf(Value v) {
     return h ? h->buffer : nullptr;
 }
 
+Value bufferValue(std::shared_ptr<GpuBuffer> buffer) {
+    return buffer ? makeBuffer(std::move(buffer)) : ev::undefined();
+}
+
 } // namespace brokernel::api
