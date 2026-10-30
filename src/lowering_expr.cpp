@@ -691,11 +691,17 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                         brass::Value* addr = b.build_add(base[0], byte_off);
                         auto atomic = [&]() -> brass::Value* {
                             if (m == "atomic_add") {
-                                return elem_t.is_f32() ? kb.atom_add_f32(addr, val[0]) : kb.atom_add_i32(addr, val[0]);
+                                if (elem_t.is_f32()) return kb.atom_add_f32(addr, val[0]);
+                                return elem_t.is_u32() ? kb.atom_add_u32(addr, val[0]) : kb.atom_add_i32(addr, val[0]);
                             }
-                            if (m == "atomic_min") return b.build_call("ptx_atom_min_i32", brass::Type::i32(), {addr, val[0]});
-                            if (m == "atomic_max") return b.build_call("ptx_atom_max_i32", brass::Type::i32(), {addr, val[0]});
-                            return b.build_call("ptx_atom_exch_i32", brass::Type::i32(), {addr, val[0]});
+                            if (m == "atomic_min") {
+                                return elem_t.is_u32() ? kb.atom_min_u32(addr, val[0]) : kb.atom_min_i32(addr, val[0]);
+                            }
+                            if (m == "atomic_max") {
+                                return elem_t.is_u32() ? kb.atom_max_u32(addr, val[0]) : kb.atom_max_i32(addr, val[0]);
+                            }
+                            if (elem_t.is_f32()) return kb.atom_exch_f32(addr, val[0]);
+                            return elem_t.is_u32() ? kb.atom_exch_u32(addr, val[0]) : kb.atom_exch_i32(addr, val[0]);
                         };
                         if (base.size() < 2) return {atomic()};
                         // Bounded: outside the store the atomic does nothing
@@ -710,14 +716,25 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                         b.position_at_end(done_bb);
                         return {old};
                     } else {
-                        // Sequential CPU evaluation of atomic op
-                        ValueList old_v = load_element_from_buffer(elem_t, base, lin);
-                        brass::Value* new_v = val[0];
-                        if (m == "atomic_add") new_v = b.build_add(old_v[0], val[0]);
-                        else if (m == "atomic_min") new_v = lower_scalar_math_2("min", old_v[0], val[0], elem_t.scalar);
-                        else if (m == "atomic_max") new_v = lower_scalar_math_2("max", old_v[0], val[0], elem_t.scalar);
-                        store_element_to_buffer(elem_t, base, lin, {new_v});
-                        return old_v;
+                        brass::Type mt = to_mir_scalar_type(elem_t.scalar);
+                        brass::Value* idx64 = (lin->type() == brass::Type::i64()) ? lin : b.build_sext_i64(lin);
+                        const Ops::Bound bound_v{idx64, base.size() > 1 ? base[1] : nullptr};
+                        const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
+                        brass::Builder& sb = b.builder();
+                        bool is_u = elem_t.is_u32();
+                        brass::Value* old_v = b.build_atomic_rmw(
+                            mt, base[0], idx64, static_cast<uint8_t>(mt.size_in_bytes()), val[0], bound,
+                            [&](brass::Value* cur, brass::Value* v) -> brass::Value* {
+                                if (m == "atomic_add") return sb.build_add(cur, v);
+                                if (m == "atomic_min") {
+                                    return sb.build_select(is_u ? sb.build_ult(cur, v) : sb.build_slt(cur, v), cur, v);
+                                }
+                                if (m == "atomic_max") {
+                                    return sb.build_select(is_u ? sb.build_ugt(cur, v) : sb.build_sgt(cur, v), cur, v);
+                                }
+                                return v;
+                            });
+                        return {old_v};
                     }
                 }
             }

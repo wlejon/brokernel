@@ -30,6 +30,7 @@
 
 #include <brass/mir/builder.hpp>
 
+#include <functional>
 #include <initializer_list>
 #include <optional>
 #include <stdexcept>
@@ -185,6 +186,9 @@ public:
                              brass::Value* val) {
         build_store_indexed(t, base, index, scale, 0, val);
     }
+    brass::Value* build_atomic_rmw(brass::Type t, brass::Value* base, brass::Value* index, uint8_t scale,
+                                   brass::Value* val, const Bound* bound,
+                                   const std::function<brass::Value*(brass::Value*, brass::Value*)>& scalar_op);
 
     // Calls take uniform arguments only.
     brass::Value* build_call(std::string_view callee, brass::Type ret) { return b_.build_call(callee, ret); }

@@ -645,6 +645,90 @@ static void test_assignment_targets_parity() {
     assert(rep.ok && rep.ran_gpu);
 }
 
+static void test_atomics_parity() {
+    const char* src = R"(
+        @kernel @grid(1)
+        fn k_atomics(g: grid<1>,
+                     s_i32: rw_store<i32, 1>,
+                     s_u32: rw_store<u32, 1>,
+                     s_f32: rw_store<f32, 1>,
+                     exch_i32: rw_store<i32, 1>,
+                     exch_u32: rw_store<u32, 1>) {
+            let x = g.x();
+            let sv: i32 = (x * 7) - 50;
+            // Values spanning above 0x80000000u (2147483648u) so signed vs unsigned order differs
+            let uv: u32 = 2147483640u + u32(x) * 3u;
+
+            s_i32.atomic_add(0, sv);
+            s_i32.atomic_min(1, sv);
+            s_i32.atomic_max(2, sv);
+
+            s_u32.atomic_add(0, u32(x + 1));
+            s_u32.atomic_min(1, uv);
+            s_u32.atomic_max(2, uv);
+
+            s_f32.atomic_add(0, 1.5);
+
+            // Per-cell exchange (deterministic across parallel threads)
+            let prev_i = exch_i32.atomic_exchange(x, sv);
+            s_i32.atomic_add(3, prev_i);
+            let prev_u = exch_u32.atomic_exchange(x, uv);
+            s_u32.atomic_add(3, prev_u);
+        }
+    )";
+
+    auto res = compile_source(src, "atomics.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_atomics");
+    assert(k != nullptr);
+    if (brass::host_has_avx2()) {
+        assert(k->cpu_grid_lanes == 8);
+    }
+
+    const uint32_t W = 29;
+    std::vector<int32_t> s_i32 = {0, 1000, -1000, 0};
+    std::vector<uint32_t> s_u32 = {0u, 0xFFFFFFFFu, 0u, 0u};
+    std::vector<float> s_f32 = {0.0f};
+    std::vector<int32_t> exch_i32(W, 5);
+    std::vector<uint32_t> exch_u32(W, 11u);
+
+    std::vector<KernelArg> args = {
+        KernelArg::store(s_i32),
+        KernelArg::store(s_u32),
+        KernelArg::store(s_f32),
+        KernelArg::store(exch_i32),
+        KernelArg::store(exch_u32),
+    };
+    auto rep = k->compare_cpu_gpu(GridShape(W), args, 0.0, 0.0);
+    if (!rep.ok) std::cerr << "k_atomics parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+
+    int32_t want_i_sum = 0, want_i_min = 1000, want_i_max = -1000;
+    uint32_t want_u_sum = 0u, want_u_min = 0xFFFFFFFFu, want_u_max = 0u;
+    for (uint32_t x = 0; x < W; ++x) {
+        int32_t sv = static_cast<int32_t>(x) * 7 - 50;
+        uint32_t uv = 2147483640u + x * 3u;
+        want_i_sum += sv;
+        want_i_min = std::min(want_i_min, sv);
+        want_i_max = std::max(want_i_max, sv);
+        want_u_sum += (x + 1u);
+        want_u_min = std::min(want_u_min, uv);
+        want_u_max = std::max(want_u_max, uv);
+        assert(exch_i32[x] == sv);
+        assert(exch_u32[x] == uv);
+    }
+    assert(s_i32[0] == want_i_sum);
+    assert(s_i32[1] == want_i_min);
+    assert(s_i32[2] == want_i_max);
+    assert(s_i32[3] == static_cast<int32_t>(W) * 5);
+    assert(s_u32[0] == want_u_sum);
+    assert(s_u32[1] == want_u_min);
+    assert(s_u32[2] == want_u_max);
+    assert(s_u32[3] == W * 11u);
+    assert(s_f32[0] == static_cast<float>(W) * 1.5f);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -659,6 +743,7 @@ int main() {
     test_store_bounds();
     test_vector_bool_masks();
     test_assignment_targets_parity();
+    test_atomics_parity();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

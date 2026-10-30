@@ -710,6 +710,46 @@ void Ops::build_store_indexed(Type t, Value* base, Value* index, uint8_t scale, 
     store_lanes(t, base, index, scale, offset, val, bound);
 }
 
+Value* Ops::build_atomic_rmw(Type t, Value* base, Value* index, uint8_t scale, Value* val, const Bound* bound,
+                             const std::function<Value*(Value*, Value*)>& scalar_op) {
+    val = real(val);
+    if (!vector_mode()) {
+        if (!bound) {
+            Value* old_v = b_.build_load_indexed(t, base, index, scale, 0);
+            b_.build_store_indexed(t, base, index, scale, 0, scalar_op(old_v, val));
+            return old_v;
+        }
+        BasicBlock* atom_bb = side_block("bounded_atomic");
+        BasicBlock* done_bb = side_block("bounded_atomic_done");
+        Value* old = b_.add_block_param(done_bb, t);
+        b_.build_br_if(in_bounds(bound->index, *bound), atom_bb, {}, done_bb, {zero_scalar(b_, t)});
+        b_.position_at_end(atom_bb);
+        Value* old_v = b_.build_load_indexed(t, base, index, scale, 0);
+        b_.build_store_indexed(t, base, index, scale, 0, scalar_op(old_v, val));
+        b_.build_br(done_bb, {old_v});
+        b_.position_at_end(done_bb);
+        return old;
+    }
+    check_lanes(t);
+    Value* out = b_.build_vzero(vec_type(t));
+    for (uint32_t i = 0; i < lanes; ++i) {
+        Value* idx = lane_of(index, i);
+        Value* v = lane_of(val, i);
+        Value* on = mask ? lane_of(mask, i) : nullptr;
+        if (bound) {
+            Value* in = in_bounds(lane_of(bound->index, i), *bound);
+            on = on ? b_.build_select(in, on, b_.build_iconst_i32(0)) : in;
+        }
+        Value* where = on ? b_.build_select(on, base, scratch) : base;
+        Value* eff_idx = on ? b_.build_select(on, idx, zero_index(b_, idx)) : idx;
+        Value* old_v = b_.build_load_indexed(t, where, eff_idx, scale, 0);
+        if (on) old_v = b_.build_select(on, old_v, zero_scalar(b_, t));
+        b_.build_store_indexed(t, where, eff_idx, scale, 0, scalar_op(old_v, v));
+        out = b_.build_vinsert_lane(out, old_v, i);
+    }
+    return out;
+}
+
 Value* Ops::build_call(std::string_view callee, Type ret, std::initializer_list<Value*> args) {
     return build_call(callee, ret, std::vector<Value*>(args));
 }

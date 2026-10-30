@@ -197,6 +197,38 @@ static void test_store_access_modes_and_mutability() {
         assert(!res.ok);
         assert(res.error_message().find("sub-element of store") != std::string::npos);
     }
+
+    // 6. Atomic builtins on unsupported store element types are rejected
+    {
+        const char* src = R"(
+            @kernel fn bad_atomic_vec(s: rw_store<vec3<f32>, 1>) {
+                s.atomic_add(0, vec3<f32>(1.0, 2.0, 3.0));
+            }
+        )";
+        auto res = compile_source(src, "bad_atomic_vec.bk");
+        assert(!res.ok);
+        assert(res.error_message().find("atomic_add requires store element type") != std::string::npos);
+    }
+    {
+        const char* src = R"(
+            @kernel fn bad_atomic_f32_min(s: rw_store<f32, 1>) {
+                s.atomic_min(0, 1.0);
+            }
+        )";
+        auto res = compile_source(src, "bad_atomic_f32_min.bk");
+        assert(!res.ok);
+        assert(res.error_message().find("atomic_min requires store element type") != std::string::npos);
+    }
+    {
+        const char* src = R"(
+            @kernel fn bad_atomic_f64(s: rw_store<f64, 1>) {
+                s.atomic_add(0, 1.0 as f64);
+            }
+        )";
+        auto res = compile_source(src, "bad_atomic_f64.bk");
+        assert(!res.ok);
+        assert(res.error_message().find("atomic_add requires store element type") != std::string::npos);
+    }
 }
 
 static void test_64bit_grid_indexing_and_bitcast() {

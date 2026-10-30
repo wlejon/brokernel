@@ -145,6 +145,11 @@ Type FnCheckState::check_method_call(Expr* e) {
             if (!can_Write(recv_t.access) || !can_Read(recv_t.access)) {
                 ctx.diags.error(e->span, "atomic store operation requires a read-write store ('rw_store' or 'store')");
             }
+            bool valid_elem = elem.is_i32() || elem.is_u32() || (m == "atomic_add" && elem.is_f32());
+            if (!valid_elem) {
+                std::string allowed = (m == "atomic_add") ? "'i32', 'u32', or 'f32'" : "'i32' or 'u32'";
+                ctx.diags.error(e->span, m + " requires store element type " + allowed + ", got '" + elem.to_string() + "'");
+            }
             if (e->args.size() != dim + 1) {
                 ctx.diags.error(e->span, m + " expects " + std::to_string(dim) + " coordinate argument(s) and 1 value argument");
             } else {
