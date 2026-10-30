@@ -418,12 +418,14 @@ brass::Value* MirBodyLowerer::lower_scalar_math_3(const std::string& name, brass
 ValueList MirBodyLowerer::lower_inlined_call(
     const CheckedFunction& callee,
     const std::vector<ValueList>& arg_vals) {
-    // Save outer return tracking and scopes
+    // Save outer return tracking, loop stack, and scopes
     int saved_has_ret = has_returned_var_id;
     int saved_ret_val = ret_val_var_id;
     Type saved_ret_type = active_return_type;
     auto saved_scopes = std::move(scopes);
+    auto saved_loops = std::move(loop_stack);
     scopes.clear();
+    loop_stack.clear();
     push_scope();
     active_return_type = callee.return_type;
     has_returned_var_id = alloc_var("__callee_has_ret", {b.build_iconst_i32(0)});
@@ -444,6 +446,7 @@ ValueList MirBodyLowerer::lower_inlined_call(
     var_values.erase(has_returned_var_id);
     if (ret_val_var_id >= 0) var_values.erase(ret_val_var_id);
     scopes = std::move(saved_scopes);
+    loop_stack = std::move(saved_loops);
     has_returned_var_id = saved_has_ret;
     ret_val_var_id = saved_ret_val;
     active_return_type = saved_ret_type;
@@ -492,6 +495,29 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return out;
         }
         case Expr::Kind::Binary: {
+            if (e->binary_op == BinaryOp::LogAnd || e->binary_op == BinaryOp::LogOr) {
+                ValueList lv = lower_expr(e->lhs.get());
+                brass::Value* l = lv.empty() ? b.build_iconst_i32(0) : lv[0];
+                brass::Value* cond = (e->binary_op == BinaryOp::LogAnd)
+                                         ? l
+                                         : b.build_eq(l, b.build_iconst_i32(0));
+                if (b.vector_mode()) {
+                    brass::Value* outer = b.mask;
+                    b.mask = outer ? b.build_and(outer, cond) : cond;
+                    ValueList rv = lower_expr(e->rhs.get());
+                    b.mask = outer;
+                    brass::Value* r = rv.empty() ? b.build_iconst_i32(0) : rv[0];
+                    return {(e->binary_op == BinaryOp::LogAnd) ? b.build_and(l, r) : b.build_or(l, r)};
+                }
+                int res_id = alloc_var("", {l});
+                lower_branch(
+                    cond,
+                    [&] { var_values[res_id] = lower_expr(e->rhs.get()); },
+                    nullptr);
+                brass::Value* res = var_values[res_id][0];
+                var_values.erase(res_id);
+                return {res};
+            }
             ValueList lv = lower_expr(e->lhs.get());
             ValueList rv = lower_expr(e->rhs.get());
             size_t n = std::max(lv.size(), rv.size());

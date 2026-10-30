@@ -729,6 +729,125 @@ static void test_atomics_parity() {
     assert(s_f32[0] == static_cast<float>(W) * 1.5f);
 }
 
+static void test_lowering_quirks_parity() {
+    const char* src = R"(
+        fn helper_early_return(i: i32, x: i32) -> i32 {
+            if (i == 2) {
+                return 100;
+            }
+            if (i + x > 25) {
+                return 50;
+            }
+            return i * 10 + 1;
+        }
+
+        fn rhs_side_effects(
+            x: i32,
+            tag: i32,
+            side_store: rw_store<i32, 1>,
+            counter: rw_store<i32, 1>
+        ) -> bool {
+            side_store.store(x, tag);
+            counter.atomic_add(0, 1);
+            return (x & 1) == 0;
+        }
+
+        @kernel fn k_lowering_quirks(
+            and_store: rw_store<i32, 1>,
+            and_count: rw_store<i32, 1>,
+            or_store: rw_store<i32, 1>,
+            or_count: rw_store<i32, 1>,
+            out: write_store<i32, 1>,
+            g: grid<1>
+        ) {
+            let x = g.x();
+            var acc: i32 = 0;
+            for (var i: i32 = 0; i < 8; i = i + 1) {
+                if (i == (x & 3)) {
+                    continue;
+                }
+                if (i > 4 + (x % 3)) {
+                    break;
+                }
+                acc += helper_early_return(i, x);
+            }
+
+            let c_and = (x % 3 == 0) && rhs_side_effects(x, 111 + x, and_store, and_count);
+            let c_or  = (x % 2 == 0) || rhs_side_effects(x, 222 + x, or_store, or_count);
+
+            if (c_and) {
+                acc += 1000;
+            }
+            if (c_or) {
+                acc += 2000;
+            }
+            out.write(acc);
+        }
+    )";
+
+    auto res = compile_source(src, "lowering_quirks.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_lowering_quirks");
+    assert(k != nullptr);
+    if (brass::host_has_avx2()) {
+        assert(k->cpu_grid_lanes == 8);
+    }
+
+    const uint32_t W = 29; // 3 full AVX2 vector groups (24) + 5 scalar tail
+    std::vector<int32_t> and_store(W, -99);
+    std::vector<int32_t> and_count = {0};
+    std::vector<int32_t> or_store(W, -99);
+    std::vector<int32_t> or_count = {0};
+    std::vector<int32_t> out(W, 0);
+
+    std::vector<KernelArg> args = {
+        KernelArg::store(and_store),
+        KernelArg::store(and_count),
+        KernelArg::store(or_store),
+        KernelArg::store(or_count),
+        KernelArg::store(out),
+    };
+    auto rep = k->compare_cpu_gpu(GridShape(W), args, 0.0, 0.0);
+    if (!rep.ok) std::cerr << "k_lowering_quirks parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+
+    int32_t expected_and_count = 0;
+    int32_t expected_or_count = 0;
+    for (int32_t x = 0; x < static_cast<int32_t>(W); ++x) {
+        int32_t want_acc = 0;
+        for (int32_t i = 0; i < 8; ++i) {
+            if (i == (x & 3)) continue;
+            if (i > 4 + (x % 3)) break;
+            int32_t hv = (i == 2) ? 100 : ((i + x > 25) ? 50 : (i * 10 + 1));
+            want_acc += hv;
+        }
+        bool c_and = false;
+        if (x % 3 == 0) {
+            expected_and_count++;
+            assert(and_store[x] == 111 + x);
+            c_and = ((x & 1) == 0);
+        } else {
+            // Left-hand side decided false: right-hand side store write must NOT happen
+            assert(and_store[x] == -99);
+        }
+        bool c_or = true;
+        if (x % 2 != 0) {
+            expected_or_count++;
+            assert(or_store[x] == 222 + x);
+            c_or = ((x & 1) == 0);
+        } else {
+            // Left-hand side decided true: right-hand side store write must NOT happen
+            assert(or_store[x] == -99);
+        }
+        if (c_and) want_acc += 1000;
+        if (c_or) want_acc += 2000;
+        assert(out[x] == want_acc);
+    }
+    assert(and_count[0] == expected_and_count);
+    assert(or_count[0] == expected_or_count);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -744,6 +863,7 @@ int main() {
     test_vector_bool_masks();
     test_assignment_targets_parity();
     test_atomics_parity();
+    test_lowering_quirks_parity();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }
