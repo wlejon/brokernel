@@ -7,19 +7,30 @@ static bool match_type_pattern(
     const TypeExpr* pattern,
     const Type& actual,
     const std::string& decl_mod,
+    const std::vector<GenericParamDecl>& generic_params,
     SemaContext& ctx,
     GenericEnv& inferred) {
     if (!pattern || actual.is_void()) return false;
+    auto bind_const_param = [&](const std::string& name, int64_t val) {
+        if (name.empty()) return;
+        for (const auto& gp : generic_params) {
+            if (gp.is_const && gp.name == name) {
+                inferred.const_params[name] = ConstValue{Type::i32(), val, static_cast<double>(val), false};
+                return;
+            }
+        }
+    };
     // Direct generic parameter name
     if (pattern->args.empty()) {
-        // Check if pattern->name is one of the type params
-        if (pattern->name == "T" || pattern->name == "U" || pattern->name == "V" || pattern->name == "Elem") {
-            auto it = inferred.type_params.find(pattern->name);
-            if (it == inferred.type_params.end()) {
-                inferred.type_params[pattern->name] = actual;
-                return true;
+        for (const auto& gp : generic_params) {
+            if (!gp.is_const && gp.name == pattern->name) {
+                auto it = inferred.type_params.find(pattern->name);
+                if (it == inferred.type_params.end()) {
+                    inferred.type_params[pattern->name] = actual;
+                    return true;
+                }
+                return it->second == actual;
             }
-            return it->second == actual;
         }
     }
     if ((pattern->name == "vec2" || pattern->name == "vec3" || pattern->name == "vec4") &&
@@ -27,7 +38,7 @@ static bool match_type_pattern(
         uint32_t lanes = static_cast<uint32_t>(pattern->name.back() - '0');
         if (actual.dimension != lanes) return false;
         if (!pattern->args.empty() && pattern->args[0].type_arg) {
-            return match_type_pattern(pattern->args[0].type_arg.get(), Type::scalar_type(actual.scalar), decl_mod, ctx, inferred);
+            return match_type_pattern(pattern->args[0].type_arg.get(), Type::scalar_type(actual.scalar), decl_mod, generic_params, ctx, inferred);
         }
         return true;
     }
@@ -35,13 +46,23 @@ static bool match_type_pattern(
         if (!actual.is_vector() && !actual.is_scalar()) return false;
         uint32_t lanes = actual.is_vector() ? actual.dimension : 1;
         if (pattern->args[0].type_arg) {
-            match_type_pattern(pattern->args[0].type_arg.get(), Type::scalar_type(actual.scalar), decl_mod, ctx, inferred);
+            match_type_pattern(pattern->args[0].type_arg.get(), Type::scalar_type(actual.scalar), decl_mod, generic_params, ctx, inferred);
         }
-        if (!pattern->args[1].ident_or_const_name.empty()) {
-            ConstValue cv;
-            cv.type = Type::i32();
-            cv.int_val = lanes;
-            inferred.const_params[pattern->args[1].ident_or_const_name] = cv;
+        bind_const_param(pattern->args[1].ident_or_const_name, lanes);
+        return true;
+    }
+    if (pattern->name == "array" && actual.is_array()) {
+        if (!pattern->args.empty() && pattern->args[0].type_arg) {
+            match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, generic_params, ctx, inferred);
+        }
+        if (pattern->args.size() >= 2) {
+            bind_const_param(pattern->args[1].ident_or_const_name, static_cast<int64_t>(actual.dimension));
+        }
+        return true;
+    }
+    if (pattern->name == "grid" && actual.is_grid()) {
+        if (!pattern->args.empty()) {
+            bind_const_param(pattern->args[0].ident_or_const_name, static_cast<int64_t>(actual.dimension));
         }
         return true;
     }
@@ -49,32 +70,33 @@ static bool match_type_pattern(
          pattern->name == "stencil2d" || pattern->name == "stencil3d") &&
         actual.is_stencil()) {
         if (!pattern->args.empty() && pattern->args[0].type_arg) {
-            match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, ctx, inferred);
+            match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, generic_params, ctx, inferred);
         }
         size_t rad_idx = 1;
         if (pattern->name == "stencil") {
-            if (pattern->args.size() >= 2 && !pattern->args[1].ident_or_const_name.empty()) {
-                ConstValue cv{Type::i32(), static_cast<int64_t>(actual.dimension), 0.0, false};
-                inferred.const_params[pattern->args[1].ident_or_const_name] = cv;
+            if (pattern->args.size() >= 2) {
+                bind_const_param(pattern->args[1].ident_or_const_name, static_cast<int64_t>(actual.dimension));
             }
             rad_idx = 2;
         }
-        if (pattern->args.size() > rad_idx && !pattern->args[rad_idx].ident_or_const_name.empty()) {
+        if (pattern->args.size() > rad_idx) {
             int32_t r = actual.stencil_radius >= 0 ? actual.stencil_radius : 1;
-            ConstValue cv{Type::i32(), r, 0.0, false};
-            inferred.const_params[pattern->args[rad_idx].ident_or_const_name] = cv;
+            bind_const_param(pattern->args[rad_idx].ident_or_const_name, r);
         }
         return true;
     }
     if ((pattern->name == "store" || pattern->name == "read_store" ||
-         pattern->name == "write_store" || pattern->name == "rw_store") &&
+         pattern->name == "write_store" || pattern->name == "rw_store" ||
+         pattern->name == "rstore" || pattern->name == "wstore" ||
+         pattern->name == "store1d" || pattern->name == "store2d" || pattern->name == "store3d" ||
+         pattern->name == "read_store1d" || pattern->name == "read_store2d" || pattern->name == "read_store3d" ||
+         pattern->name == "write_store1d" || pattern->name == "write_store2d" || pattern->name == "write_store3d") &&
         actual.is_store()) {
         if (!pattern->args.empty() && pattern->args[0].type_arg) {
-            match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, ctx, inferred);
+            match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, generic_params, ctx, inferred);
         }
-        if (pattern->args.size() >= 2 && !pattern->args[1].ident_or_const_name.empty()) {
-            ConstValue cv{Type::i32(), static_cast<int64_t>(actual.dimension), 0.0, false};
-            inferred.const_params[pattern->args[1].ident_or_const_name] = cv;
+        if (pattern->args.size() >= 2) {
+            bind_const_param(pattern->args[1].ident_or_const_name, static_cast<int64_t>(actual.dimension));
         }
         return true;
     }
@@ -83,8 +105,23 @@ static bool match_type_pattern(
         const StructDecl* sdecl = ctx.find_struct_decl(decl_mod, pattern->name, &st_mod);
         const StructDef* sdef = ctx.out->types.find_struct(actual.struct_id);
         if (sdecl && sdef) {
+            GenericEnv st_inferred;
             for (size_t fi = 0; fi < sdecl->fields.size() && fi < sdef->fields.size(); ++fi) {
-                match_type_pattern(sdecl->fields[fi].type.get(), sdef->fields[fi].type, st_mod, ctx, inferred);
+                match_type_pattern(sdecl->fields[fi].type.get(), sdef->fields[fi].type, st_mod, sdecl->generic_params, ctx, st_inferred);
+            }
+            for (size_t gi = 0; gi < pattern->args.size() && gi < sdecl->generic_params.size(); ++gi) {
+                const auto& sgp = sdecl->generic_params[gi];
+                if (sgp.is_const) {
+                    auto it = st_inferred.const_params.find(sgp.name);
+                    if (it != st_inferred.const_params.end()) {
+                        bind_const_param(pattern->args[gi].ident_or_const_name, it->second.int_val);
+                    }
+                } else if (pattern->args[gi].type_arg) {
+                    auto it = st_inferred.type_params.find(sgp.name);
+                    if (it != st_inferred.type_params.end()) {
+                        match_type_pattern(pattern->args[gi].type_arg.get(), it->second, decl_mod, generic_params, ctx, inferred);
+                    }
+                }
             }
         }
         return true;
@@ -162,7 +199,7 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
                 }
             }
             if (!is_gp_name) {
-                match_type_pattern(ptexpr, arg_t, callee_mod, ctx, call_env);
+                match_type_pattern(ptexpr, arg_t, callee_mod, callee_decl.generic_params, ctx, call_env);
             }
         }
         // 3. Apply defaults or report missing generic parameters

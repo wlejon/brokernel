@@ -129,10 +129,65 @@ static void test_generic_stencil_filter_module() {
     assert(kb->find_param("img")->stencil_offsets.size() == 25);
 }
 
+static void test_generic_type_pattern_inference() {
+    const char* src = R"(
+        fn f<Scalar>(v: vec3<Scalar>) -> Scalar {
+            return v.x + v.y + v.z;
+        }
+
+        fn g<Data>(s: store<Data, 2>, x: i32, y: i32) -> Data {
+            return s.load(x, y);
+        }
+
+        @kernel fn run_inferred(inp: store<f64, 2>, out: write_store<f64, 2>, dom: grid<2>) {
+            let v = vec3<f64>(1.5, 2.5, 3.0);
+            let sum_v: f64 = f(v);
+            let cell: f64 = g(inp, dom.x(), dom.y());
+            out.write(sum_v + cell);
+        }
+
+        @kernel fn run_inferred_i32(inp: store<i32, 2>, out: write_store<i32, 2>, dom: grid<2>) {
+            let v = vec3<i32>(10, 20, 30);
+            out.write(f(v) + g(inp, dom.x(), dom.y()));
+        }
+    )";
+
+    auto res = compile_source(src, "generic_infer.bk");
+    if (!res.ok) {
+        std::cerr << res.error_message() << "\n";
+    }
+    assert(res.ok);
+
+    const auto* k64 = res.find_kernel("run_inferred");
+    assert(k64 != nullptr);
+    std::vector<double> in64 = {10.0, 20.0, 30.0, 40.0};
+    std::vector<double> out64(4, 0.0);
+    bool disp64 = k64->dispatch_cpu(
+        GridShape(2, 2),
+        {KernelArg::store(in64), KernelArg::store(out64)});
+    assert(disp64);
+    for (int i = 0; i < 4; ++i) {
+        assert(std::abs(out64[i] - (7.0 + in64[i])) < 1e-12);
+    }
+
+    const auto* k32 = res.find_kernel("run_inferred_i32");
+    assert(k32 != nullptr);
+    std::vector<int32_t> in32 = {1, 2, 3, 4};
+    std::vector<int32_t> out32(4, 0);
+    bool disp32 = k32->dispatch_cpu(
+        GridShape(2, 2),
+        {KernelArg::store(in32), KernelArg::store(out32)});
+    assert(disp32);
+    for (int i = 0; i < 4; ++i) {
+        assert(out32[i] == 60 + in32[i]);
+    }
+}
+
 int main() {
     test_builtin_stdlib_modules();
     test_custom_and_filesystem_modules_and_cycles();
     test_generic_stencil_filter_module();
+    test_generic_type_pattern_inference();
     std::cout << "test_modules_generics: ALL PASSED\n";
     return 0;
 }
