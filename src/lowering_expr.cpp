@@ -812,18 +812,32 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 }
                 return out;
             }
-            // 4. Vector / Array / Struct constructors
+            // 4. Vector / Matrix / Array / Struct constructors
             if (n == "vec2" || n == "vec3" || n == "vec4" ||
                 n == "vec2f" || n == "vec3f" || n == "vec4f" ||
                 n == "vec2d" || n == "vec3d" || n == "vec4d" ||
                 n == "vec2i" || n == "vec3i" || n == "vec4i" ||
                 n == "vec2u" || n == "vec3u" || n == "vec4u" ||
-                n == "vec" || n == "array" || e->resolved_type.is_struct()) {
+                n == "mat2" || n == "mat3" || n == "mat4" ||
+                n == "mat2f" || n == "mat3f" || n == "mat4f" ||
+                n == "mat2d" || n == "mat3d" || n == "mat4d" ||
+                n == "vec" || n == "mat" || n == "array" || e->resolved_type.is_struct()) {
                 uint32_t target_leaves = mod.types.flat_leaf_count(e->resolved_type);
+                std::vector<ScalarKind> target_sks = mod.types.flatten_scalars(e->resolved_type);
                 ValueList flat;
                 for (const auto& a : e->args) {
                     ValueList av = lower_expr(a.get());
-                    for (brass::Value* v : av) flat.push_back(v);
+                    std::vector<ScalarKind> arg_sks = mod.types.flatten_scalars(a->resolved_type);
+                    for (size_t i = 0; i < av.size(); ++i) {
+                        brass::Value* v = av[i];
+                        if (!e->resolved_type.is_struct() && i < arg_sks.size() && !target_sks.empty()) {
+                            ScalarKind to_sk = target_sks[std::min(flat.size(), target_sks.size() - 1)];
+                            if (arg_sks[i] != to_sk) {
+                                v = lower_scalar_cast(v, arg_sks[i], to_sk);
+                            }
+                        }
+                        flat.push_back(v);
+                    }
                 }
                 if (flat.empty()) return make_zero_leaves(e->resolved_type);
                 if (flat.size() == 1 && target_leaves > 1) {

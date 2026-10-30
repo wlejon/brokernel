@@ -393,6 +393,205 @@ std::optional<ConstValue> SemaContext::find_const(
     return std::nullopt;
 }
 
+static ConstValue convert_const_scalar(const ConstValue& cv, ScalarKind sk) {
+    ConstValue out;
+    out.type = Type::scalar_type(sk);
+    if (sk == ScalarKind::F32 || sk == ScalarKind::F64) {
+        double v = cv.type.is_float_scalar() ? cv.float_val : static_cast<double>(cv.int_val);
+        out.float_val = v;
+        out.int_val = static_cast<int64_t>(v);
+        out.bool_val = (v != 0.0);
+    } else if (sk == ScalarKind::Bool) {
+        bool b = cv.type.is_bool() ? cv.bool_val
+               : cv.type.is_float_scalar() ? (cv.float_val != 0.0)
+                                           : (cv.int_val != 0);
+        out.bool_val = b;
+        out.int_val = b ? 1 : 0;
+        out.float_val = b ? 1.0 : 0.0;
+    } else {
+        int64_t iv = cv.type.is_float_scalar() ? static_cast<int64_t>(cv.float_val) : cv.int_val;
+        if (sk == ScalarKind::I32) iv = static_cast<int32_t>(iv);
+        else if (sk == ScalarKind::U32) iv = static_cast<uint32_t>(iv);
+        out.int_val = iv;
+        out.float_val = static_cast<double>(iv);
+        out.bool_val = (iv != 0);
+    }
+    return out;
+}
+
+static void flatten_const_leaves(const ConstValue& cv, std::vector<ConstValue>& out) {
+    if (cv.elements.empty()) {
+        out.push_back(cv);
+        return;
+    }
+    for (const auto& el : cv.elements) {
+        flatten_const_leaves(el, out);
+    }
+}
+
+static ConstValue unflatten_const_value(const Type& t, const std::vector<ConstValue>& leaves, size_t& idx) {
+    if (t.is_scalar()) {
+        ConstValue src = (idx < leaves.size()) ? leaves[idx++] : ConstValue{};
+        return convert_const_scalar(src, t.scalar);
+    }
+    ConstValue out;
+    out.type = t;
+    Type elem_t = t.element_type();
+    out.elements.reserve(t.dimension);
+    for (uint32_t i = 0; i < t.dimension; ++i) {
+        out.elements.push_back(unflatten_const_value(elem_t, leaves, idx));
+    }
+    return out;
+}
+
+static ConstValue convert_const_value(const ConstValue& cv, const Type& target, const TypeRegistry& types) {
+    if (target.is_scalar()) {
+        return convert_const_scalar(cv, target.scalar);
+    }
+    std::vector<ConstValue> leaves;
+    flatten_const_leaves(cv, leaves);
+    if (leaves.empty()) return cv;
+    uint32_t needed = types.flat_leaf_count(target);
+    if (leaves.size() == 1 && needed > 1) {
+        leaves.assign(needed, leaves[0]);
+    } else {
+        while (leaves.size() < needed) leaves.push_back(leaves.back());
+    }
+    size_t idx = 0;
+    return unflatten_const_value(target, leaves, idx);
+}
+
+static std::optional<ConstValue> apply_const_unary(UnaryOp op, const ConstValue& sub) {
+    if (!sub.elements.empty()) {
+        ConstValue res;
+        res.type = sub.type;
+        res.elements.reserve(sub.elements.size());
+        for (const auto& el : sub.elements) {
+            auto r = apply_const_unary(op, el);
+            if (!r) return std::nullopt;
+            res.elements.push_back(*r);
+        }
+        return res;
+    }
+    ConstValue res = sub;
+    if (op == UnaryOp::Neg) {
+        res.int_val = -sub.int_val;
+        res.float_val = -sub.float_val;
+    } else if (op == UnaryOp::Not) {
+        res.type = Type::bool_type();
+        res.bool_val = !sub.bool_val;
+        res.int_val = res.bool_val ? 1 : 0;
+    } else if (op == UnaryOp::BitNot) {
+        res.int_val = ~sub.int_val;
+    }
+    return res;
+}
+
+static std::optional<ConstValue> apply_const_binary(BinaryOp op, const ConstValue& l, const ConstValue& r) {
+    if (!l.elements.empty() || !r.elements.empty()) {
+        if (!l.elements.empty() && !r.elements.empty()) {
+            if (l.elements.size() != r.elements.size()) return std::nullopt;
+            ConstValue res;
+            res.type = l.type;
+            res.elements.reserve(l.elements.size());
+            for (size_t i = 0; i < l.elements.size(); ++i) {
+                auto sub = apply_const_binary(op, l.elements[i], r.elements[i]);
+                if (!sub) return std::nullopt;
+                res.elements.push_back(*sub);
+            }
+            return res;
+        }
+        if (!l.elements.empty()) {
+            ConstValue res;
+            res.type = l.type;
+            res.elements.reserve(l.elements.size());
+            for (const auto& el : l.elements) {
+                auto sub = apply_const_binary(op, el, r);
+                if (!sub) return std::nullopt;
+                res.elements.push_back(*sub);
+            }
+            return res;
+        }
+        ConstValue res;
+        res.type = r.type;
+        res.elements.reserve(r.elements.size());
+        for (const auto& el : r.elements) {
+            auto sub = apply_const_binary(op, l, el);
+            if (!sub) return std::nullopt;
+            res.elements.push_back(*sub);
+        }
+        return res;
+    }
+    ConstValue res;
+    bool is_fp = l.type.is_float_scalar() || r.type.is_float_scalar();
+    res.type = is_fp ? (l.type.is_f64() || r.type.is_f64() ? Type::f64() : Type::f32()) : Type::i32();
+    switch (op) {
+        case BinaryOp::Add:
+            res.int_val = l.int_val + r.int_val;
+            res.float_val = l.float_val + r.float_val;
+            return res;
+        case BinaryOp::Sub:
+            res.int_val = l.int_val - r.int_val;
+            res.float_val = l.float_val - r.float_val;
+            return res;
+        case BinaryOp::Mul:
+            res.int_val = l.int_val * r.int_val;
+            res.float_val = l.float_val * r.float_val;
+            return res;
+        case BinaryOp::Div:
+            if (!is_fp && r.int_val == 0) return std::nullopt;
+            if (!is_fp) res.int_val = l.int_val / r.int_val;
+            res.float_val = l.float_val / r.float_val;
+            return res;
+        case BinaryOp::Mod:
+            if (r.int_val == 0) return std::nullopt;
+            res.int_val = l.int_val % r.int_val;
+            return res;
+        case BinaryOp::Eq:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val == r.float_val) : (l.int_val == r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::Ne:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val != r.float_val) : (l.int_val != r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::Lt:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val < r.float_val) : (l.int_val < r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::Le:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val <= r.float_val) : (l.int_val <= r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::Gt:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val > r.float_val) : (l.int_val > r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::Ge:
+            res.type = Type::bool_type();
+            res.bool_val = is_fp ? (l.float_val >= r.float_val) : (l.int_val >= r.int_val);
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::LogAnd:
+            res.type = Type::bool_type();
+            res.bool_val = l.bool_val && r.bool_val;
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        case BinaryOp::LogOr:
+            res.type = Type::bool_type();
+            res.bool_val = l.bool_val || r.bool_val;
+            res.int_val = res.bool_val ? 1 : 0;
+            return res;
+        default:
+            return std::nullopt;
+    }
+}
+
 std::optional<ConstValue> SemaContext::eval_const_expr(
     const Expr* e,
     const std::string& current_mod,
@@ -409,7 +608,7 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
         }
         case Expr::Kind::FloatLit: {
             ConstValue cv;
-            cv.type = (e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::f64();
+            cv.type = (e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::f32();
             cv.float_val = e->float_val;
             cv.int_val = static_cast<int64_t>(e->float_val);
             return cv;
@@ -428,109 +627,63 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
         case Expr::Kind::Unary: {
             auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
             if (!sub) return std::nullopt;
-            ConstValue res = *sub;
-            if (e->unary_op == UnaryOp::Neg) {
-                res.int_val = -sub->int_val;
-                res.float_val = -sub->float_val;
-            } else if (e->unary_op == UnaryOp::Not) {
-                res.type = Type::bool_type();
-                res.bool_val = !sub->bool_val;
-                res.int_val = res.bool_val ? 1 : 0;
-            } else if (e->unary_op == UnaryOp::BitNot) {
-                res.int_val = ~sub->int_val;
-            }
-            return res;
+            return apply_const_unary(e->unary_op, *sub);
         }
         case Expr::Kind::Binary: {
             auto l = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
             auto r = eval_const_expr(e->rhs.get(), current_mod, genv, scopes);
             if (!l || !r) return std::nullopt;
-            ConstValue res;
-            bool is_fp = l->type.is_float() || r->type.is_float();
-            res.type = is_fp ? (l->type.is_f64() || r->type.is_f64() ? Type::f64() : Type::f32()) : Type::i32();
-            switch (e->binary_op) {
-                case BinaryOp::Add:
-                    res.int_val = l->int_val + r->int_val;
-                    res.float_val = l->float_val + r->float_val;
-                    return res;
-                case BinaryOp::Sub:
-                    res.int_val = l->int_val - r->int_val;
-                    res.float_val = l->float_val - r->float_val;
-                    return res;
-                case BinaryOp::Mul:
-                    res.int_val = l->int_val * r->int_val;
-                    res.float_val = l->float_val * r->float_val;
-                    return res;
-                case BinaryOp::Div:
-                    if (!is_fp && r->int_val == 0) return std::nullopt;
-                    if (!is_fp) res.int_val = l->int_val / r->int_val;
-                    res.float_val = l->float_val / r->float_val;
-                    return res;
-                case BinaryOp::Mod:
-                    if (r->int_val == 0) return std::nullopt;
-                    res.int_val = l->int_val % r->int_val;
-                    return res;
-                case BinaryOp::Eq:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val == r->float_val) : (l->int_val == r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::Ne:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val != r->float_val) : (l->int_val != r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::Lt:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val < r->float_val) : (l->int_val < r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::Le:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val <= r->float_val) : (l->int_val <= r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::Gt:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val > r->float_val) : (l->int_val > r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::Ge:
-                    res.type = Type::bool_type();
-                    res.bool_val = is_fp ? (l->float_val >= r->float_val) : (l->int_val >= r->int_val);
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::LogAnd:
-                    res.type = Type::bool_type();
-                    res.bool_val = l->bool_val && r->bool_val;
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                case BinaryOp::LogOr:
-                    res.type = Type::bool_type();
-                    res.bool_val = l->bool_val || r->bool_val;
-                    res.int_val = res.bool_val ? 1 : 0;
-                    return res;
-                default:
-                    return std::nullopt;
+            return apply_const_binary(e->binary_op, *l, *r);
+        }
+        case Expr::Kind::Field: {
+            auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
+            if (!sub) return std::nullopt;
+            if (sub->type.is_scalar() && (e->name == "x" || e->name == "r")) {
+                return sub;
             }
+            if (sub->type.is_vector() && sub->elements.size() == sub->type.dimension) {
+                if (e->name.empty() || e->name.size() > 4) return std::nullopt;
+                auto swz_idx = [](char c) -> uint32_t {
+                    if (c == 'x' || c == 'r' || c == 's') return 0;
+                    if (c == 'y' || c == 'g' || c == 't') return 1;
+                    if (c == 'z' || c == 'b' || c == 'p') return 2;
+                    if (c == 'w' || c == 'a' || c == 'q') return 3;
+                    return 4;
+                };
+                if (e->name.size() == 1) {
+                    uint32_t idx = swz_idx(e->name[0]);
+                    if (idx >= sub->elements.size()) return std::nullopt;
+                    return sub->elements[idx];
+                }
+                ConstValue out;
+                out.type = Type::vec(sub->type.scalar, static_cast<uint32_t>(e->name.size()));
+                out.elements.reserve(e->name.size());
+                for (char c : e->name) {
+                    uint32_t idx = swz_idx(c);
+                    if (idx >= sub->elements.size()) return std::nullopt;
+                    out.elements.push_back(sub->elements[idx]);
+                }
+                return out;
+            }
+            return std::nullopt;
+        }
+        case Expr::Kind::Index: {
+            if (e->args.size() != 1) return std::nullopt;
+            auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
+            auto idx = eval_const_int(e->args[0].get(), current_mod, genv, scopes);
+            if (!sub || !idx) return std::nullopt;
+            if (*idx < 0 || static_cast<size_t>(*idx) >= sub->elements.size()) return std::nullopt;
+            return sub->elements[static_cast<size_t>(*idx)];
         }
         case Expr::Kind::Cast: {
             auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
             if (!sub) return std::nullopt;
             Type target = resolve_type(e->target_type.get(), current_mod, genv);
-            ConstValue res = *sub;
-            res.type = target;
-            if (target.is_integer()) {
-                res.int_val = sub->type.is_float() ? static_cast<int64_t>(sub->float_val) : sub->int_val;
-                res.float_val = static_cast<double>(res.int_val);
-            } else if (target.is_float()) {
-                res.float_val = sub->type.is_float() ? sub->float_val : static_cast<double>(sub->int_val);
-                res.int_val = static_cast<int64_t>(res.float_val);
-            }
-            return res;
+            return convert_const_value(*sub, target, out->types);
         }
         case Expr::Kind::Call: {
-            if ((e->name == "is_f64" || e->name == "sizeof") && e->generic_args.size() == 1 && e->args.empty()) {
+            const std::string& n = e->name;
+            if ((n == "is_f64" || n == "sizeof") && e->generic_args.size() == 1 && e->args.empty()) {
                 Type t = Type::f32();
                 const auto& ga = e->generic_args[0];
                 if (ga.type_arg) {
@@ -539,12 +692,89 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
                     TypeExpr tmp{ga.span, ga.ident_or_const_name, {}};
                     t = resolve_type(&tmp, current_mod, genv);
                 }
-                if (e->name == "is_f64") {
+                if (n == "is_f64") {
                     bool b = (t.scalar == ScalarKind::F64);
                     return ConstValue{Type::bool_type(), b ? 1 : 0, b ? 1.0 : 0.0, b};
                 }
                 int64_t sz = static_cast<int64_t>(out->types.byte_size(t));
                 return ConstValue{Type::i32(), sz, static_cast<double>(sz), false};
+            }
+            if (n == "vec2" || n == "vec3" || n == "vec4" ||
+                n == "vec2f" || n == "vec3f" || n == "vec4f" ||
+                n == "vec2d" || n == "vec3d" || n == "vec4d" ||
+                n == "vec2i" || n == "vec3i" || n == "vec4i" ||
+                n == "vec2u" || n == "vec3u" || n == "vec4u" ||
+                n == "mat2" || n == "mat3" || n == "mat4" ||
+                n == "mat2f" || n == "mat3f" || n == "mat4f" ||
+                n == "mat2d" || n == "mat3d" || n == "mat4d" ||
+                n == "vec" || n == "mat" || n == "array") {
+                std::vector<ConstValue> arg_vals;
+                arg_vals.reserve(e->args.size());
+                for (const auto& a : e->args) {
+                    auto av = eval_const_expr(a.get(), current_mod, genv, scopes);
+                    if (!av) return std::nullopt;
+                    arg_vals.push_back(*av);
+                }
+                Type target = e->resolved_type;
+                if (target.is_void()) {
+                    if (!e->generic_args.empty() || n == "vec" || n == "mat") {
+                        TypeExpr te;
+                        te.span = e->span;
+                        te.name = n;
+                        for (const auto& ga : e->generic_args) {
+                            GenericArg copy;
+                            copy.span = ga.span;
+                            copy.type_arg = clone_type_expr(ga.type_arg.get());
+                            copy.int_arg = ga.int_arg;
+                            copy.ident_or_const_name = ga.ident_or_const_name;
+                            te.args.push_back(std::move(copy));
+                        }
+                        target = resolve_type(&te, current_mod, genv);
+                    } else if (n == "array") {
+                        Type elem_t = arg_vals.empty() ? Type::f32() : arg_vals[0].type;
+                        target = Type::array_of(elem_t, std::max<uint32_t>(1, static_cast<uint32_t>(arg_vals.size())));
+                    } else if (n == "vec2" || n == "vec3" || n == "vec4") {
+                        uint32_t lanes = static_cast<uint32_t>(n.back() - '0');
+                        ScalarKind sk = ScalarKind::F32;
+                        for (size_t i = 0; i < arg_vals.size(); ++i) {
+                            if (e->args[i]->literal_suffix != ScalarKind::Void || !arg_vals[i].type.is_scalar()) {
+                                sk = arg_vals[i].type.scalar;
+                                break;
+                            }
+                            if (arg_vals[i].type.is_integer()) {
+                                sk = arg_vals[i].type.scalar;
+                            }
+                        }
+                        target = Type::vec(sk, lanes);
+                    } else if (n == "mat2" || n == "mat3" || n == "mat4") {
+                        uint32_t dim = static_cast<uint32_t>(n.back() - '0');
+                        ScalarKind sk = ScalarKind::F32;
+                        for (size_t i = 0; i < arg_vals.size(); ++i) {
+                            if (e->args[i]->literal_suffix != ScalarKind::Void || !arg_vals[i].type.is_scalar()) {
+                                sk = arg_vals[i].type.scalar;
+                                break;
+                            }
+                        }
+                        target = Type::array_of(Type::vec(sk, dim), dim);
+                    } else {
+                        TypeExpr te{e->span, n, {}};
+                        target = resolve_type(&te, current_mod, genv);
+                    }
+                }
+                std::vector<ConstValue> leaves;
+                for (const auto& av : arg_vals) {
+                    flatten_const_leaves(av, leaves);
+                }
+                uint32_t needed = out->types.flat_leaf_count(target);
+                if (leaves.empty()) {
+                    leaves.assign(needed, ConstValue{});
+                } else if (leaves.size() == 1 && needed > 1) {
+                    leaves.assign(needed, leaves[0]);
+                } else {
+                    while (leaves.size() < needed) leaves.push_back(leaves.back());
+                }
+                size_t idx = 0;
+                return unflatten_const_value(target, leaves, idx);
             }
             return std::nullopt;
         }
@@ -641,6 +871,45 @@ Type SemaContext::resolve_type(
             return Type::vec(elem.scalar, 3);
         }
         return Type::vec(elem.scalar, static_cast<uint32_t>(*dim_opt));
+    }
+
+    if (n == "mat2f") return Type::array_of(Type::vec(ScalarKind::F32, 2), 2);
+    if (n == "mat3f") return Type::array_of(Type::vec(ScalarKind::F32, 3), 3);
+    if (n == "mat4f") return Type::array_of(Type::vec(ScalarKind::F32, 4), 4);
+    if (n == "mat2d") return Type::array_of(Type::vec(ScalarKind::F64, 2), 2);
+    if (n == "mat3d") return Type::array_of(Type::vec(ScalarKind::F64, 3), 3);
+    if (n == "mat4d") return Type::array_of(Type::vec(ScalarKind::F64, 4), 4);
+
+    if (n == "mat2" || n == "mat3" || n == "mat4") {
+        uint32_t dim = static_cast<uint32_t>(n.back() - '0');
+        ScalarKind sk = ScalarKind::F32;
+        if (!texpr->args.empty() && texpr->args[0].type_arg) {
+            Type elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
+            if (!elem.is_scalar()) {
+                diags.error(texpr->span, "matrix element type must be a scalar");
+                return Type::array_of(Type::vec(ScalarKind::F32, dim), dim);
+            }
+            sk = elem.scalar;
+        }
+        return Type::array_of(Type::vec(sk, dim), dim);
+    }
+
+    if (n == "mat") {
+        if ((texpr->args.size() != 2 && texpr->args.size() != 3) || !texpr->args[0].type_arg) {
+            diags.error(texpr->span, "'mat<T, C, R>' requires a scalar type T and dimensions");
+            return Type::array_of(Type::vec(ScalarKind::F32, 3), 3);
+        }
+        Type elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
+        auto cols_opt = resolve_generic_int_arg(texpr->args[1], current_mod, genv, *this);
+        auto rows_opt = (texpr->args.size() == 3)
+                            ? resolve_generic_int_arg(texpr->args[2], current_mod, genv, *this)
+                            : cols_opt;
+        if (!cols_opt || *cols_opt < 2 || *cols_opt > 4 || !rows_opt || *rows_opt < 2 || *rows_opt > 4) {
+            diags.error(texpr->span, "matrix dimensions must be compile-time integers in 2..4");
+            return Type::array_of(Type::vec(elem.scalar, 3), 3);
+        }
+        return Type::array_of(Type::vec(elem.scalar, static_cast<uint32_t>(*rows_opt)),
+                              static_cast<uint32_t>(*cols_opt));
     }
 
     // 4. Fixed array: `array<T, N>`
@@ -870,7 +1139,7 @@ std::unique_ptr<CheckedModule> check_module(
             ConstValue cv = *cv_opt;
             if (const_decl.type) {
                 Type expected = ctx.resolve_type(const_decl.type.get(), mod_name, empty_env);
-                cv.type = expected;
+                cv = detail::convert_const_value(cv, expected, ctx.out->types);
             }
             ctx.out->constants[mod_name + "::" + const_decl.name] = cv;
             if (mod_name == root_name) {

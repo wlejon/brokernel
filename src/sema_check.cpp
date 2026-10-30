@@ -51,6 +51,15 @@ static bool match_type_pattern(
         bind_const_param(pattern->args[1].ident_or_const_name, lanes);
         return true;
     }
+    if ((pattern->name == "mat2" || pattern->name == "mat3" || pattern->name == "mat4") &&
+        actual.is_array() && actual.element_type().is_vector()) {
+        uint32_t dim = static_cast<uint32_t>(pattern->name.back() - '0');
+        if (actual.dimension != dim || actual.element_type().dimension != dim) return false;
+        if (!pattern->args.empty() && pattern->args[0].type_arg) {
+            return match_type_pattern(pattern->args[0].type_arg.get(), Type::scalar_type(actual.scalar), decl_mod, generic_params, ctx, inferred);
+        }
+        return true;
+    }
     if (pattern->name == "array" && actual.is_array()) {
         if (!pattern->args.empty() && pattern->args[0].type_arg) {
             match_type_pattern(pattern->args[0].type_arg.get(), actual.element_type(), decl_mod, generic_params, ctx, inferred);
@@ -293,6 +302,46 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     mark_type_usage(inst_ret);
     return inst_ret;
 }
+static void fold_const_into_expr(Expr* e, const ConstValue& cv) {
+    if (!e) return;
+    e->path.clear();
+    e->generic_args.clear();
+    e->args.clear();
+    e->fields.clear();
+    e->lhs.reset();
+    e->rhs.reset();
+    e->cond.reset();
+    e->target_type.reset();
+    e->resolved_type = cv.type;
+    if (cv.type.is_scalar()) {
+        if (cv.type.is_float_scalar()) {
+            e->kind = Expr::Kind::FloatLit;
+            e->float_val = cv.float_val;
+            e->literal_suffix = cv.type.scalar;
+        } else if (cv.type.is_bool()) {
+            e->kind = Expr::Kind::BoolLit;
+            e->bool_val = cv.bool_val;
+        } else {
+            e->kind = Expr::Kind::IntLit;
+            e->int_val = cv.int_val;
+            e->literal_suffix = cv.type.scalar;
+        }
+        return;
+    }
+    if (cv.type.is_vector() || cv.type.is_array()) {
+        e->kind = Expr::Kind::Call;
+        e->name = cv.type.is_vector() ? ("vec" + std::to_string(cv.type.dimension)) : "array";
+        e->args.reserve(cv.elements.size());
+        for (const auto& el : cv.elements) {
+            auto arg = std::make_unique<Expr>();
+            arg->span = e->span;
+            fold_const_into_expr(arg.get(), el);
+            e->args.push_back(std::move(arg));
+        }
+        return;
+    }
+}
+
 Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
     if (!e) return Type::void_type();
     switch (e->kind) {
@@ -308,7 +357,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         case Expr::Kind::FloatLit: {
             ScalarKind sk = (e->literal_suffix != ScalarKind::Void) ? e->literal_suffix : ScalarKind::F32;
             if (e->literal_suffix == ScalarKind::Void && expected) {
-                if (expected->is_f64() || (expected->is_vector() && expected->scalar == ScalarKind::F64)) {
+                if (expected->is_f64() || ((expected->is_vector() || expected->is_array()) && expected->scalar == ScalarKind::F64)) {
                     sk = ScalarKind::F64;
                 }
             }
@@ -327,19 +376,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             auto cv = ctx.find_const(fn.module_name, {}, e->name, genv, scopes);
             if (cv) {
-                if (cv->type.is_float()) {
-                    e->kind = Expr::Kind::FloatLit;
-                    e->float_val = cv->float_val;
-                    e->literal_suffix = cv->type.scalar;
-                } else if (cv->type.is_bool()) {
-                    e->kind = Expr::Kind::BoolLit;
-                    e->bool_val = cv->bool_val;
-                } else {
-                    e->kind = Expr::Kind::IntLit;
-                    e->int_val = cv->int_val;
-                    e->literal_suffix = cv->type.scalar;
-                }
-                e->resolved_type = cv->type;
+                fold_const_into_expr(e, *cv);
                 mark_type_usage(cv->type);
                 return cv->type;
             }
@@ -349,19 +386,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         case Expr::Kind::Path: {
             auto cv = ctx.find_const(fn.module_name, e->path, e->name, genv, scopes);
             if (cv) {
-                if (cv->type.is_float()) {
-                    e->kind = Expr::Kind::FloatLit;
-                    e->float_val = cv->float_val;
-                    e->literal_suffix = cv->type.scalar;
-                } else if (cv->type.is_bool()) {
-                    e->kind = Expr::Kind::BoolLit;
-                    e->bool_val = cv->bool_val;
-                } else {
-                    e->kind = Expr::Kind::IntLit;
-                    e->int_val = cv->int_val;
-                    e->literal_suffix = cv->type.scalar;
-                }
-                e->resolved_type = cv->type;
+                fold_const_into_expr(e, *cv);
                 mark_type_usage(cv->type);
                 return cv->type;
             }
@@ -384,6 +409,12 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             e->resolved_type = sub;
             mark_type_usage(sub);
+            if (!sub.is_scalar()) {
+                if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                    cv->type = sub;
+                    fold_const_into_expr(e, *cv);
+                }
+            }
             return sub;
         }
         case Expr::Kind::Binary: {
@@ -419,6 +450,12 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                     return Type::bool_type();
                 default:
                     e->resolved_type = lt;
+                    if (!lt.is_scalar()) {
+                        if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                            cv->type = lt;
+                            fold_const_into_expr(e, *cv);
+                        }
+                    }
                     return lt;
             }
         }
@@ -492,6 +529,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 Type rt = (f.size() == 1) ? Type::scalar_type(recv.scalar)
                                           : Type::vec(recv.scalar, static_cast<uint32_t>(f.size()));
                 e->resolved_type = rt;
+                if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                    fold_const_into_expr(e, *cv);
+                }
                 return rt;
             }
             if (recv.is_struct()) {
@@ -550,6 +590,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 }
                 Type elem = recv.element_type();
                 e->resolved_type = elem;
+                if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                    fold_const_into_expr(e, *cv);
+                }
                 return elem;
             }
             ctx.diags.error(e->span, "type '" + recv.to_string() + "' is not indexable");

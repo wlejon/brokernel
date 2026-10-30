@@ -69,6 +69,7 @@ struct ConstValue {
     int64_t int_val = 0;
     double float_val = 0.0;
     bool bool_val = false;
+    std::vector<ConstValue> elements = {};
 };
 
 /// A concrete, monomorphized, type-checked function ready for MIR lowering.

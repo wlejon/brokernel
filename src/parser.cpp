@@ -873,6 +873,19 @@ private:
             consume(TokenKind::RParen, "')'");
             return inner;
         }
+        if (match(TokenKind::LBracket)) {
+            const Token& lb = previous();
+            auto call = std::make_unique<Expr>();
+            call->kind = Expr::Kind::Call;
+            call->name = "array";
+            while (!check(TokenKind::RBracket) && !is_at_end()) {
+                call->args.push_back(parse_expr());
+                if (!match(TokenKind::Comma)) break;
+            }
+            const Token& rb = consume(TokenKind::RBracket, "']' after array literal");
+            call->span = SourceSpan::merge(lb.span, rb.span);
+            return call;
+        }
         if (match(TokenKind::Ident)) {
             Token first = previous();
             std::vector<std::string> path = {first.text};

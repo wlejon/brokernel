@@ -848,6 +848,77 @@ static void test_lowering_quirks_parity() {
     assert(or_count[0] == expected_or_count);
 }
 
+static void test_vector_and_matrix_constants_parity() {
+    const char* src = R"(
+        const AXIS: vec3<f32> = vec3<f32>(1.0, 0.45, -0.5);
+        const OFFSET: vec3<f32> = vec3<f32>(0.5, -0.25, 1.5);
+        const COMBINED: vec3<f32> = AXIS * 2.0 + OFFSET;
+        const SWIZ: vec2<f32> = COMBINED.xz;
+        const MAT3: mat3<f32> = mat3<f32>(
+            vec3<f32>(1.0, 2.0, 3.0),
+            AXIS,
+            OFFSET
+        );
+        const MAT2: mat2<f32> = mat2<f32>(1.5, -0.5, 2.0, 3.0);
+        const MAT2_SCALED: mat2<f32> = MAT2 * 2.0 + mat2<f32>(0.5);
+        const CONST_ELEM: f32 = MAT3[1].y + MAT2_SCALED[0][1] + AXIS[2];
+
+        @kernel fn k_vec_mat_consts(
+            out: write_store<vec4<f32>, 1>,
+            g: grid<1>
+        ) {
+            let x = f32(g.x());
+            let v: vec3<f32> = AXIS * x + COMBINED;
+            let mcol: vec3<f32> = MAT3[1] + MAT3[2];
+            let m2: vec2<f32> = MAT2_SCALED[0] + SWIZ;
+            out.write(vec4<f32>(
+                v.x + mcol.x,
+                v.y + mcol.y + m2.x,
+                v.z + mcol.z + m2.y,
+                CONST_ELEM
+            ));
+        }
+    )";
+
+    auto res = compile_source(src, "vec_mat_consts.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+
+    const auto* k = res.find_kernel("k_vec_mat_consts");
+    assert(k != nullptr);
+    if (brass::host_has_avx2()) {
+        assert(k->cpu_grid_lanes == 8);
+    }
+
+    const uint32_t W = 29;
+    std::vector<float> out(W * 4, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out)};
+
+    auto rep = k->compare_cpu_gpu(GridShape(W), args, 1e-5, 1e-5);
+    if (!rep.ok) std::cerr << "k_vec_mat_consts parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+
+    for (uint32_t i = 0; i < W; ++i) {
+        float x = static_cast<float>(i);
+        float vx = 1.0f * x + 2.5f;
+        float vy = 0.45f * x + 0.65f;
+        float vz = -0.5f * x + 0.5f;
+        float mcol_x = 1.0f + 0.5f;
+        float mcol_y = 0.45f - 0.25f;
+        float mcol_z = -0.5f + 1.5f;
+        float m2_x = (1.5f * 2.0f + 0.5f) + 2.5f;
+        float m2_y = (-0.5f * 2.0f + 0.5f) + 0.5f;
+        float want0 = vx + mcol_x;
+        float want1 = vy + mcol_y + m2_x;
+        float want2 = vz + mcol_z + m2_y;
+        float want3 = 0.45f + (-0.5f) + (-0.5f);
+        assert(std::abs(out[i * 4 + 0] - want0) < 1e-5f);
+        assert(std::abs(out[i * 4 + 1] - want1) < 1e-5f);
+        assert(std::abs(out[i * 4 + 2] - want2) < 1e-5f);
+        assert(std::abs(out[i * 4 + 3] - want3) < 1e-5f);
+    }
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -864,6 +935,7 @@ int main() {
     test_assignment_targets_parity();
     test_atomics_parity();
     test_lowering_quirks_parity();
+    test_vector_and_matrix_constants_parity();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

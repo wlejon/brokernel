@@ -281,16 +281,18 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = target;
         return target;
     }
-    // 2. Vector / Array constructors: vec2, vec3, vec4, vec2f, vec3d, vec<T, D>, array<T, N>
+    // 2. Vector / Matrix / Array constructors: vec2, vec3, vec4, mat2, mat3, mat4, vec<T, D>, array<T, N>
     if (n == "vec2" || n == "vec3" || n == "vec4" ||
         n == "vec2f" || n == "vec3f" || n == "vec4f" ||
         n == "vec2d" || n == "vec3d" || n == "vec4d" ||
         n == "vec2i" || n == "vec3i" || n == "vec4i" ||
         n == "vec2u" || n == "vec3u" || n == "vec4u" ||
-        n == "vec" || n == "array") {
-        for (auto& a : e->args) check_expr(a.get());
-        Type target;
-        if (n == "vec" || n == "array" || !e->generic_args.empty()) {
+        n == "mat2" || n == "mat3" || n == "mat4" ||
+        n == "mat2f" || n == "mat3f" || n == "mat4f" ||
+        n == "mat2d" || n == "mat3d" || n == "mat4d" ||
+        n == "vec" || n == "mat" || n == "array") {
+        std::optional<Type> pre_target;
+        if (!e->generic_args.empty() || n == "vec" || n == "mat") {
             TypeExpr te;
             te.span = e->span;
             te.name = n;
@@ -302,7 +304,28 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
                 copy.ident_or_const_name = ga.ident_or_const_name;
                 te.args.push_back(std::move(copy));
             }
-            target = ctx.resolve_type(&te, fn.module_name, genv);
+            pre_target = ctx.resolve_type(&te, fn.module_name, genv);
+        } else if (n == "array" && expected && expected->is_array()) {
+            pre_target = *expected;
+        }
+        std::optional<Type> arg_expected;
+        if (pre_target) {
+            arg_expected = pre_target->element_type();
+        } else if (expected) {
+            arg_expected = expected->element_type();
+        }
+        for (auto& a : e->args) check_expr(a.get(), arg_expected);
+        Type target;
+        if (pre_target) {
+            target = *pre_target;
+        } else if (n == "array") {
+            if (!e->generic_args.empty()) {
+                TypeExpr te{e->span, n, {}};
+                target = ctx.resolve_type(&te, fn.module_name, genv);
+            } else {
+                Type elem_t = e->args.empty() ? Type::f32() : e->args[0]->resolved_type;
+                target = Type::array_of(elem_t, std::max<uint32_t>(1, static_cast<uint32_t>(e->args.size())));
+            }
         } else if (n == "vec2" || n == "vec3" || n == "vec4") {
             uint32_t lanes = static_cast<uint32_t>(n.back() - '0');
             ScalarKind sk = ScalarKind::F32;
@@ -316,14 +339,27 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
                 sk = expected->scalar;
             }
             target = Type::vec(sk, lanes);
+        } else if (n == "mat2" || n == "mat3" || n == "mat4") {
+            uint32_t dim = static_cast<uint32_t>(n.back() - '0');
+            ScalarKind sk = ScalarKind::F32;
+            for (const auto& a : e->args) {
+                if (!is_unsuffixed_literal(a.get()) && !a->resolved_type.is_void()) {
+                    sk = a->resolved_type.scalar;
+                    break;
+                }
+            }
+            if (expected && expected->is_array() && expected->dimension == dim) {
+                sk = expected->scalar;
+            }
+            target = Type::array_of(Type::vec(sk, dim), dim);
         } else {
             TypeExpr te{e->span, n, {}};
             target = ctx.resolve_type(&te, fn.module_name, genv);
         }
-        Type elem_t = target.element_type();
+        Type scalar_t = Type::scalar_type(target.scalar);
         for (auto& a : e->args) {
             if (a->resolved_type.is_scalar()) {
-                coerce_expr_to_type(a.get(), elem_t);
+                coerce_expr_to_type(a.get(), scalar_t);
             }
         }
         mark_type_usage(target);
