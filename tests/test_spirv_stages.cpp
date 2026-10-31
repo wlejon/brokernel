@@ -500,11 +500,13 @@ static void test_module_resources() {
         module scene;
         pub struct Camera { view_proj: vec4<f32>, eye: vec3<f32>, frame: vec4<f32> }
         pub struct Light { color: vec4<f32>, dir: vec4<f32> }
+        pub struct Ray { dir: vec3<f32>, t: f32 }
         @binding(0, 0) pub var camera: uniform<Camera>;
         @binding(1, 0) pub var lights: read_buffer<Light>;
         @binding(1, 8) pub var linear: sampler;
         @binding(1, 1) pub var sky: texture_cube<vec3<f32>>;
         @binding(2, 5) pub var meter: buffer<vec4<f32>>;
+        pub fn ray(d: vec3<f32>) -> Ray { return Ray { dir: d, t: 2.0 }; }
         pub fn sky_light(dir: vec3<f32>) -> vec3<f32> {
             return sky.sample_lod(linear, dir, 0.0) * lights[0].color.rgb;
         }
@@ -512,9 +514,13 @@ static void test_module_resources() {
     const char* src = R"(
         import scene;
         from scene import camera;
+        struct Ray { a: f32 }   // not scene's
         @fragment fn shade(@location(0) dir: vec3<f32>) {
-            let l: vec3<f32> = scene::sky_light(normalize(dir)) + camera.eye * scene::camera.frame.x;
-            scene::meter[1] = vec4<f32>(l, 1.0);
+            let own = Ray { a: 3.0 };
+            let theirs = scene::ray(dir);
+            let l: vec3<f32> = scene::sky_light(normalize(dir)) + camera.eye * scene::camera.frame.x +
+                               theirs.dir * (theirs.t * own.a);
+            scene::meter[scene::meter.len() - 1] = vec4<f32>(l, 1.0);
             set_frag_color(vec4<f32>(l, 1.0));
         }
         @kernel @grid(1) fn plain(out: write_store<f32, 1>, g: grid<1>) { out.write(1.0); }

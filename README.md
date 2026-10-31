@@ -120,7 +120,8 @@ general graphics:
 - **Buffers at a descriptor** are parameters too, `@binding(set, binding)`:
   - `uniform<T>` holds one T, laid out std140.
   - `buffer<T>` and `read_buffer<T>` hold an array of T, laid out std430.
-    Only `buffer<T>` is written.
+    Only `buffer<T>` is written. `buf.len()` is the number of elements
+    bound (an i32).
   - T is a struct, or a 32-bit scalar or vector.
   - An access is a path of fields, indices (dynamic ones too) and swizzles.
     It reads or writes only the words the path names, at the offset its

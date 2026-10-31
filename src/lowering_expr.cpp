@@ -695,6 +695,16 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_image() || rt.is_sampler()) return lower_texture_call(e);
+            if (rt.is_buffer() && e->name == "len") {
+                // The runtime array's words over an element's.
+                ValueList base = lower_expr(e->lhs.get());
+                auto found = base.empty() ? block_param.end() : block_param.find(base[0]);
+                if (found == block_param.end()) return {b.build_iconst_i32(0)};
+                const CheckedParam& p = bound_param(found->second);
+                const uint32_t words = std::max(1u, block_stride(rt.element_type(), false) / 4);
+                brass::Value* n = kb.buffer_length(p.descriptor_set, p.descriptor_binding);
+                return {words == 1 ? n : b.build_udiv(n, b.build_iconst_i32(static_cast<int32_t>(words)))};
+            }
             if (rt.is_store()) {
                 ValueList base = lower_expr(e->lhs.get());
                 uint32_t dim = rt.dimension;

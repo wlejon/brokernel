@@ -171,6 +171,12 @@ Type FnCheckState::check_method_call(Expr* e) {
     if (recv_t.is_image() || recv_t.is_sampler()) {
         return check_texture_method(e, recv_t);
     }
+    // A buffer's element count (its runtime array's).
+    if (recv_t.is_buffer() && m == "len") {
+        if (!e->args.empty()) ctx.diags.error(e->span, "len() takes no arguments");
+        e->resolved_type = Type::i32();
+        return e->resolved_type;
+    }
     ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
     return Type::void_type();
 }

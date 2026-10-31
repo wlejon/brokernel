@@ -1123,7 +1123,9 @@ Type SemaContext::resolve_type(
     const StructDecl* sdecl = find_struct_decl(current_mod, n, &st_mod);
     if (sdecl) {
         GenericEnv st_env;
-        std::string mangled = sdecl->name;
+        // Named by its module (but the root's), so two modules' structs of
+        // one name stay two types.
+        std::string mangled = st_mod == out->module_name ? sdecl->name : st_mod + "::" + sdecl->name;
         if (!sdecl->generic_params.empty()) {
             if (texpr->args.size() > sdecl->generic_params.size()) {
                 diags.error(texpr->span, "too many generic arguments for struct '" + sdecl->name + "'");
