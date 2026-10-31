@@ -237,8 +237,9 @@ MirBodyLowerer::LocalPlace MirBodyLowerer::get_or_create_const_slot(const Type& 
     return lp;
 }
 
-MirBodyLowerer::LocalPlace MirBodyLowerer::materialize_array_slot(const Type& t, const ValueList& leaves) {
-    bool all_const = !leaves.empty();
+MirBodyLowerer::LocalPlace MirBodyLowerer::materialize_array_slot(const Type& t, const ValueList& leaves,
+                                                                  bool allow_const_slot) {
+    bool all_const = allow_const_slot && !leaves.empty();
     for (const brass::Value* v : leaves) {
         if (b.vector_mode() && Ops::is_varying(v)) return {};
         if (!is_const_leaf(v)) all_const = false;
@@ -367,7 +368,7 @@ bool MirBodyLowerer::local_place(const Expr* e, LocalPlace& p) {
         }
     }
     if (e->resolved_type.is_array()) {
-        p = materialize_array_slot(e->resolved_type, lower_expr(e));
+        p = materialize_array_slot(e->resolved_type, lower_expr(e), true);
         return p.base != nullptr;
     }
     return false;

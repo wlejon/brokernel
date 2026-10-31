@@ -293,7 +293,7 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
             ctx.diags.error(e->span, "type conversion '" + n + "(x)' expects 1 argument");
             return target;
         }
-        check_expr(e->args[0].get(), target);
+        check_expr(e->args[0].get(), is_unsuffixed_literal(e->args[0].get()) ? std::optional<Type>(target) : std::nullopt);
         mark_type_usage(target);
         e->resolved_type = target;
         return target;

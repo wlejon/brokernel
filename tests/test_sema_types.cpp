@@ -285,11 +285,70 @@ static void test_64bit_grid_indexing_and_bitcast() {
     }
 }
 
+static void test_select_comparisons_bool_casts_and_u32_f32_casts() {
+    const char* src = R"(
+        fn radical_inverse_vdc(in_bits: u32) -> f32 {
+            var bits: u32 = (in_bits << 16u) | (in_bits >> 16u);
+            bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+            bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+            bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+            bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+            return f32(bits) * 2.3283064365386963e-10;
+        }
+
+        @kernel @grid(1)
+        fn eval_edge_cases(g: grid<1>, out: write_store<vec4f, 1>) {
+            let x: i32 = g.x();
+            let b_i32: i32 = i32(x < (2 + 3));
+            let b_u32: u32 = u32(x >= (1 + 2));
+            let b_f32: f32 = f32(!(x == 4));
+            let s1: f32 = select(x < (0 + 4), 10.0, 20.0);
+            let v: vec2f = vec2f(f32(x) - 3.5, 2.5 - f32(x));
+            let sv: vec2f = select(v >= vec2f(0.0), vec2f(1.0, 2.0), vec2f(-1.0, -2.0));
+
+            var arr: array<f32, 4> = array<f32, 4>(1.0, 2.0, 3.0, 4.0);
+            for (var i: i32 = 0; i < 4; i += 1) {
+                arr[i] = arr[i] + f32(x + i);
+            }
+            let dyn_idx: i32 = x & 3;
+            let a_val: f32 = arr[dyn_idx];
+
+            let vdc: f32 = radical_inverse_vdc(u32(x) + 1u);
+            let high_u: u32 = 0x80000000u + u32(x) * 1024u;
+            let roundtrip: u32 = u32(f32(high_u));
+            let rt_ok: f32 = f32(roundtrip == high_u);
+
+            out.write(vec4f(f32(b_i32) + f32(b_u32) * 2.0 + b_f32 * 4.0 + s1,
+                            sv.x + sv.y * 3.0 + a_val,
+                            vdc,
+                            rt_ok));
+        }
+    )";
+    auto res = compile_source(src, "edge_cases.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("eval_edge_cases");
+    assert(k != nullptr);
+
+    std::vector<float> out(16 * 4, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out)};
+    auto rep = k->compare_cpu_gpu(GridShape(16), args, 1e-6, 1e-6);
+    if (!rep.ok) std::cerr << "edge_cases parity failed: " << rep.message << "\n";
+    assert(rep.ok);
+    // Verify radical_inverse_vdc(1) == 0.5f (bits = 0x80000000u -> float(bits) = +2147483648.0f, NOT negative!)
+    assert(std::abs(out[0 * 4 + 2] - 0.5f) < 1e-6f);
+    assert(out[0 * 4 + 3] == 1.0f);
+    // Verify mutable var array initialized with constants was actually modified in loop:
+    // For x = 1, dyn_idx = 1, arr[1] = 2.0 + (1 + 1) = 4.0; v = (-2.5, 1.5) -> sv = (-1.0, 2.0) -> sv.x + 3*sv.y + a_val = 9.0
+    assert(std::abs(out[1 * 4 + 1] - 9.0f) < 1e-6f);
+}
+
 int main() {
     test_f64_precision_discipline();
     test_stencil_validation();
     test_store_access_modes_and_mutability();
     test_64bit_grid_indexing_and_bitcast();
+    test_select_comparisons_bool_casts_and_u32_f32_casts();
     std::cout << "test_sema_types: ALL PASSED\n";
     return 0;
 }

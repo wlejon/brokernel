@@ -509,11 +509,16 @@ brass::Value* MirBodyLowerer::lower_scalar_cast(brass::Value* v, ScalarKind from
     if (to_sk == ScalarKind::F32) {
         if (from_sk == ScalarKind::F64) return b.build_fptrunc_f32_f64(v);
         if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f32_i64(v);
+        if (from_sk == ScalarKind::U32) {
+            return (is_gpu && !b.vector_mode()) ? b.build_call("ptx_u32_to_f32", brass::Type::f32(), {v})
+                                                : b.build_sitofp_f32_i64(b.build_zext_i64(v));
+        }
         return b.build_sitofp_f32_i32(v);
     }
     if (to_sk == ScalarKind::F64) {
         if (from_sk == ScalarKind::F32) return b.build_fpext_f64_f32(v);
         if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f64_i64(v);
+        if (from_sk == ScalarKind::U32) return b.build_sitofp_f64_i64(b.build_zext_i64(v));
         return b.build_sitofp_f64_i32(v);
     }
     if (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64) {
@@ -522,8 +527,16 @@ brass::Value* MirBodyLowerer::lower_scalar_cast(brass::Value* v, ScalarKind from
         if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return v;
         return (from_sk == ScalarKind::U32 || from_sk == ScalarKind::Bool) ? b.build_zext_i64(v) : b.build_sext_i64(v);
     }
-    if (from_sk == ScalarKind::F32) return b.build_fptosi_i32_f32(v);
-    if (from_sk == ScalarKind::F64) return b.build_fptosi_i32(v);
+    if (from_sk == ScalarKind::F32) {
+        if (to_sk == ScalarKind::U32) {
+            return (is_gpu && !b.vector_mode()) ? b.build_call("ptx_f32_to_u32", brass::Type::i32(), {v})
+                                                : b.build_trunc_i32(b.build_fptosi_i64_f32(v));
+        }
+        return b.build_fptosi_i32_f32(v);
+    }
+    if (from_sk == ScalarKind::F64) {
+        return to_sk == ScalarKind::U32 ? b.build_trunc_i32(b.build_fptosi_i64(v)) : b.build_fptosi_i32(v);
+    }
     if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_trunc_i32(v);
     return v;
 }

@@ -288,8 +288,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::Select: {
             ValueList cv = lower_expr(e->cond.get());
-            brass::Value* cond = cv.empty() ? b.build_iconst_i32(0) : cv[0];
-            if (const brass::Instruction* def = cond->is_instruction() ? cond->defining_instruction() : nullptr;
+            brass::Value* cond0 = cv.empty() ? b.build_iconst_i32(0) : cv[0];
+            if (const brass::Instruction* def = (cv.size() <= 1 && cond0->is_instruction()) ? cond0->defining_instruction() : nullptr;
                 def && def->opcode() == brass::Opcode::iconst_i32) {
                 return lower_expr(def->imm_i32() != 0 ? e->lhs.get() : e->rhs.get());
             }
@@ -298,7 +298,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             ValueList out;
             out.reserve(lv.size());
             for (size_t i = 0; i < lv.size() && i < rv.size(); ++i) {
-                out.push_back(b.build_select(cond, lv[i], rv[i]));
+                out.push_back(b.build_select(i < cv.size() ? cv[i] : cond0, lv[i], rv[i]));
             }
             return out;
         }
@@ -699,9 +699,10 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     std::vector<ScalarKind> arg_sks = mod.types.flatten_scalars(a->resolved_type);
                     for (size_t i = 0; i < av.size(); ++i) {
                         brass::Value* v = av[i];
-                        if (!e->resolved_type.is_struct() && i < arg_sks.size() && !target_sks.empty()) {
+                        if (!e->resolved_type.is_struct() && !arg_sks.empty() && !target_sks.empty()) {
+                            ScalarKind from_sk = arg_sks[std::min(i, arg_sks.size() - 1)];
                             ScalarKind to_sk = target_sks[std::min(flat.size(), target_sks.size() - 1)];
-                            if (arg_sks[i] != to_sk) v = lower_scalar_cast(v, arg_sks[i], to_sk);
+                            if (from_sk != to_sk) v = lower_scalar_cast(v, from_sk, to_sk);
                         }
                         flat.push_back(v);
                     }
@@ -951,7 +952,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             if (n == "select") {
                 ValueList cv = lower_expr(e->args[0].get());
-                if (const brass::Instruction* def = cv[0]->is_instruction() ? cv[0]->defining_instruction() : nullptr;
+                if (const brass::Instruction* def = (cv.size() == 1 && cv[0]->is_instruction()) ? cv[0]->defining_instruction() : nullptr;
                     def && def->opcode() == brass::Opcode::iconst_i32) {
                     return lower_expr(def->imm_i32() != 0 ? e->args[1].get() : e->args[2].get());
                 }
@@ -959,7 +960,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList bv = lower_expr(e->args[2].get());
                 ValueList out;
                 for (size_t i = 0; i < av.size() && i < bv.size(); ++i) {
-                    out.push_back(b.build_select(cv[0], av[i], bv[i]));
+                    out.push_back(b.build_select(cv[i < cv.size() ? i : 0], av[i], bv[i]));
                 }
                 return out;
             }

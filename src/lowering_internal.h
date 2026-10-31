@@ -208,7 +208,7 @@ struct MirBodyLowerer {
     void collect_dyn_indexed_vars(const std::vector<StmtPtr>& stmts);
     brass::Value* alloc_entry_slot(uint32_t bytes, uint32_t align);
     LocalPlace get_or_create_const_slot(const Type& t, const ValueList& leaves);
-    LocalPlace materialize_array_slot(const Type& t, const ValueList& leaves);
+    LocalPlace materialize_array_slot(const Type& t, const ValueList& leaves, bool allow_const_slot = false);
     int alloc_local_place_var(const std::string& name, const Type& t, const ValueList& init_leaves,
                               bool is_const_init = false);
     bool is_local_path(const Expr* e, bool for_assign = false) const;

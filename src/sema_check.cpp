@@ -478,18 +478,13 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return Type::void_type();
         }
         case Expr::Kind::Unary: {
-            Type sub = check_expr(e->lhs.get(), expected);
+            Type sub = check_expr(e->lhs.get(), e->unary_op == UnaryOp::Not ? Type::bool_type() : expected);
             if (e->unary_op == UnaryOp::Not) {
-                if (!sub.is_bool()) {
-                    ctx.diags.error(e->span, "logical '!' requires a bool operand");
-                }
-                e->resolved_type = Type::bool_type();
-                return e->resolved_type;
+                if (!sub.is_bool()) ctx.diags.error(e->span, "logical '!' requires a bool operand");
+                return e->resolved_type = Type::bool_type();
             }
-            if (e->unary_op == UnaryOp::BitNot) {
-                if (!sub.is_integer()) {
-                    ctx.diags.error(e->span, "bitwise '~' requires an integer operand");
-                }
+            if (e->unary_op == UnaryOp::BitNot && !sub.is_integer()) {
+                ctx.diags.error(e->span, "bitwise '~' requires an integer operand");
             }
             e->resolved_type = sub;
             mark_type_usage(sub);
@@ -502,7 +497,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return sub;
         }
         case Expr::Kind::Binary: {
-            Type lt = check_expr(e->lhs.get(), expected);
+            bool is_cmp = (e->binary_op == BinaryOp::Eq || e->binary_op == BinaryOp::Ne || e->binary_op == BinaryOp::Lt ||
+                           e->binary_op == BinaryOp::Le || e->binary_op == BinaryOp::Gt || e->binary_op == BinaryOp::Ge);
+            Type lt = check_expr(e->lhs.get(), is_cmp ? std::nullopt : expected);
             if (e->binary_op == BinaryOp::LogAnd || e->binary_op == BinaryOp::LogOr) {
                 if (auto lcv = ctx.eval_const_expr(e->lhs.get(), fn.module_name, genv, scopes);
                     lcv && lcv->type.is_bool()) {
@@ -516,7 +513,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                     return check_expr(e, Type::bool_type());
                 }
             }
-            Type rt = check_expr(e->rhs.get(), (e->binary_op == BinaryOp::Mul && (lt.is_matrix() || lt.is_vector())) ? std::nullopt : expected);
+            std::optional<Type> rhs_exp = is_cmp ? ((!lt.is_void() && !is_unsuffixed_literal(e->lhs.get())) ? std::optional<Type>(lt) : std::nullopt)
+                                                 : ((e->binary_op == BinaryOp::Mul && (lt.is_matrix() || lt.is_vector())) ? std::nullopt : expected);
+            Type rt = check_expr(e->rhs.get(), rhs_exp);
             if (e->binary_op == BinaryOp::Mul && !lt.is_scalar() && !rt.is_scalar() && (lt.is_matrix() || rt.is_matrix())) {
                 Type res = lt;
                 bool ok = (lt.scalar == rt.scalar);
