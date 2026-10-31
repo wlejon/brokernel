@@ -778,6 +778,21 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = res;
         return res;
     }
+    if (n == "unpack_unorm4x8" || n == "unpack_unorm2x16") {
+        uint32_t lanes = n == "unpack_unorm4x8" ? 4 : 2;
+        Type res = Type::vec(ScalarKind::F32, lanes);
+        if (e->args.size() != 1) {
+            ctx.diags.error(e->span, "'" + n + "' expects 1 integer argument");
+            return res;
+        }
+        Type t = check_expr(e->args[0].get(), Type::u32());
+        if (!t.is_scalar() || !t.is_integer()) {
+            ctx.diags.error(e->span, "'" + n + "' requires an integer argument, got '" + t.to_string() + "'");
+        }
+        mark_type_usage(res);
+        e->resolved_type = res;
+        return res;
+    }
     if (n == "isnan" || n == "isinf" || n == "subgroup_all" || n == "subgroup_any") {
         if (e->args.size() != 1) {
             ctx.diags.error(e->span, "'" + n + "' expects 1 argument");

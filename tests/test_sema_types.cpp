@@ -317,11 +317,13 @@ static void test_select_comparisons_bool_casts_and_u32_f32_casts() {
             let high_u: u32 = 0x80000000u + u32(x) * 1024u;
             let roundtrip: u32 = u32(f32(high_u));
             let rt_ok: f32 = f32(roundtrip == high_u);
+            let u4: vec4f = unpack_unorm4x8(0xff804000u);
+            let u2: vec2f = unpack_unorm2x16(0xffff0000u);
 
             out.write(vec4f(f32(b_i32) + f32(b_u32) * 2.0 + b_f32 * 4.0 + s1,
                             sv.x + sv.y * 3.0 + a_val,
                             vdc,
-                            rt_ok));
+                            rt_ok + u4.w + u2.y - u4.x - u2.x));
         }
     )";
     auto res = compile_source(src, "edge_cases.bk");
@@ -337,7 +339,7 @@ static void test_select_comparisons_bool_casts_and_u32_f32_casts() {
     assert(rep.ok);
     // Verify radical_inverse_vdc(1) == 0.5f (bits = 0x80000000u -> float(bits) = +2147483648.0f, NOT negative!)
     assert(std::abs(out[0 * 4 + 2] - 0.5f) < 1e-6f);
-    assert(out[0 * 4 + 3] == 1.0f);
+    assert(out[0 * 4 + 3] == 3.0f);
     // Verify mutable var array initialized with constants was actually modified in loop:
     // For x = 1, dyn_idx = 1, arr[1] = 2.0 + (1 + 1) = 4.0; v = (-2.5, 1.5) -> sv = (-1.0, 2.0) -> sv.x + 3*sv.y + a_val = 9.0
     assert(std::abs(out[1 * 4 + 1] - 9.0f) < 1e-6f);

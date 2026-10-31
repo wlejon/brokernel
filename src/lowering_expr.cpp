@@ -950,6 +950,29 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 }
                 return out;
             }
+            if (n == "unpack_unorm4x8") {
+                brass::Value* w = lower_expr(e->args[0].get())[0];
+                if (w->type() == brass::Type::i64()) w = b.build_trunc_i32(w);
+                brass::Value* mask = b.build_iconst_i32(255);
+                brass::Value* scale = b.build_fconst_f32(1.0f / 255.0f);
+                ValueList out;
+                for (int i = 0; i < 4; ++i) {
+                    brass::Value* byte = i == 0 ? b.build_and(w, mask)
+                                                : b.build_and(b.build_lshr(w, b.build_iconst_i32(i * 8)), mask);
+                    out.push_back(b.build_mul(b.build_sitofp_f32_i32(byte), scale));
+                }
+                return out;
+            }
+            if (n == "unpack_unorm2x16") {
+                brass::Value* w = lower_expr(e->args[0].get())[0];
+                if (w->type() == brass::Type::i64()) w = b.build_trunc_i32(w);
+                brass::Value* mask = b.build_iconst_i32(65535);
+                brass::Value* scale = b.build_fconst_f32(1.0f / 65535.0f);
+                brass::Value* lo = b.build_and(w, mask);
+                brass::Value* hi = b.build_and(b.build_lshr(w, b.build_iconst_i32(16)), mask);
+                return {b.build_mul(b.build_sitofp_f32_i32(lo), scale),
+                        b.build_mul(b.build_sitofp_f32_i32(hi), scale)};
+            }
             if (n == "select") {
                 ValueList cv = lower_expr(e->args[0].get());
                 if (const brass::Instruction* def = (cv.size() == 1 && cv[0]->is_instruction()) ? cv[0]->defining_instruction() : nullptr;
