@@ -256,6 +256,7 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     e->name = inst_name;
     if (inst_f64) fn.uses_f64 = true;
     if (inst->uses_descriptors) fn.uses_descriptors = true;   // a resource read in the callee
+    if (inst->uses_textures) fn.uses_textures = true;
     if (inst->uses_barriers_or_shared) fn.uses_barriers_or_shared = true;
     if (inst->required_stage) require_stage(*inst->required_stage, callee_decl.name, e->span);
     if (inst_grid) ensure_grid_dim(std::max(1u, inst_grid_dim));
@@ -367,6 +368,17 @@ void SemaContext::resolve_globals() {
             cp.name = d.name;
             cp.type = resolve_type(d.type.get(), mod_name, empty_env);
             cp.access = cp.type.access;
+            if (d.is_shared) {
+                cp.role = ParamRole::Shared;
+                cp.access = AccessMode::ReadWrite;
+                if (!d.attributes.empty()) {
+                    diags.error(d.attributes.front().span, "module-level shared variable '" + d.name + "' cannot have attributes");
+                }
+                validate_shared_type(cp.type, out->types, diags, d.span, d.name);
+                out->global_index[mod_name + "::" + d.name] = out->globals.size();
+                out->globals.push_back(std::move(cp));
+                continue;
+            }
             if (cp.type.is_image()) {
                 cp.role = ParamRole::Image;
                 cp.image_format = resolve_image_format(cp, d.find_attribute("format"), diags);
@@ -391,46 +403,6 @@ void SemaContext::resolve_globals() {
             out->global_index[mod_name + "::" + d.name] = out->globals.size();
             out->globals.push_back(std::move(cp));
         }
-    }
-}
-
-static void fold_const_into_expr(Expr* e, const ConstValue& cv) {
-    if (!e) return;
-    e->path.clear();
-    e->generic_args.clear();
-    e->args.clear();
-    e->fields.clear();
-    e->lhs.reset();
-    e->rhs.reset();
-    e->cond.reset();
-    e->target_type.reset();
-    e->resolved_type = cv.type;
-    if (cv.type.is_scalar()) {
-        if (cv.type.is_float_scalar()) {
-            e->kind = Expr::Kind::FloatLit;
-            e->float_val = cv.float_val;
-            e->literal_suffix = cv.type.scalar;
-        } else if (cv.type.is_bool()) {
-            e->kind = Expr::Kind::BoolLit;
-            e->bool_val = cv.bool_val;
-        } else {
-            e->kind = Expr::Kind::IntLit;
-            e->int_val = cv.int_val;
-            e->literal_suffix = cv.type.scalar;
-        }
-        return;
-    }
-    if (cv.type.is_vector() || cv.type.is_array()) {
-        e->kind = Expr::Kind::Call;
-        e->name = cv.type.is_vector() ? ("vec" + std::to_string(cv.type.dimension)) : "array";
-        e->args.reserve(cv.elements.size());
-        for (const auto& el : cv.elements) {
-            auto arg = std::make_unique<Expr>();
-            arg->span = e->span;
-            fold_const_into_expr(arg.get(), el);
-            e->args.push_back(std::move(arg));
-        }
-        return;
     }
 }
 
@@ -477,8 +449,16 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             if (int32_t g = ctx.find_global(fn.module_name, {}, e->name); g >= 0) {
                 e->global_index = g;
-                fn.uses_descriptors = true;
-                return e->resolved_type = ctx.out->globals[static_cast<size_t>(g)].type;
+                const auto& gp = ctx.out->globals[static_cast<size_t>(g)];
+                if (gp.role == ParamRole::Shared) {
+                    require_stage(Stage::Compute, "shared variable '" + e->name + "'", e->span);
+                    fn.uses_barriers_or_shared = true;
+                } else {
+                    fn.uses_descriptors = true;
+                    if (gp.role == ParamRole::Image || gp.role == ParamRole::Sampler) fn.uses_textures = true;
+                }
+                mark_type_usage(gp.type);
+                return e->resolved_type = gp.type;
             }
             ctx.diags.error(e->span, "undeclared identifier '" + e->name + "'");
             return Type::void_type();
@@ -492,8 +472,16 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             if (int32_t g = ctx.find_global(fn.module_name, e->path, e->name); g >= 0) {
                 e->global_index = g;
-                fn.uses_descriptors = true;
-                return e->resolved_type = ctx.out->globals[static_cast<size_t>(g)].type;
+                const auto& gp = ctx.out->globals[static_cast<size_t>(g)];
+                if (gp.role == ParamRole::Shared) {
+                    require_stage(Stage::Compute, "shared variable '" + e->name + "'", e->span);
+                    fn.uses_barriers_or_shared = true;
+                } else {
+                    fn.uses_descriptors = true;
+                    if (gp.role == ParamRole::Image || gp.role == ParamRole::Sampler) fn.uses_textures = true;
+                }
+                mark_type_usage(gp.type);
+                return e->resolved_type = gp.type;
             }
             ctx.diags.error(e->span, "undeclared constant or symbol '" + ModuleRegistry::format_module_path(e->path) + "'");
             return Type::void_type();
@@ -658,7 +646,8 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 }
                 return rt;
             }
-            if (recv.is_uniform()) recv = recv.element_type();   // a field of the block's T
+            if (recv.is_uniform() || (recv.is_buffer() && recv.element_type().is_struct()))
+                recv = recv.element_type();   // a field of the block's T
             if (recv.is_struct()) {
                 const StructDef* sdef = ctx.out->types.find_struct(recv.struct_id);
                 if (sdef) {
@@ -764,306 +753,94 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
     }
     return Type::void_type();
 }
-void FnCheckState::check_block_stmts(std::vector<StmtPtr>& stmts) {
-    for (auto& s : stmts) {
-        check_stmt(s.get());
+
+// A sampler's methods filter (sample*, at the fragment's implicit LOD, an
+// explicit lod, or gradients; the _offset forms add constant texels each
+// dimension), compare to a reference (a shadow sampler), fetch a texel,
+// gather four, and give the size and the mip count; an image loads and
+// stores texels. Coordinates are f32 for filtering and i32 for texels, a
+// layer after a texture array's dimensions.
+Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
+    const std::string& m = e->name;
+    const bool image = recv_t.is_image();
+    const bool cube = recv_t.image_cube();
+    const bool shadow = recv_t.image_shadow();
+    const Type elem = recv_t.element_type();
+    const uint32_t n = recv_t.image_coords();
+    const Type fcoord = Type::vec(ScalarKind::F32, n);
+    const Type icoord = Type::vec(ScalarKind::I32, n);
+    const Type space = Type::vec(ScalarKind::F32, recv_t.dimension);   // a gradient
+    const Type offset = Type::vec(ScalarKind::I32, recv_t.dimension);
+    const Type size = Type::vec(ScalarKind::I32, (cube ? 2 : recv_t.dimension) + (recv_t.image_arrayed() ? 1 : 0));
+
+    auto done = [&](const Type& t) {
+        e->resolved_type = t;
+        return t;
+    };
+    // A texture's filtering methods take the sampler they go through first.
+    const bool through = recv_t.image_separate() && m != "size" && m != "levels" && m != "fetch";
+    // `m(params...)`: each argument checked against its parameter.
+    auto takes = [&](std::initializer_list<Type> params, const char* shape) {
+        if (e->args.size() != params.size() + (through ? 1 : 0)) {
+            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + (through ? "sampler, " : "") +
+                                         shape + ")");
+            for (auto& a : e->args) check_expr(a.get());
+            return;
+        }
+        size_t i = 0;
+        if (through) {
+            Expr* s = e->args[i++].get();
+            Type st = check_expr(s);
+            if (!st.is_sampler() || !st.sampler_only()) {
+                ctx.diags.error(s->span, recv_t.to_string() + "." + m + " samples through a 'sampler', got '" +
+                                             st.to_string() + "'");
+            }
+        }
+        for (const Type& t : params) {
+            Expr* a = e->args[i++].get();
+            check_expr(a, t);
+            check_assignable(a, t, ctx.diags, a->span);
+        }
+    };
+    auto no_cube = [&] {
+        if (cube) ctx.diags.error(e->span, recv_t.to_string() + "." + m + ": a cube has no texel offsets or fetches");
+    };
+
+    if (image) {
+        if (m == "load") {
+            if (!can_Read(recv_t.access)) ctx.diags.error(e->span, "cannot load from write-only image");
+            takes({icoord}, "coordinates");
+            return done(elem);
+        }
+        if (m == "store") {
+            if (!can_Write(recv_t.access)) ctx.diags.error(e->span, "cannot store to read-only image");
+            takes({icoord, elem}, "coordinates, texel");
+            return done(Type::void_type());
+        }
+        if (m == "size") { takes({}, ""); return done(Type::vec(ScalarKind::I32, n)); }
+    } else {
+        if (m == "size") { takes({Type::i32()}, "lod"); return done(size); }
+        if (m == "levels") { takes({}, ""); return done(Type::i32()); }
+        if (shadow) {
+            if (m == "compare") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::f32()); }
+            if (m == "compare_lod") { takes({fcoord, Type::f32(), Type::f32()}, "coordinates, reference, lod"); return done(Type::f32()); }
+            if (m == "gather") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::vec(ScalarKind::F32, 4)); }
+        } else {
+            if (m == "sample") { takes({fcoord}, "coordinates"); return done(elem); }
+            if (m == "sample_offset") { no_cube(); takes({fcoord, offset}, "coordinates, offset"); return done(elem); }
+            if (m == "sample_lod") { takes({fcoord, Type::f32()}, "coordinates, lod"); return done(elem); }
+            if (m == "sample_lod_offset") { no_cube(); takes({fcoord, Type::f32(), offset}, "coordinates, lod, offset"); return done(elem); }
+            if (m == "sample_grad") { takes({fcoord, space, space}, "coordinates, dx, dy"); return done(elem); }
+            if (m == "sample_grad_offset") { no_cube(); takes({fcoord, space, space, offset}, "coordinates, dx, dy, offset"); return done(elem); }
+            if (m == "fetch") { no_cube(); takes({icoord, Type::i32()}, "texel coordinates, lod"); return done(elem); }
+            if (m == "gather") { takes({fcoord, Type::i32()}, "coordinates, component"); return done(Type::vec(elem.scalar, 4)); }
+        }
     }
+    for (auto& a : e->args) check_expr(a.get());
+    ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
+    return done(Type::void_type());
 }
-void FnCheckState::check_stmt(Stmt* s) {
-    if (!s) return;
-    switch (s->kind) {
-        case Stmt::Kind::Block:
-            push_scope();
-            check_block_stmts(s->body);
-            pop_scope();
-            break;
-        case Stmt::Kind::Let:
-        case Stmt::Kind::Var: {
-            std::optional<Type> annotated;
-            if (s->var_type) {
-                annotated = ctx.resolve_type(s->var_type.get(), fn.module_name, genv);
-            }
-            Type init_t = Type::void_type();
-            if (s->init_expr) {
-                init_t = check_expr(s->init_expr.get(), annotated);
-            }
-            Type final_t = annotated ? *annotated : init_t;
-            if (final_t.is_void()) {
-                ctx.diags.error(s->span, "variable '" + s->var_name + "' must have a non-void type");
-                final_t = Type::i32();
-            }
-            if (annotated && s->init_expr) {
-                check_assignable(s->init_expr.get(), *annotated, ctx.diags, s->span);
-            }
-            s->resolved_var_type = final_t;
-            mark_type_usage(final_t);
-            LocalVar lv;
-            lv.name = s->var_name;
-            lv.type = final_t;
-            lv.is_mutable = (s->kind == Stmt::Kind::Var);
-            if (!lv.is_mutable && s->init_expr) {
-                if (auto cv = ctx.eval_const_expr(s->init_expr.get(), fn.module_name, genv, scopes)) {
-                    lv.is_const = true;
-                    lv.const_val = *cv;
-                }
-            }
-            scopes.back()[s->var_name] = lv;
-            break;
-        }
-        case Stmt::Kind::Assign: {
-            // Special case: assigning to store index `st[x, y] = val`
-            if (s->assign_target && s->assign_target->kind == Expr::Kind::Index && s->assign_target->lhs) {
-                Type recv = check_expr(s->assign_target->lhs.get());
-                if (recv.is_stencil()) {
-                    ctx.diags.error(s->span, "cannot write to read-only stencil");
-                    return;
-                }
-                if (recv.is_store()) {
-                    if (!can_Write(recv.access)) {
-                        ctx.diags.error(s->span, "cannot write to read-only store");
-                    }
-                    if (s->compound_op.has_value() && !can_Read(recv.access)) {
-                        ctx.diags.error(s->span, "compound assignment on store requires read-write access");
-                    }
-                    if (s->assign_target->args.size() != recv.dimension) {
-                        ctx.diags.error(s->span, "store indexing expects " + std::to_string(recv.dimension) + " coordinate(s)");
-                    }
-                    for (auto& a : s->assign_target->args) {
-                        Type at = check_expr(a.get(), Type::i32());
-                        if (!at.is_integer() || !at.is_scalar()) {
-                            ctx.diags.error(a->span, "store coordinate must be a scalar integer, got '" + at.to_string() + "'");
-                        }
-                    }
-                    Type elem = recv.element_type();
-                    if (s->compound_op.has_value() && !elem.is_numeric()) {
-                        ctx.diags.error(s->span, "compound assignment on store requires numeric scalar or vector element type");
-                    }
-                    s->assign_target->resolved_type = elem;
-                    check_expr(s->assign_value.get(), elem);
-                    if (s->compound_op.has_value() && elem.is_vector()) {
-                        Type elem_s = Type::scalar_type(elem.scalar);
-                        if (s->assign_value->resolved_type == elem_s || coerce_expr_to_type(s->assign_value.get(), elem_s)) {
-                            coerce_expr_to_type(s->assign_value.get(), elem);
-                        }
-                    }
-                    check_assignable(s->assign_value.get(), elem, ctx.diags, s->span);
-                    mark_type_usage(elem);
-                    return;
-                }
-            }
-            // Validate lvalue chain and mutability on base identifier
-            const Expr* base = s->assign_target.get();
-            while (base && (base->kind == Expr::Kind::Field || base->kind == Expr::Kind::Index)) {
-                base = base->lhs.get();
-            }
-            if (!base || (base->kind != Expr::Kind::Ident && base->kind != Expr::Kind::Path)) {
-                ctx.diags.error(s->span, "invalid assignment target");
-                if (s->assign_value) check_expr(s->assign_value.get());
-                return;
-            }
-            LocalVar* lv = base->kind == Expr::Kind::Ident ? lookup_var(base->name) : nullptr;
-            // A module-level resource: a place in a buffer, as a buffer parameter's.
-            LocalVar global_lv;
-            if (!lv) {
-                int32_t g = ctx.find_global(fn.module_name, base->path, base->name);
-                if (g >= 0) {
-                    global_lv.name = base->name;
-                    global_lv.type = ctx.out->globals[static_cast<size_t>(g)].type;
-                    lv = &global_lv;
-                }
-            }
-            if (!lv) {
-                ctx.diags.error(s->span, "cannot assign to '" + base->name + "'");
-                if (s->assign_value) check_expr(s->assign_value.get());
-                return;
-            }
-            if (lv->type.is_stencil()) {
-                ctx.diags.error(s->span, "cannot write to read-only stencil");
-                return;
-            }
-            if (lv->type.is_store()) {
-                ctx.diags.error(s->span, "cannot assign to sub-element of store '" + base->name + "' directly; assign a full store element");
-                return;
-            }
-            if (lv->type.is_block()) {
-                // A place in the buffer: the variable naming it is not what changes.
-                if (!lv->type.is_buffer() || lv->type.access == AccessMode::Read) {
-                    ctx.diags.error(s->span, "'" + base->name + "' is read-only (" + lv->type.to_string() + ")");
-                } else if (s->assign_target->kind == Expr::Kind::Ident) {
-                    ctx.diags.error(s->span, "assign to an element of buffer '" + base->name + "', not the buffer");
-                }
-            } else if (!lv->is_mutable) {
-                ctx.diags.error(s->span, "cannot assign to immutable variable '" + base->name + "' (declare with 'var' instead of 'let')");
-            }
-            Type target_t = check_expr(s->assign_target.get());
-            for (const Expr* cur = s->assign_target.get();
-                 cur && (cur->kind == Expr::Kind::Field || cur->kind == Expr::Kind::Index);
-                 cur = cur->lhs.get()) {
-                if (cur->kind == Expr::Kind::Field && cur->lhs && cur->lhs->resolved_type.is_vector() && cur->name.size() > 1) {
-                    uint32_t seen_mask = 0;
-                    for (char c : cur->name) {
-                        uint32_t idx = (c == 'x' || c == 'r' || c == 's') ? 0 :
-                                       (c == 'y' || c == 'g' || c == 't') ? 1 :
-                                       (c == 'z' || c == 'b' || c == 'p') ? 2 : 3;
-                        if (seen_mask & (1u << idx)) {
-                            ctx.diags.error(cur->span, "cannot assign to vector swizzle with duplicate components '." + cur->name + "'");
-                            break;
-                        }
-                        seen_mask |= (1u << idx);
-                    }
-                }
-            }
-            if (s->compound_op.has_value() && !target_t.is_numeric()) {
-                ctx.diags.error(s->span, "compound assignment requires a numeric scalar or vector target, got '" + target_t.to_string() + "'");
-            }
-            check_expr(s->assign_value.get(), target_t);
-            if (s->compound_op.has_value() && target_t.is_vector()) {
-                // Allow `vec *= scalar`
-                Type elem_t = Type::scalar_type(target_t.scalar);
-                if (s->assign_value->resolved_type == elem_t || coerce_expr_to_type(s->assign_value.get(), elem_t)) {
-                    coerce_expr_to_type(s->assign_value.get(), target_t);
-                }
-            }
-            check_assignable(s->assign_value.get(), target_t, ctx.diags, s->span);
-            break;
-        }
-        case Stmt::Kind::If: {
-            // Check if condition is a compile-time constant (e.g. `if D == 1`)
-            if (auto cv = ctx.eval_const_expr(s->cond.get(), fn.module_name, genv, scopes)) {
-                if (cv->type.is_bool()) {
-                    std::vector<StmtPtr> chosen = cv->bool_val ? std::move(s->body) : std::move(s->else_body);
-                    s->kind = Stmt::Kind::Block;
-                    s->cond.reset();
-                    s->body = std::move(chosen);
-                    s->else_body.clear();
-                    push_scope();
-                    check_block_stmts(s->body);
-                    pop_scope();
-                    return;
-                }
-            }
-            Type ct = check_expr(s->cond.get(), Type::bool_type());
-            if (!ct.is_bool()) {
-                ctx.diags.error(s->cond->span, "if condition must be 'bool', got '" + ct.to_string() + "'");
-            }
-            push_scope();
-            check_block_stmts(s->body);
-            pop_scope();
-            if (!s->else_body.empty()) {
-                push_scope();
-                check_block_stmts(s->else_body);
-                pop_scope();
-            }
-            break;
-        }
-        case Stmt::Kind::ForRange: {
-            bool has_unroll = false;
-            for (const auto& attr : s->attributes) {
-                if (attr.name == "unroll") has_unroll = true;
-            }
-            auto start_c = ctx.eval_const_int(s->range_start.get(), fn.module_name, genv, scopes);
-            auto end_c = ctx.eval_const_int(s->range_end.get(), fn.module_name, genv, scopes);
-            // Unroll @unroll loops when bounds are compile-time constants
-            if (has_unroll && start_c.has_value() && end_c.has_value()) {
-                int64_t lo = *start_c;
-                int64_t hi = s->inclusive_range ? *end_c : (*end_c - 1);
-                std::vector<StmtPtr> orig_body = std::move(s->body);
-                std::string loop_var = s->var_name;
-                s->kind = Stmt::Kind::Block;
-                s->body.clear();
-                for (int64_t v = lo; v <= hi; ++v) {
-                    auto block = std::make_unique<Stmt>();
-                    block->kind = Stmt::Kind::Block;
-                    block->span = s->span;
-                    auto let_v = std::make_unique<Stmt>();
-                    let_v->kind = Stmt::Kind::Let;
-                    let_v->span = s->span;
-                    let_v->var_name = loop_var;
-                    let_v->resolved_var_type = Type::i32();
-                    let_v->init_expr = std::make_unique<Expr>();
-                    let_v->init_expr->kind = Expr::Kind::IntLit;
-                    let_v->init_expr->span = s->span;
-                    let_v->init_expr->int_val = v;
-                    let_v->init_expr->resolved_type = Type::i32();
-                    block->body.push_back(std::move(let_v));
-                    for (const auto& bs : orig_body) {
-                        block->body.push_back(clone_stmt(bs.get()));
-                    }
-                    s->body.push_back(std::move(block));
-                }
-                push_scope();
-                check_block_stmts(s->body);
-                pop_scope();
-                return;
-            }
-            Type st = check_expr(s->range_start.get(), Type::i32());
-            check_expr(s->range_end.get(), st);
-            check_assignable(s->range_end.get(), st, ctx.diags, s->range_end->span);
-            s->resolved_var_type = st;
-            push_scope();
-            LocalVar lv;
-            lv.name = s->var_name;
-            lv.type = st;
-            lv.is_mutable = false;
-            scopes.back()[s->var_name] = lv;
-            ++loop_depth;
-            check_block_stmts(s->body);
-            --loop_depth;
-            pop_scope();
-            break;
-        }
-        case Stmt::Kind::ForC: {
-            push_scope();
-            if (s->for_init) check_stmt(s->for_init.get());
-            if (s->cond) {
-                Type ct = check_expr(s->cond.get(), Type::bool_type());
-                if (!ct.is_bool()) ctx.diags.error(s->cond->span, "for loop condition must be 'bool'");
-            }
-            if (s->for_step) check_stmt(s->for_step.get());
-            ++loop_depth;
-            check_block_stmts(s->body);
-            --loop_depth;
-            pop_scope();
-            break;
-        }
-        case Stmt::Kind::While: {
-            Type ct = check_expr(s->cond.get(), Type::bool_type());
-            if (!ct.is_bool()) {
-                ctx.diags.error(s->cond->span, "while condition must be 'bool'");
-            }
-            push_scope();
-            ++loop_depth;
-            check_block_stmts(s->body);
-            --loop_depth;
-            pop_scope();
-            break;
-        }
-        case Stmt::Kind::Break:
-        case Stmt::Kind::Continue:
-            if (loop_depth <= 0) {
-                ctx.diags.error(s->span, std::string(s->kind == Stmt::Kind::Break ? "'break'" : "'continue'") +
-                                         " statement outside of a loop");
-            }
-            break;
-        case Stmt::Kind::Return: {
-            if (s->expr) {
-                if (fn.return_type.is_void()) {
-                    ctx.diags.error(s->span, "void function '" + fn.source_name + "' cannot return a value");
-                } else {
-                    check_expr(s->expr.get(), fn.return_type);
-                    check_assignable(s->expr.get(), fn.return_type, ctx.diags, s->span);
-                }
-            } else if (!fn.return_type.is_void()) {
-                ctx.diags.error(s->span, "non-void function '" + fn.source_name + "' must return a value of type '" +
-                                         fn.return_type.to_string() + "'");
-            }
-            break;
-        }
-        case Stmt::Kind::Expr:
-            check_expr(s->expr.get());
-            break;
-    }
-}
+
 const CheckedFunction* SemaContext::instantiate_function(
     const FnDecl& decl,
     const std::string& decl_mod,
@@ -1105,7 +882,6 @@ const CheckedFunction* SemaContext::instantiate_function(
     cfn.source_name = decl.name;
     cfn.module_name = decl_mod;
     cfn.is_entry_kernel = as_entry_kernel || decl.is_entry_kernel();
-    // Stage & attributes
     if (decl.has_attribute("vertex")) {
         cfn.stage = Stage::Vertex;
         cfn.required_stage = Stage::Vertex;
@@ -1120,11 +896,8 @@ const CheckedFunction* SemaContext::instantiate_function(
     if (const Attribute* grid_attr = decl.find_attribute("grid")) {
         if (!grid_attr->int_args.empty()) {
             int64_t gd = grid_attr->int_args[0];
-            if (gd < 1 || gd > 3) {
-                diags.error(grid_attr->span, "@grid(D) dimension D must be 1, 2, or 3");
-            } else {
-                cfn.grid_dim = static_cast<uint32_t>(gd);
-            }
+            if (gd < 1 || gd > 3) diags.error(grid_attr->span, "@grid(D) dimension D must be 1, 2, or 3");
+            else cfn.grid_dim = static_cast<uint32_t>(gd);
         } else {
             cfn.grid_dim = 2;
         }
@@ -1140,7 +913,6 @@ const CheckedFunction* SemaContext::instantiate_function(
             cfn.local_size[i] = static_cast<uint32_t>(sz);
         }
     }
-    // Resolve parameters
     for (const auto& pdecl : decl.params) {
         CheckedParam cp;
         cp.span = pdecl.span;
@@ -1166,16 +938,14 @@ const CheckedFunction* SemaContext::instantiate_function(
         } else if (cp.type.is_image()) {
             cp.role = ParamRole::Image;
             cp.image_format = resolve_image_format(cp, pdecl.find_attribute("format"), diags);
-        } else if (cp.type.is_sampler()) {
-            cp.role = ParamRole::Sampler;
-        } else if (cp.type.is_uniform()) {
-            cp.role = ParamRole::Uniform;
-        } else if (cp.type.is_buffer()) {
-            cp.role = ParamRole::Buffer;
-        }
+        } else if (cp.type.is_sampler()) cp.role = ParamRole::Sampler;
+        else if (cp.type.is_uniform()) cp.role = ParamRole::Uniform;
+        else if (cp.type.is_buffer()) cp.role = ParamRole::Buffer;
         if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler || cp.role == ParamRole::Uniform ||
             cp.role == ParamRole::Buffer)
             cfn.uses_descriptors = true;
+        if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler)
+            cfn.uses_textures = true;
         for (const auto& pattr : pdecl.attributes) {
             if (pattr.name == "binding") {
                 if (pattr.int_args.size() == 1) {
@@ -1186,20 +956,15 @@ const CheckedFunction* SemaContext::instantiate_function(
                 }
             }
         }
-        // A vertex stage's attribute or a fragment stage's interpolated
-        // input: f32, i32 or u32 lanes, 1 to 4.
         if (const Attribute* loc = pdecl.find_attribute("location")) {
-            if (cfn.stage != Stage::Vertex && cfn.stage != Stage::Fragment) {
+            if (cfn.stage != Stage::Vertex && cfn.stage != Stage::Fragment)
                 diags.error(loc->span, "@location is a vertex or fragment stage's input");
-            }
-            if (loc->int_args.size() != 1 || loc->int_args[0] < 0) {
+            if (loc->int_args.size() != 1 || loc->int_args[0] < 0)
                 diags.error(loc->span, "@location takes one location, e.g. @location(0)");
-            }
             if (!(cp.type.is_scalar() || cp.type.is_vector()) ||
                 (cp.type.scalar != ScalarKind::F32 && cp.type.scalar != ScalarKind::I32 &&
-                 cp.type.scalar != ScalarKind::U32)) {
+                 cp.type.scalar != ScalarKind::U32))
                 diags.error(cp.span, "a stage input is f32, i32 or u32, or a vector of one");
-            }
             cp.role = ParamRole::StageInput;
             cp.location = loc->int_args.empty() ? 0 : static_cast<uint32_t>(loc->int_args[0]);
             cp.flat = pdecl.find_attribute("flat") != nullptr || cp.type.scalar != ScalarKind::F32;
@@ -1209,42 +974,21 @@ const CheckedFunction* SemaContext::instantiate_function(
         cfn.params.push_back(std::move(cp));
     }
     if (!cfn.has_explicit_local_size) {
-        if (cfn.grid_dim == 2) {
-            cfn.local_size[0] = 8;
-            cfn.local_size[1] = 8;
-            cfn.local_size[2] = 1;
-        } else if (cfn.grid_dim == 3) {
-            cfn.local_size[0] = 4;
-            cfn.local_size[1] = 4;
-            cfn.local_size[2] = 4;
-        }
+        if (cfn.grid_dim == 2) { cfn.local_size[0] = 8; cfn.local_size[1] = 8; cfn.local_size[2] = 1; }
+        else if (cfn.grid_dim == 3) { cfn.local_size[0] = 4; cfn.local_size[1] = 4; cfn.local_size[2] = 4; }
     }
     cfn.return_type = decl.return_type ? resolve_type(decl.return_type.get(), decl_mod, genv) : Type::void_type();
     if (cfn.return_type.scalar == ScalarKind::F64) cfn.uses_f64 = true;
-    // Clone body and type-check
-    for (const auto& s : decl.body) {
-        cfn.body.push_back(clone_stmt(s.get()));
-    }
+    for (const auto& s : decl.body) cfn.body.push_back(clone_stmt(s.get()));
     active_fn_stack.push_back(mangled);
     {
         FnCheckState state{*this, cfn, genv, {}, 0};
         state.push_scope();
         for (size_t i = 0; i < cfn.params.size(); ++i) {
-            LocalVar lv;
-            lv.name = cfn.params[i].name;
-            lv.type = cfn.params[i].type;
-            lv.is_mutable = false;
-            lv.param_index = static_cast<int>(i);
-            state.scopes.back()[lv.name] = lv;
+            state.scopes.back()[cfn.params[i].name] = LocalVar{cfn.params[i].name, cfn.params[i].type, false, false, false, {}, static_cast<int>(i)};
         }
         for (const auto& [cname, cval] : genv.const_params) {
-            LocalVar lv;
-            lv.name = cname;
-            lv.type = cval.type;
-            lv.is_mutable = false;
-            lv.is_const = true;
-            lv.const_val = cval;
-            state.scopes.back()[cname] = lv;
+            state.scopes.back()[cname] = LocalVar{cname, cval.type, false, true, false, cval, -1};
         }
         state.check_block_stmts(cfn.body);
         state.pop_scope();

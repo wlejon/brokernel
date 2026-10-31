@@ -45,6 +45,7 @@ TokenKind classify_keyword(std::string_view text) noexcept {
     if (text == "return")   return TokenKind::KwReturn;
     if (text == "true")     return TokenKind::KwTrue;
     if (text == "false")    return TokenKind::KwFalse;
+    if (text == "shared")   return TokenKind::KwShared;
     return TokenKind::Ident;
 }
 

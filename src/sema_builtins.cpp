@@ -141,26 +141,37 @@ Type FnCheckState::check_method_call(Expr* e) {
             e->resolved_type = Type::void_type();
             return Type::void_type();
         }
-        if (m == "atomic_add" || m == "atomic_min" || m == "atomic_max" || m == "atomic_exchange") {
+        if (m == "atomic_add" || m == "atomic_min" || m == "atomic_max" || m == "atomic_exchange" ||
+            m == "atomic_or" || m == "atomic_and" || m == "atomic_xor" || m == "atomic_cas" ||
+            m == "add" || m == "min" || m == "max" || m == "exchange" ||
+            m == "or" || m == "and" || m == "xor" || m == "cas" || m == "compare_exchange") {
+            std::string canonical = (m == "compare_exchange" || m == "cas") ? "atomic_cas"
+                                  : (m.rfind("atomic_", 0) == 0 ? m : "atomic_" + m);
+            e->name = canonical;
             if (!can_Write(recv_t.access) || !can_Read(recv_t.access)) {
                 ctx.diags.error(e->span, "atomic store operation requires a read-write store ('rw_store' or 'store')");
             }
-            bool valid_elem = elem.is_i32() || elem.is_u32() || (m == "atomic_add" && elem.is_f32());
+            bool is_cas = (canonical == "atomic_cas");
+            bool valid_elem = elem.is_i32() || elem.is_u32() || (canonical == "atomic_add" && elem.is_f32());
             if (!valid_elem) {
-                std::string allowed = (m == "atomic_add") ? "'i32', 'u32', or 'f32'" : "'i32' or 'u32'";
-                ctx.diags.error(e->span, m + " requires store element type " + allowed + ", got '" + elem.to_string() + "'");
+                std::string allowed = (canonical == "atomic_add") ? "'i32', 'u32', or 'f32'" : "'i32' or 'u32'";
+                ctx.diags.error(e->span, canonical + " requires store element type " + allowed + ", got '" + elem.to_string() + "'");
             }
-            if (e->args.size() != dim + 1) {
-                ctx.diags.error(e->span, m + " expects " + std::to_string(dim) + " coordinate argument(s) and 1 value argument");
+            size_t val_args = is_cas ? 2 : 1;
+            if (e->args.size() != dim + val_args) {
+                ctx.diags.error(e->span, canonical + " expects " + std::to_string(dim) + " coordinate argument(s) and " +
+                                         std::to_string(val_args) + " value argument(s)");
             } else {
                 for (size_t i = 0; i < dim; ++i) {
                     Type at = check_expr(e->args[i].get(), Type::i32());
                     if (!at.is_integer() || !at.is_scalar()) {
-                        ctx.diags.error(e->args[i]->span, m + " coordinate must be a scalar integer, got '" + at.to_string() + "'");
+                        ctx.diags.error(e->args[i]->span, canonical + " coordinate must be a scalar integer, got '" + at.to_string() + "'");
                     }
                 }
-                check_expr(e->args[dim].get(), elem);
-                check_assignable(e->args[dim].get(), elem, ctx.diags, e->args[dim]->span);
+                for (size_t i = dim; i < dim + val_args; ++i) {
+                    check_expr(e->args[i].get(), elem);
+                    check_assignable(e->args[i].get(), elem, ctx.diags, e->args[i]->span);
+                }
             }
             e->resolved_type = elem;
             return elem;
@@ -176,6 +187,78 @@ Type FnCheckState::check_method_call(Expr* e) {
         if (!e->args.empty()) ctx.diags.error(e->span, "len() takes no arguments");
         e->resolved_type = Type::i32();
         return e->resolved_type;
+    }
+    // Atomics as methods on @binding buffer<T> and on shared variables/arrays.
+    if (m == "atomic_add" || m == "atomic_min" || m == "atomic_max" || m == "atomic_exchange" ||
+        m == "atomic_or" || m == "atomic_and" || m == "atomic_xor" || m == "atomic_cas" ||
+        m == "add" || m == "min" || m == "max" || m == "exchange" ||
+        m == "or" || m == "and" || m == "xor" || m == "cas" || m == "compare_exchange") {
+        std::string canonical = (m == "compare_exchange" || m == "cas") ? "atomic_cas"
+                              : (m.rfind("atomic_", 0) == 0 ? m : "atomic_" + m);
+        e->name = canonical;
+        const Expr* base = e->lhs.get();
+        while (base && (base->kind == Expr::Kind::Field || base->kind == Expr::Kind::Index)) base = base->lhs.get();
+        bool is_buf = false;
+        bool is_sh = false;
+        bool read_only_buf = false;
+        if (base && (base->kind == Expr::Kind::Ident || base->kind == Expr::Kind::Path)) {
+            if (base->kind == Expr::Kind::Ident) {
+                if (LocalVar* lv = lookup_var(base->name)) {
+                    if (lv->is_shared) is_sh = true;
+                    if (lv->type.is_buffer()) { is_buf = true; read_only_buf = (lv->type.access == AccessMode::Read); }
+                }
+            }
+            if (!is_sh && !is_buf && base->global_index >= 0) {
+                const auto& gp = ctx.out->globals[static_cast<size_t>(base->global_index)];
+                if (gp.role == ParamRole::Shared) is_sh = true;
+                if (gp.role == ParamRole::Buffer) { is_buf = true; read_only_buf = (gp.access == AccessMode::Read); }
+            }
+        }
+        if (is_buf || is_sh) {
+            if (is_buf && read_only_buf) {
+                ctx.diags.error(e->span, "atomic operation on read-only buffer");
+            }
+            if (is_sh) {
+                require_stage(Stage::Compute, canonical, e->span);
+                fn.uses_barriers_or_shared = true;
+            }
+            bool is_cas = (canonical == "atomic_cas");
+            size_t val_args = is_cas ? 2 : 1;
+            // If index argument(s) are given before the value argument(s), e.g. `bins.atomic_add(i, val)`
+            // or `words.atomic_or(idx, mask)` or `c.add(i, j, val)`, fold them into `e->lhs` as Index nodes.
+            while (e->args.size() > val_args && (recv_t.is_buffer() || recv_t.is_array() || recv_t.is_vector())) {
+                ExprPtr idx_arg = std::move(e->args.front());
+                e->args.erase(e->args.begin());
+                Type at = check_expr(idx_arg.get(), Type::i32());
+                if (!at.is_integer() || !at.is_scalar()) {
+                    ctx.diags.error(idx_arg->span, canonical + " index must be a scalar integer, got '" + at.to_string() + "'");
+                }
+                auto idx_expr = std::make_unique<Expr>();
+                idx_expr->kind = Expr::Kind::Index;
+                idx_expr->span = SourceSpan::merge(e->lhs->span, idx_arg->span);
+                idx_expr->lhs = std::move(e->lhs);
+                idx_expr->args.push_back(std::move(idx_arg));
+                recv_t = recv_t.element_type();
+                idx_expr->resolved_type = recv_t;
+                e->lhs = std::move(idx_expr);
+            }
+            bool valid_elem = recv_t.is_i32() || recv_t.is_u32() || (canonical == "atomic_add" && recv_t.is_f32());
+            if (!valid_elem) {
+                std::string allowed = (canonical == "atomic_add") ? "'i32', 'u32', or 'f32'" : "'i32' or 'u32'";
+                ctx.diags.error(e->span, canonical + " requires scalar place of type " + allowed + ", got '" + recv_t.to_string() + "'");
+            }
+            if (e->args.size() != val_args) {
+                ctx.diags.error(e->span, canonical + " expects " + std::to_string(val_args) + " value argument(s) after indices");
+                for (auto& a : e->args) check_expr(a.get());
+            } else {
+                for (size_t i = 0; i < val_args; ++i) {
+                    check_expr(e->args[i].get(), recv_t);
+                    check_assignable(e->args[i].get(), recv_t, ctx.diags, e->args[i]->span);
+                }
+            }
+            e->resolved_type = recv_t;
+            return recv_t;
+        }
     }
     ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
     return Type::void_type();
@@ -400,11 +483,30 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
     if (n == "thread_id_x" || n == "thread_id_y" || n == "thread_id_z" ||
         n == "local_id_x" || n == "local_id_y" || n == "local_id_z" ||
         n == "group_id_x" || n == "group_id_y" || n == "group_id_z" ||
+        n == "workgroup_id_x" || n == "workgroup_id_y" || n == "workgroup_id_z" ||
         n == "global_id_x" || n == "global_id_y" || n == "global_id_z" ||
         n == "workgroup_size_x" || n == "workgroup_size_y" || n == "workgroup_size_z" ||
+        n == "num_workgroups_x" || n == "num_workgroups_y" || n == "num_workgroups_z" ||
+        n == "local_invocation_index" || n == "local_index" ||
         n == "subgroup_size" || n == "subgroup_invocation_id") {
         e->resolved_type = Type::i32();
         return Type::i32();
+    }
+    if (n == "num_workgroups" || n == "workgroup_id" || n == "group_id" ||
+        n == "local_id" || n == "thread_id" || n == "global_id" || n == "workgroup_size") {
+        require_stage(Stage::Compute, n + "()", e->span);
+        if (!e->args.empty()) ctx.diags.error(e->span, n + "() takes 0 arguments");
+        Type v3i = Type::vec(ScalarKind::I32, 3);
+        e->resolved_type = v3i;
+        return v3i;
+    }
+    if ((n == "atomic_add" || n == "atomic_min" || n == "atomic_max" || n == "atomic_exchange" ||
+         n == "atomic_or" || n == "atomic_and" || n == "atomic_xor" || n == "atomic_cas") &&
+        !e->args.empty()) {
+        e->kind = Expr::Kind::MethodCall;
+        e->lhs = std::move(e->args.front());
+        e->args.erase(e->args.begin());
+        return check_method_call(e);
     }
     if (n == "workgroup_barrier" || n == "storage_barrier" || n == "barrier") {
         require_stage(Stage::Compute, n + "()", e->span);
@@ -839,136 +941,4 @@ bool FnCheckState::validate_stencil_access(
     return true;
 }
 
-// A sampler's methods filter (sample*, at the fragment's implicit LOD, an
-// explicit lod, or gradients; the _offset forms add constant texels each
-// dimension), compare to a reference (a shadow sampler), fetch a texel,
-// gather four, and give the size and the mip count; an image loads and
-// stores texels. Coordinates are f32 for filtering and i32 for texels, a
-// layer after a texture array's dimensions.
-Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
-    const std::string& m = e->name;
-    const bool image = recv_t.is_image();
-    const bool cube = recv_t.image_cube();
-    const bool shadow = recv_t.image_shadow();
-    const Type elem = recv_t.element_type();
-    const uint32_t n = recv_t.image_coords();
-    const Type fcoord = Type::vec(ScalarKind::F32, n);
-    const Type icoord = Type::vec(ScalarKind::I32, n);
-    const Type space = Type::vec(ScalarKind::F32, recv_t.dimension);   // a gradient
-    const Type offset = Type::vec(ScalarKind::I32, recv_t.dimension);
-    const Type size = Type::vec(ScalarKind::I32, (cube ? 2 : recv_t.dimension) + (recv_t.image_arrayed() ? 1 : 0));
-
-    auto done = [&](const Type& t) {
-        e->resolved_type = t;
-        return t;
-    };
-    // A texture's filtering methods take the sampler they go through first.
-    const bool through = recv_t.image_separate() && m != "size" && m != "levels" && m != "fetch";
-    // `m(params...)`: each argument checked against its parameter.
-    auto takes = [&](std::initializer_list<Type> params, const char* shape) {
-        if (e->args.size() != params.size() + (through ? 1 : 0)) {
-            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + (through ? "sampler, " : "") +
-                                         shape + ")");
-            for (auto& a : e->args) check_expr(a.get());
-            return;
-        }
-        size_t i = 0;
-        if (through) {
-            Expr* s = e->args[i++].get();
-            Type st = check_expr(s);
-            if (!st.is_sampler() || !st.sampler_only()) {
-                ctx.diags.error(s->span, recv_t.to_string() + "." + m + " samples through a 'sampler', got '" +
-                                             st.to_string() + "'");
-            }
-        }
-        for (const Type& t : params) {
-            Expr* a = e->args[i++].get();
-            check_expr(a, t);
-            check_assignable(a, t, ctx.diags, a->span);
-        }
-    };
-    auto no_cube = [&] {
-        if (cube) ctx.diags.error(e->span, recv_t.to_string() + "." + m + ": a cube has no texel offsets or fetches");
-    };
-
-    if (image) {
-        if (m == "load") {
-            if (!can_Read(recv_t.access)) ctx.diags.error(e->span, "cannot load from write-only image");
-            takes({icoord}, "coordinates");
-            return done(elem);
-        }
-        if (m == "store") {
-            if (!can_Write(recv_t.access)) ctx.diags.error(e->span, "cannot store to read-only image");
-            takes({icoord, elem}, "coordinates, texel");
-            return done(Type::void_type());
-        }
-        if (m == "size") {
-            takes({}, "");
-            return done(Type::vec(ScalarKind::I32, n));
-        }
-    } else {
-        if (m == "size") {
-            takes({Type::i32()}, "lod");
-            return done(size);
-        }
-        if (m == "levels") {
-            takes({}, "");
-            return done(Type::i32());
-        }
-        if (shadow) {
-            if (m == "compare") {
-                takes({fcoord, Type::f32()}, "coordinates, reference");
-                return done(Type::f32());
-            }
-            if (m == "compare_lod") {
-                takes({fcoord, Type::f32(), Type::f32()}, "coordinates, reference, lod");
-                return done(Type::f32());
-            }
-            if (m == "gather") {
-                takes({fcoord, Type::f32()}, "coordinates, reference");
-                return done(Type::vec(ScalarKind::F32, 4));
-            }
-        } else {
-            if (m == "sample") {
-                takes({fcoord}, "coordinates");
-                return done(elem);
-            }
-            if (m == "sample_offset") {
-                no_cube();
-                takes({fcoord, offset}, "coordinates, offset");
-                return done(elem);
-            }
-            if (m == "sample_lod") {
-                takes({fcoord, Type::f32()}, "coordinates, lod");
-                return done(elem);
-            }
-            if (m == "sample_lod_offset") {
-                no_cube();
-                takes({fcoord, Type::f32(), offset}, "coordinates, lod, offset");
-                return done(elem);
-            }
-            if (m == "sample_grad") {
-                takes({fcoord, space, space}, "coordinates, dx, dy");
-                return done(elem);
-            }
-            if (m == "sample_grad_offset") {
-                no_cube();
-                takes({fcoord, space, space, offset}, "coordinates, dx, dy, offset");
-                return done(elem);
-            }
-            if (m == "fetch") {
-                no_cube();
-                takes({icoord, Type::i32()}, "texel coordinates, lod");
-                return done(elem);
-            }
-            if (m == "gather") {
-                takes({fcoord, Type::i32()}, "coordinates, component");
-                return done(Type::vec(elem.scalar, 4));
-            }
-        }
-    }
-    for (auto& a : e->args) check_expr(a.get());
-    ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
-    return done(Type::void_type());
-}
 } // namespace brokernel::detail

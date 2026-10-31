@@ -44,11 +44,15 @@ public:
                 mod->consts.push_back(parse_const(is_pub));
             } else if (check(TokenKind::KwFn)) {
                 mod->functions.push_back(parse_fn(is_pub, std::move(attrs)));
-            } else if (check(TokenKind::KwVar)) {
+            } else if (check(TokenKind::KwVar) || check(TokenKind::KwShared)) {
                 BindingDecl d;
                 d.is_pub = is_pub;
                 d.attributes = std::move(attrs);
                 d.span = advance().span;
+                if (previous().kind == TokenKind::KwShared) {
+                    d.is_shared = true;
+                    match(TokenKind::KwVar);
+                }
                 d.name = consume(TokenKind::Ident, "resource name").text;
                 consume(TokenKind::Colon, "':' and the resource's type");
                 d.type = parse_type();
@@ -68,30 +72,12 @@ private:
     const std::vector<Token>& tokens_;
     DiagnosticBag& diags_;
     size_t pos_ = 0;
-    const Token& peek(size_t offset = 0) const noexcept {
-        size_t idx = pos_ + offset;
-        return idx < tokens_.size() ? tokens_[idx] : tokens_.back();
-    }
-    const Token& previous() const noexcept {
-        return pos_ > 0 ? tokens_[pos_ - 1] : tokens_.front();
-    }
-    bool is_at_end() const noexcept {
-        return peek().kind == TokenKind::Eof;
-    }
-    bool check(TokenKind k, size_t offset = 0) const noexcept {
-        return peek(offset).kind == k;
-    }
-    const Token& advance() noexcept {
-        if (!is_at_end()) ++pos_;
-        return previous();
-    }
-    bool match(TokenKind k) noexcept {
-        if (check(k)) {
-            advance();
-            return true;
-        }
-        return false;
-    }
+    const Token& peek(size_t offset = 0) const noexcept { size_t idx = pos_ + offset; return idx < tokens_.size() ? tokens_[idx] : tokens_.back(); }
+    const Token& previous() const noexcept { return pos_ > 0 ? tokens_[pos_ - 1] : tokens_.front(); }
+    bool is_at_end() const noexcept { return peek().kind == TokenKind::Eof; }
+    bool check(TokenKind k, size_t offset = 0) const noexcept { return peek(offset).kind == k; }
+    const Token& advance() noexcept { if (!is_at_end()) ++pos_; return previous(); }
+    bool match(TokenKind k) noexcept { if (check(k)) { advance(); return true; } return false; }
     const Token& consume(TokenKind k, const char* what) {
         if (check(k)) return advance();
         error(peek().span, std::string("expected ") + what + ", got '" + peek().text + "'");
@@ -105,17 +91,11 @@ private:
         while (!is_at_end()) {
             if (previous().kind == TokenKind::Semi || previous().kind == TokenKind::RBrace) return;
             switch (peek().kind) {
-                case TokenKind::At:
-                case TokenKind::KwPub:
-                case TokenKind::KwFn:
-                case TokenKind::KwStruct:
-                case TokenKind::KwConst:
-                case TokenKind::KwImport:
-                case TokenKind::KwFrom:
+                case TokenKind::At: case TokenKind::KwPub: case TokenKind::KwFn:
+                case TokenKind::KwStruct: case TokenKind::KwConst: case TokenKind::KwImport:
+                case TokenKind::KwFrom: case TokenKind::KwShared: case TokenKind::KwVar:
                     return;
-                default:
-                    advance();
-                    break;
+                default: advance(); break;
             }
         }
     }
@@ -427,25 +407,26 @@ private:
             st->span = SourceSpan::merge(start_sp, previous().span);
             return st;
         }
+        if (match(TokenKind::KwShared)) {
+            match(TokenKind::KwVar);
+            auto st = parse_let_or_var(true, start_sp);
+            st->is_shared = true;
+            st->attributes = std::move(attrs);
+            consume(TokenKind::Semi, "';' after shared variable declaration");
+            st->span = SourceSpan::merge(start_sp, previous().span);
+            return st;
+        }
         if (match(TokenKind::KwLet) || match(TokenKind::KwVar)) {
             bool is_var = previous().kind == TokenKind::KwVar;
-            // Allow `let mut x = ...` as `var x = ...`
-            if (!is_var && check(TokenKind::Ident) && peek().text == "mut") {
-                advance();
-                is_var = true;
-            }
+            if (!is_var && check(TokenKind::Ident) && peek().text == "mut") { advance(); is_var = true; }
             auto st = parse_let_or_var(is_var, start_sp);
             st->attributes = std::move(attrs);
             consume(TokenKind::Semi, "';' after variable declaration");
             st->span = SourceSpan::merge(start_sp, previous().span);
             return st;
         }
-        if (match(TokenKind::KwIf)) {
-            return parse_if_stmt(start_sp, std::move(attrs));
-        }
-        if (match(TokenKind::KwFor)) {
-            return parse_for_stmt(start_sp, std::move(attrs));
-        }
+        if (match(TokenKind::KwIf)) return parse_if_stmt(start_sp, std::move(attrs));
+        if (match(TokenKind::KwFor)) return parse_for_stmt(start_sp, std::move(attrs));
         if (match(TokenKind::KwWhile)) {
             auto st = std::make_unique<Stmt>();
             st->kind = Stmt::Kind::While;
@@ -472,9 +453,7 @@ private:
         if (match(TokenKind::KwReturn)) {
             auto st = std::make_unique<Stmt>();
             st->kind = Stmt::Kind::Return;
-            if (!check(TokenKind::Semi) && !check(TokenKind::RBrace)) {
-                st->expr = parse_expr();
-            }
+            if (!check(TokenKind::Semi) && !check(TokenKind::RBrace)) st->expr = parse_expr();
             consume(TokenKind::Semi, "';' after 'return'");
             st->span = SourceSpan::merge(start_sp, previous().span);
             return st;
@@ -966,18 +945,12 @@ private:
                 sl->span = SourceSpan::merge(first.span, rb.span);
                 return sl;
             }
-            // Generic call `foo<T, D>(...)` or `vec3<f64>(...)`
             if (!generic_args.empty() && match(TokenKind::LParen)) {
                 auto callee = std::make_unique<Expr>();
                 callee->span = first.span;
-                if (path.size() == 1) {
-                    callee->kind = Expr::Kind::Ident;
-                    callee->name = path[0];
-                } else {
-                    callee->kind = Expr::Kind::Path;
-                    callee->name = path.back();
-                    callee->path = path;
-                }
+                callee->kind = path.size() == 1 ? Expr::Kind::Ident : Expr::Kind::Path;
+                callee->name = path.back();
+                if (path.size() > 1) callee->path = path;
                 auto call = std::make_unique<Expr>();
                 call->kind = Expr::Kind::Call;
                 call->name = path.back();
@@ -994,14 +967,9 @@ private:
             }
             auto id = std::make_unique<Expr>();
             id->span = SourceSpan::merge(first.span, previous().span);
-            if (path.size() == 1) {
-                id->kind = Expr::Kind::Ident;
-                id->name = std::move(path[0]);
-            } else {
-                id->kind = Expr::Kind::Path;
-                id->name = path.back();
-                id->path = std::move(path);
-            }
+            id->kind = path.size() == 1 ? Expr::Kind::Ident : Expr::Kind::Path;
+            id->name = path.back();
+            if (path.size() > 1) id->path = std::move(path);
             return id;
         }
         error(peek().span, "expected expression, got '" + peek().text + "'");
@@ -1013,22 +981,13 @@ private:
     }
 };
 } // namespace
-std::unique_ptr<ModuleAst> parse_module(
-    const SourceMap& src,
-    const std::vector<Token>& tokens,
-    DiagnosticBag& diags) {
+std::unique_ptr<ModuleAst> parse_module(const SourceMap& src, const std::vector<Token>& tokens, DiagnosticBag& diags) {
     Parser p(src, tokens, diags);
     return p.parse();
 }
-std::unique_ptr<ModuleAst> parse_source(
-    std::string_view source,
-    std::string file_name,
-    DiagnosticBag& diags) {
+std::unique_ptr<ModuleAst> parse_source(std::string_view source, std::string file_name, DiagnosticBag& diags) {
     SourceMap sm(std::move(file_name), std::string(source));
     auto tokens = lex_source(sm, diags);
-    if (diags.has_errors()) {
-        return nullptr;
-    }
-    return parse_module(sm, tokens, diags);
+    return diags.has_errors() ? nullptr : parse_module(sm, tokens, diags);
 }
 } // namespace brokernel

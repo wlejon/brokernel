@@ -255,12 +255,15 @@ public:
     uint32_t local_size[3] = {64, 1, 1};
     std::vector<KernelParamInfo> params; // Source parameters
     std::vector<KernelParamInfo> all_mir_params; // Includes implicit GridDim and ReturnStore
+    std::vector<KernelParamInfo> block_bindings; // Descriptor-bound uniform<T> / buffer<T> used by the kernel
     Type return_type = Type::void_type();
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
     std::vector<ScalarKind> return_leaf_kinds;
     bool uses_f64 = false;
     bool uses_grid_coords = false;
+    bool uses_barriers_or_shared = false;
+    uint32_t cpu_shared_bytes = 0;
     int32_t max_stencil_radius = 0;
     int32_t stencil_halo[3] = {0, 0, 0};
 

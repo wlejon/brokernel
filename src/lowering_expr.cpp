@@ -100,338 +100,6 @@ std::vector<brass::Value*> MirBodyLowerer::pack_var_ids(const std::vector<int>& 
         }
         return flat;
     }
-brass::Value* MirBodyLowerer::clamp_coord(brass::Value* c, brass::Value* extent) {
-        brass::Value* zero = b.build_iconst_i32(0);
-        brass::Value* one = b.build_iconst_i32(1);
-        brass::Value* hi = b.build_sub(extent, one);
-        brass::Value* c_lo = b.build_select(b.build_slt(c, zero), zero, c);
-        return b.build_select(b.build_sgt(c_lo, hi), hi, c_lo);
-    }
-ValueList MirBodyLowerer::at_cells(const ValueList& store, uint32_t dim) {
-        auto it = store_param.find(store[0]);
-        if (it == store_param.end()) return store;
-        grid_cover[it->second] = std::max(grid_cover[it->second], dim);
-        return {store[0]};
-    }
-ValueList MirBodyLowerer::store_access(const ValueList& store, uint32_t dim, brass::Value* x, brass::Value* y,
-                                       brass::Value* z) {
-        if (!cell_coords_in_grid) return store;
-        if (dim == 1 && linear_indices.count(x)) return at_cells(store, std::max(1u, root_fn.grid_dim));
-        if (x != gx || (dim >= 2 && y != gy) || (dim >= 3 && z != gz)) return store;
-        return at_cells(store, dim);
-    }
-ValueList MirBodyLowerer::lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets) {
-        ValueList base = lower_expr(stencil);
-        auto offset = [&](size_t i) -> brass::Value* {
-            return i < offsets.size() ? lower_expr(offsets[i].get())[0] : b.build_iconst_i32(0);
-        };
-        brass::Value* x = b.build_add(gx, offset(0));
-        if (!x_interior) x = clamp_coord(x, gw);
-        brass::Value* y = (st.dimension >= 2) ? clamp_coord(b.build_add(gy, offset(1)), gh) : b.build_iconst_i32(0);
-        brass::Value* z = (st.dimension >= 3) ? clamp_coord(b.build_add(gz, offset(2)), gd) : b.build_iconst_i32(0);
-        // Clamped (or interior), a stencil read is always at a cell.
-        return load_element_from_buffer(st.element_type(), at_cells(base, st.dimension),
-                                        compute_linear_index(st.dimension, x, y, z));
-    }
-brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z) {
-        auto to_i64 = [&](brass::Value* v) -> brass::Value* {
-            return (v->type() == brass::Type::i64()) ? v : b.build_sext_i64(v);
-        };
-        brass::Value* x64 = to_i64(x);
-        if (dim == 1) return x64;
-        brass::Value* y64 = to_i64(y);
-        brass::Value* gw64 = to_i64(gw);
-        if (dim == 2) {
-            return b.build_add(b.build_mul(y64, gw64), x64);
-        }
-        brass::Value* z64 = to_i64(z);
-        brass::Value* gh64 = to_i64(gh);
-        brass::Value* zy = b.build_add(b.build_mul(z64, gh64), y64);
-        return b.build_add(b.build_mul(zy, gw64), x64);
-    }
-ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx) {
-        brass::Value* base_ptr = store[0];
-        brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
-        const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
-        const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
-        auto kinds = mod.types.flatten_scalars(elem_type);
-        ValueList res;
-        res.reserve(kinds.size());
-        if (kinds.size() == 1) {
-            brass::Type mt = to_mir_scalar_type(kinds[0]);
-            brass::Value* v = b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, bound);
-            if (kinds[0] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
-            res.push_back(v);
-            return res;
-        }
-        // Check if all leaves have identical scalar kind
-        bool uniform = true;
-        for (size_t i = 1; i < kinds.size(); ++i) {
-            if (kinds[i] != kinds[0]) { uniform = false; break; }
-        }
-        if (uniform) {
-            brass::Type mt = to_mir_scalar_type(kinds[0]);
-            uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
-            brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
-            for (size_t i = 0; i < kinds.size(); ++i) {
-                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                brass::Value* v = b.build_load_indexed(mt, base_ptr, idx_i, scale, 0, bound);
-                if (kinds[i] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
-                res.push_back(v);
-            }
-            return res;
-        }
-        // Heterogeneous struct: compute byte offset = linear_idx * elem_byte_size + leaf_off
-        uint32_t elem_bytes = mod.types.byte_size(elem_type);
-        brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
-        uint32_t cur_off = 0;
-        for (ScalarKind sk : kinds) {
-            brass::Type mt = to_mir_scalar_type(sk);
-            brass::Value* v = b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), bound);
-            if (sk == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
-            res.push_back(v);
-            cur_off += static_cast<uint32_t>(mt.size_in_bytes());
-        }
-        return res;
-    }
-void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx,
-                                 const ValueList& vals) {
-        brass::Value* base_ptr = store[0];
-        brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
-        const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
-        const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
-        auto kinds = mod.types.flatten_scalars(elem_type);
-        auto norm_bool = [&](ScalarKind sk, brass::Value* v) -> brass::Value* {
-            return (sk == ScalarKind::Bool && b.vector_mode()) ? b.build_and(v, b.build_iconst_i32(1)) : v;
-        };
-        if (kinds.size() == 1 && !vals.empty()) {
-            brass::Type mt = to_mir_scalar_type(kinds[0]);
-            b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, norm_bool(kinds[0], vals[0]), bound);
-            return;
-        }
-        bool uniform = true;
-        for (size_t i = 1; i < kinds.size(); ++i) {
-            if (kinds[i] != kinds[0]) { uniform = false; break; }
-        }
-        if (uniform) {
-            brass::Type mt = to_mir_scalar_type(kinds[0]);
-            uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
-            brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
-            for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
-                brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
-                b.build_store_indexed(mt, base_ptr, idx_i, scale, 0, norm_bool(kinds[i], vals[i]), bound);
-            }
-            return;
-        }
-        uint32_t elem_bytes = mod.types.byte_size(elem_type);
-        brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
-        uint32_t cur_off = 0;
-        for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
-            brass::Type mt = to_mir_scalar_type(kinds[i]);
-            b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), norm_bool(kinds[i], vals[i]), bound);
-            cur_off += static_cast<uint32_t>(mt.size_in_bytes());
-        }
-    }
-brass::Value* MirBodyLowerer::lower_scalar_cast(brass::Value* v, ScalarKind from_sk, ScalarKind to_sk) {
-        if (from_sk == to_sk) return v;
-        if (to_sk == ScalarKind::Bool) {
-            if (from_sk == ScalarKind::F32) return b.build_ne(v, b.build_fconst_f32(0.0f));
-            if (from_sk == ScalarKind::F64) return b.build_ne(v, b.build_fconst_f64(0.0));
-            if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_ne(v, b.build_iconst_i64(0));
-            return b.build_ne(v, b.build_iconst_i32(0));
-        }
-        if (from_sk == ScalarKind::Bool && b.vector_mode()) {
-            v = b.build_and(v, b.build_iconst_i32(1));
-        }
-        if (to_sk == ScalarKind::F32) {
-            if (from_sk == ScalarKind::F64) return b.build_fptrunc_f32_f64(v);
-            if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f32_i64(v);
-            return b.build_sitofp_f32_i32(v);
-        }
-        if (to_sk == ScalarKind::F64) {
-            if (from_sk == ScalarKind::F32) return b.build_fpext_f64_f32(v);
-            if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f64_i64(v);
-            return b.build_sitofp_f64_i32(v);
-        }
-        if (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64) {
-            if (from_sk == ScalarKind::F32) return b.build_fptosi_i64_f32(v);
-            if (from_sk == ScalarKind::F64) return b.build_fptosi_i64(v);
-            if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return v;
-            return (from_sk == ScalarKind::U32 || from_sk == ScalarKind::Bool) ? b.build_zext_i64(v) : b.build_sext_i64(v);
-        }
-        // Target is I32 or U32
-        if (from_sk == ScalarKind::F32) return b.build_fptosi_i32_f32(v);
-        if (from_sk == ScalarKind::F64) return b.build_fptosi_i32(v);
-        if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_trunc_i32(v);
-        return v;
-    }
-brass::Value* MirBodyLowerer::lower_scalar_binary(BinaryOp op, brass::Value* l, brass::Value* r, ScalarKind sk) {
-        bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
-        bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
-        switch (op) {
-            case BinaryOp::Add: return b.build_add(l, r);
-            case BinaryOp::Sub: return b.build_sub(l, r);
-            case BinaryOp::Mul: return b.build_mul(l, r);
-            case BinaryOp::Div:
-                if (is_fp) return b.build_sdiv(l, r);
-                return is_unsigned ? b.build_udiv(l, r) : b.build_sdiv(l, r);
-            case BinaryOp::Mod:
-                if (is_fp) {
-                    // x - y * floor(x / y) for well-defined GLSL/SPIR-V/CPU parity
-                    brass::Value* q = b.build_floor(b.build_sdiv(l, r));
-                    return b.build_sub(l, b.build_mul(r, q));
-                }
-                return is_unsigned ? b.build_umod(l, r) : b.build_smod(l, r);
-            case BinaryOp::BitAnd:
-            case BinaryOp::LogAnd: return b.build_and(l, r);
-            case BinaryOp::BitOr:
-            case BinaryOp::LogOr:  return b.build_or(l, r);
-            case BinaryOp::BitXor: return b.build_xor(l, r);
-            case BinaryOp::Shl:    return b.build_shl(l, r);
-            case BinaryOp::Shr:    return is_unsigned ? b.build_lshr(l, r) : b.build_ashr(l, r);
-            case BinaryOp::Eq:     return b.build_eq(l, r);
-            case BinaryOp::Ne:     return b.build_ne(l, r);
-            case BinaryOp::Lt:     return (!is_fp && is_unsigned) ? b.build_ult(l, r) : b.build_slt(l, r);
-            case BinaryOp::Le:     return (!is_fp && is_unsigned) ? b.build_ule(l, r) : b.build_sle(l, r);
-            case BinaryOp::Gt:     return (!is_fp && is_unsigned) ? b.build_ugt(l, r) : b.build_sgt(l, r);
-            case BinaryOp::Ge:     return (!is_fp && is_unsigned) ? b.build_uge(l, r) : b.build_sge(l, r);
-        }
-        return l;
-    }
-brass::Value* MirBodyLowerer::lower_native_math_1(const std::string& name, brass::Value* x) {
-    static const char* const kNative[][2] = {
-        {"sin", "sinf"}, {"cos", "cosf"}, {"tan", "tanf"}, {"asin", "asinf"}, {"acos", "acosf"},
-        {"atan", "atanf"}, {"sinh", "sinhf"}, {"cosh", "coshf"}, {"tanh", "tanhf"},
-        {"exp", "expf"}, {"exp2", "ex2f"}, {"log", "logf"}, {"log2", "lg2f"},
-    };
-    for (const auto& n : kNative) {
-        if (name == n[0]) return b.build_call(n[1], brass::Type::f32(), {x});
-    }
-    return nullptr;
-}
-brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass::Value* x, ScalarKind sk) {
-        bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
-        brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0)
-                             : (sk == ScalarKind::F32) ? b.build_fconst_f32(0.0f)
-                             : (sk == ScalarKind::I64 || sk == ScalarKind::U64) ? b.build_iconst_i64(0)
-                                                                                : b.build_iconst_i32(0);
-        brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0)
-                            : (sk == ScalarKind::F32) ? b.build_fconst_f32(1.0f)
-                            : (sk == ScalarKind::I64 || sk == ScalarKind::U64) ? b.build_iconst_i64(1)
-                                                                               : b.build_iconst_i32(1);
-        if (name == "abs") {
-            if (is_fp) return b.build_fabs(x);
-            return b.build_select(b.build_slt(x, zero), b.build_neg(x), x);
-        }
-        if (name == "sign") {
-            brass::Value* neg_one = b.build_neg(one);
-            return b.build_select(b.build_sgt(x, zero), one, b.build_select(b.build_slt(x, zero), neg_one, zero));
-        }
-        if (name == "sqrt") return b.build_sqrt(x);
-        if (name == "rsqrt" || name == "inversesqrt") return b.build_sdiv(one, b.build_sqrt(x));
-        if (name == "floor") return b.build_floor(x);
-        if (name == "ceil") return b.build_ceil(x);
-        if (name == "round") return b.build_round(x);
-        if (name == "trunc") {
-            return b.build_select(b.build_sge(x, zero), b.build_floor(x), b.build_ceil(x));
-        }
-        if (name == "fract") return b.build_sub(x, b.build_floor(x));
-        if (name == "saturate") return b.build_fmin(b.build_fmax(x, zero), one);
-        if (name == "degrees") {
-            constexpr double kRadToDeg = 57.2957795130823208768;
-            brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kRadToDeg) : b.build_fconst_f32(static_cast<float>(kRadToDeg));
-            return b.build_mul(x, c);
-        }
-        if (name == "radians") {
-            constexpr double kDegToRad = 0.017453292519943295769;
-            brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kDegToRad) : b.build_fconst_f32(static_cast<float>(kDegToRad));
-            return b.build_mul(x, c);
-        }
-        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) {
-            if (brass::Value* t = lower_native_math_1(name, x)) return t;
-        }
-        if (brass::Value* t = lower_transcendental_1(b, name, x, sk)) return t;
-        if (name == "dpdx" || name == "dpdy" || name == "fwidth") {
-            // Fragment-only (sema), and fragments have no CPU build.
-            return b.build_call("spirv_" + name + "_f32", brass::Type::f32(), {x});
-        }
-        if (name == "subgroup_broadcast_first" || name == "subgroup_add" || name == "subgroup_min" ||
-            name == "subgroup_max") {
-            // The CPU's subgroup is one invocation: every reduction is the value itself.
-            if (!is_gpu) return x;
-            return b.build_call("spirv_" + name + (sk == ScalarKind::F32 ? "_f32" : "_i32"), to_mir_scalar_type(sk), {x});
-        }
-        if (name == "subgroup_all" || name == "subgroup_any") {
-            if (!is_gpu) return b.build_ne(x, b.build_iconst_i32(0));
-            return b.build_call("spirv_" + name, brass::Type::i32(), {x});
-        }
-        if (name == "isnan" || name == "isinf") return lower_float_class(b, name, x, sk);
-        diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
-        return x;
-    }
-brass::Value* MirBodyLowerer::lower_scalar_math_2(const std::string& name, brass::Value* a, brass::Value* c, ScalarKind sk) {
-        bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
-        bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
-        if (name == "min") {
-            if (is_fp) return b.build_fmin(a, c);
-            return b.build_select(is_unsigned ? b.build_ult(a, c) : b.build_slt(a, c), a, c);
-        }
-        if (name == "max") {
-            if (is_fp) return b.build_fmax(a, c);
-            return b.build_select(is_unsigned ? b.build_ugt(a, c) : b.build_sgt(a, c), a, c);
-        }
-        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32 && (name == "pow" || name == "atan2")) {
-            return b.build_call(name == "pow" ? "powf" : "atan2f", brass::Type::f32(), {a, c});
-        }
-        if (brass::Value* t = lower_transcendental_2(b, name, a, c, sk)) return t;
-        if (name == "step") {
-            brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
-            brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0) : b.build_fconst_f32(1.0f);
-            return b.build_select(b.build_slt(c, a), zero, one);
-        }
-        if (name == "mod") {
-            brass::Value* q = b.build_floor(b.build_sdiv(a, c));
-            return b.build_sub(a, b.build_mul(c, q));
-        }
-        if (name == "fmod") {
-            if (!is_fp) return is_unsigned ? b.build_umod(a, c) : b.build_smod(a, c);
-            // C fmod: x - y trunc(x / y), the sign of x.
-            brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
-            brass::Value* q = b.build_sdiv(a, c);
-            q = b.build_select(b.build_sge(q, zero), b.build_floor(q), b.build_ceil(q));
-            return b.build_sub(a, b.build_mul(c, q));
-        }
-        diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
-        return a;
-    }
-brass::Value* MirBodyLowerer::lower_scalar_math_3(const std::string& name, brass::Value* x, brass::Value* y, brass::Value* z, ScalarKind sk) {
-        bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
-        if (name == "clamp") {
-            if (is_fp) return b.build_fmin(b.build_fmax(x, y), z);
-            bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
-            brass::Value* lo = b.build_select(is_unsigned ? b.build_ult(x, y) : b.build_slt(x, y), y, x);
-            return b.build_select(is_unsigned ? b.build_ugt(lo, z) : b.build_sgt(lo, z), z, lo);
-        }
-        if (name == "mix" || name == "lerp") {
-            return b.build_add(x, b.build_mul(b.build_sub(y, x), z));
-        }
-        if (name == "fma") {
-            if (is_fp) return b.build_fma(x, y, z);
-            return b.build_add(b.build_mul(x, y), z);
-        }
-        if (name == "smoothstep") {
-            brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
-            brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0) : b.build_fconst_f32(1.0f);
-            brass::Value* two = (sk == ScalarKind::F64) ? b.build_fconst_f64(2.0) : b.build_fconst_f32(2.0f);
-            brass::Value* three = (sk == ScalarKind::F64) ? b.build_fconst_f64(3.0) : b.build_fconst_f32(3.0f);
-            brass::Value* raw = b.build_sdiv(b.build_sub(z, x), b.build_sub(y, x));
-            brass::Value* t = b.build_fmin(b.build_fmax(raw, zero), one);
-            brass::Value* tt = b.build_mul(t, t);
-            return b.build_mul(tt, b.build_sub(three, b.build_mul(two, t)));
-        }
-        diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
-        return x;
-    }
 ValueList MirBodyLowerer::lower_inlined_call(
     const CheckedFunction& callee,
     const std::vector<ValueList>& arg_vals,
@@ -440,12 +108,14 @@ ValueList MirBodyLowerer::lower_inlined_call(
     int saved_has_ret = has_returned_var_id;
     int saved_ret_val = ret_val_var_id;
     Type saved_ret_type = active_return_type;
+    std::string saved_fn_name = active_fn_name;
     auto saved_scopes = std::move(scopes);
     auto saved_loops = std::move(loop_stack);
     scopes.clear();
     loop_stack.clear();
     push_scope();
     active_return_type = callee.return_type;
+    active_fn_name = callee.name;
     has_returned_var_id = alloc_var("__callee_has_ret", {b.build_iconst_i32(0)});
     if (!callee.return_type.is_void()) {
         ret_val_var_id = alloc_var("__callee_ret_val", make_zero_leaves(callee.return_type));
@@ -471,6 +141,7 @@ ValueList MirBodyLowerer::lower_inlined_call(
     has_returned_var_id = saved_has_ret;
     ret_val_var_id = saved_ret_val;
     active_return_type = saved_ret_type;
+    active_fn_name = std::move(saved_fn_name);
     return result;
 }
 ValueList MirBodyLowerer::lower_expr(const Expr* e) {
@@ -492,6 +163,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         case Expr::Kind::BoolLit:
             return {e->bool_val ? b.true_value() : b.build_iconst_i32(0)};
         case Expr::Kind::Ident: {
+            if (auto v = try_shared_read(e)) return *v;
             if (e->global_index >= 0) return global_value(e);
             if (auto v = try_block_read(e)) return *v;
             int id = lookup_var_id(e->name);
@@ -499,6 +171,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return make_zero_leaves(e->resolved_type);
         }
         case Expr::Kind::Path:
+            if (auto v = try_shared_read(e)) return *v;
             if (e->global_index >= 0) return global_value(e);
             return make_zero_leaves(e->resolved_type);
         case Expr::Kind::Unary: {
@@ -584,6 +257,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::Field: {
             if (auto v = try_block_read(e)) return *v;
+            if (auto v = try_shared_read(e)) return *v;
             ValueList recv = lower_expr(e->lhs.get());
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_scalar()) return recv;
@@ -613,6 +287,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::Index: {
             if (auto v = try_block_read(e)) return *v;
+            if (auto v = try_shared_read(e)) return *v;
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_store()) {
@@ -709,10 +384,39 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList base = lower_expr(e->lhs.get());
                 auto found = base.empty() ? block_param.end() : block_param.find(base[0]);
                 if (found == block_param.end()) return {b.build_iconst_i32(0)};
+                used_block_params.insert(found->second);
+                if (!is_gpu) {
+                    auto it = cpu_block_ptrs.find(found->second);
+                    if (it == cpu_block_ptrs.end()) return {b.build_iconst_i32(0)};
+                    const uint32_t stride = std::max(4u, block_stride(rt.element_type(), false));
+                    return {b.build_trunc_i32(b.build_udiv(it->second.second, b.build_iconst_i64(stride)))};
+                }
                 const CheckedParam& p = bound_param(found->second);
                 const uint32_t words = std::max(1u, block_stride(rt.element_type(), false) / 4);
                 brass::Value* n = kb.buffer_length(p.descriptor_set, p.descriptor_binding);
                 return {words == 1 ? n : b.build_udiv(n, b.build_iconst_i32(static_cast<int32_t>(words)))};
+            }
+            if (m.rfind("atomic_", 0) == 0 && is_block_path(e->lhs.get())) {
+                BlockPlace bp;
+                if (!block_place(e->lhs.get(), bp)) {
+                    diags.error(e->span, "this atomic access to a buffer is not a path of fields, indices and swizzles");
+                    return make_zero_leaves(e->resolved_type);
+                }
+                std::vector<ValueList> avs;
+                avs.reserve(e->args.size());
+                for (const auto& a : e->args) avs.push_back(lower_expr(a.get()));
+                return block_atomic(e, bp, m, avs);
+            }
+            if (m.rfind("atomic_", 0) == 0 && is_shared_path(e->lhs.get())) {
+                SharedPlace sp;
+                if (!shared_place(e->lhs.get(), sp)) {
+                    diags.error(e->span, "this atomic access to shared memory is not a path of fields, indices and swizzles");
+                    return make_zero_leaves(e->resolved_type);
+                }
+                std::vector<ValueList> avs;
+                avs.reserve(e->args.size());
+                for (const auto& a : e->args) avs.push_back(lower_expr(a.get()));
+                return shared_atomic(e, sp, m, avs);
             }
             if (rt.is_store()) {
                 ValueList base = lower_expr(e->lhs.get());
@@ -744,11 +448,14 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                     store_element_to_buffer(elem_t, store_access(base, dim, x[0], y[0], z[0]), lin, val);
                     return {};
                 }
-                if (m == "atomic_add" || m == "atomic_min" || m == "atomic_max" || m == "atomic_exchange") {
+                if (m.rfind("atomic_", 0) == 0) {
                     ValueList x = dim >= 1 ? lower_expr(e->args[0].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList y = dim >= 2 ? lower_expr(e->args[1].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList z = dim >= 3 ? lower_expr(e->args[2].get()) : ValueList{b.build_iconst_i32(0)};
                     ValueList val = lower_expr(e->args[dim].get());
+                    ValueList val2 = (m == "atomic_cas" && e->args.size() > dim + 1)
+                                         ? lower_expr(e->args[dim + 1].get())
+                                         : ValueList{};
                     brass::Value* lin = compute_linear_index(dim, x[0], y[0], z[0]);
                     base = store_access(base, dim, x[0], y[0], z[0]);
                     if (is_gpu) {
@@ -767,12 +474,23 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                             if (m == "atomic_max") {
                                 return elem_t.is_u32() ? kb.atom_max_u32(addr, val[0]) : kb.atom_max_i32(addr, val[0]);
                             }
+                            if (m == "atomic_or") {
+                                return elem_t.is_u32() ? kb.atom_or_u32(addr, val[0]) : kb.atom_or_i32(addr, val[0]);
+                            }
+                            if (m == "atomic_and") {
+                                return elem_t.is_u32() ? kb.atom_and_u32(addr, val[0]) : kb.atom_and_i32(addr, val[0]);
+                            }
+                            if (m == "atomic_xor") {
+                                return elem_t.is_u32() ? kb.atom_xor_u32(addr, val[0]) : kb.atom_xor_i32(addr, val[0]);
+                            }
+                            if (m == "atomic_cas") {
+                                return elem_t.is_u32() ? kb.atom_cas_u32(addr, val[0], val2[0])
+                                                       : kb.atom_cas_i32(addr, val[0], val2[0]);
+                            }
                             if (elem_t.is_f32()) return kb.atom_exch_f32(addr, val[0]);
                             return elem_t.is_u32() ? kb.atom_exch_u32(addr, val[0]) : kb.atom_exch_i32(addr, val[0]);
                         };
                         if (base.size() < 2) return {atomic()};
-                        // Bounded: outside the store the atomic does nothing
-                        // and returns zero, as a load there reads it.
                         brass::BasicBlock* atom_bb = b.side_block("bounded_atomic");
                         brass::BasicBlock* done_bb = b.side_block("bounded_atomic_done");
                         brass::Value* old = b.add_block_param(done_bb, to_mir_scalar_type(elem_t.scalar));
@@ -789,8 +507,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                         const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
                         brass::Builder& sb = b.builder();
                         bool is_u = elem_t.is_u32();
+                        brass::Value* rmw_val = (m == "atomic_cas") ? val2[0] : val[0];
+                        brass::Value* cmp_val = (m == "atomic_cas") ? val[0] : nullptr;
+                        if (cmp_val && b.vector_mode() && Ops::is_varying(cmp_val)) {
+                            throw VectorUnsupported("varying atomic_cas");
+                        }
                         brass::Value* old_v = b.build_atomic_rmw(
-                            mt, base[0], idx64, static_cast<uint8_t>(mt.size_in_bytes()), val[0], bound,
+                            mt, base[0], idx64, static_cast<uint8_t>(mt.size_in_bytes()), rmw_val, bound,
                             [&](brass::Value* cur, brass::Value* v) -> brass::Value* {
                                 if (m == "atomic_add") return sb.build_add(cur, v);
                                 if (m == "atomic_min") {
@@ -799,6 +522,10 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                                 if (m == "atomic_max") {
                                     return sb.build_select(is_u ? sb.build_ugt(cur, v) : sb.build_sgt(cur, v), cur, v);
                                 }
+                                if (m == "atomic_or") return sb.build_or(cur, v);
+                                if (m == "atomic_and") return sb.build_and(cur, v);
+                                if (m == "atomic_xor") return sb.build_xor(cur, v);
+                                if (m == "atomic_cas") return sb.build_select(sb.build_eq(cur, cmp_val), v, cur);
                                 return v;
                             });
                         return {old_v};
@@ -940,22 +667,61 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 if (e->resolved_type.dimension == 2) return {uv_comp(gx, gw), uv_comp(gy, gh)};
                 return {uv_comp(gx, gw), uv_comp(gy, gh), uv_comp(gz, gd)};
             }
-            if (n == "thread_id_x" || n == "local_id_x") return {is_gpu ? kb.tid_x() : b.build_iconst_i32(0)};
-            if (n == "thread_id_y" || n == "local_id_y") return {is_gpu ? kb.tid_y() : b.build_iconst_i32(0)};
-            if (n == "thread_id_z" || n == "local_id_z") return {is_gpu ? kb.tid_z() : b.build_iconst_i32(0)};
-            if (n == "group_id_x") return {is_gpu ? kb.ctaid_x() : b.build_iconst_i32(0)};
-            if (n == "group_id_y") return {is_gpu ? kb.ctaid_y() : b.build_iconst_i32(0)};
-            if (n == "group_id_z") return {is_gpu ? kb.ctaid_z() : b.build_iconst_i32(0)};
-            if (n == "global_id_x") return {gx ? gx : (is_gpu ? kb.global_tid_x() : b.build_iconst_i32(0))};
-            if (n == "global_id_y") return {gy ? gy : b.build_iconst_i32(0)};
-            if (n == "global_id_z") return {gz ? gz : b.build_iconst_i32(0)};
-            if (n == "workgroup_size_x") return {is_gpu ? kb.ntid_x() : b.build_iconst_i32(1)};
-            if (n == "workgroup_size_y") return {is_gpu ? kb.ntid_y() : b.build_iconst_i32(1)};
-            if (n == "workgroup_size_z") return {is_gpu ? kb.ntid_z() : b.build_iconst_i32(1)};
+            auto get_lid_x = [&] { return is_gpu ? kb.tid_x() : (lid_x ? lid_x : b.build_iconst_i32(0)); };
+            auto get_lid_y = [&] { return is_gpu ? kb.tid_y() : (lid_y ? lid_y : b.build_iconst_i32(0)); };
+            auto get_lid_z = [&] { return is_gpu ? kb.tid_z() : (lid_z ? lid_z : b.build_iconst_i32(0)); };
+            auto get_wgid_x = [&] { return is_gpu ? kb.ctaid_x() : (wgid_x ? wgid_x : b.build_iconst_i32(0)); };
+            auto get_wgid_y = [&] { return is_gpu ? kb.ctaid_y() : (wgid_y ? wgid_y : b.build_iconst_i32(0)); };
+            auto get_wgid_z = [&] { return is_gpu ? kb.ctaid_z() : (wgid_z ? wgid_z : b.build_iconst_i32(0)); };
+            auto get_nwg_x = [&] { return is_gpu ? kb.nctaid_x() : (nwg_x ? nwg_x : b.build_iconst_i32(1)); };
+            auto get_nwg_y = [&] { return is_gpu ? kb.nctaid_y() : (nwg_y ? nwg_y : b.build_iconst_i32(1)); };
+            auto get_nwg_z = [&] { return is_gpu ? kb.nctaid_z() : (nwg_z ? nwg_z : b.build_iconst_i32(1)); };
+            auto get_lsz_x = [&] { return is_gpu ? kb.ntid_x() : (lsz_x ? lsz_x : b.build_iconst_i32(1)); };
+            auto get_lsz_y = [&] { return is_gpu ? kb.ntid_y() : (lsz_y ? lsz_y : b.build_iconst_i32(1)); };
+            auto get_lsz_z = [&] { return is_gpu ? kb.ntid_z() : (lsz_z ? lsz_z : b.build_iconst_i32(1)); };
+            auto get_gid_x = [&] { return gx ? gx : (is_gpu ? kb.global_tid_x() : b.build_iconst_i32(0)); };
+            auto get_gid_y = [&] {
+                if (is_gpu && root_fn.grid_dim < 2) return b.build_add(b.build_mul(kb.ctaid_y(), kb.ntid_y()), kb.tid_y());
+                return gy ? gy : b.build_iconst_i32(0);
+            };
+            auto get_gid_z = [&] {
+                if (is_gpu && root_fn.grid_dim < 3) return b.build_add(b.build_mul(kb.ctaid_z(), kb.ntid_z()), kb.tid_z());
+                return gz ? gz : b.build_iconst_i32(0);
+            };
+            if (n == "thread_id_x" || n == "local_id_x") return {get_lid_x()};
+            if (n == "thread_id_y" || n == "local_id_y") return {get_lid_y()};
+            if (n == "thread_id_z" || n == "local_id_z") return {get_lid_z()};
+            if (n == "local_id" || n == "thread_id") return {get_lid_x(), get_lid_y(), get_lid_z()};
+            if (n == "group_id_x" || n == "workgroup_id_x") return {get_wgid_x()};
+            if (n == "group_id_y" || n == "workgroup_id_y") return {get_wgid_y()};
+            if (n == "group_id_z" || n == "workgroup_id_z") return {get_wgid_z()};
+            if (n == "workgroup_id" || n == "group_id") return {get_wgid_x(), get_wgid_y(), get_wgid_z()};
+            if (n == "num_workgroups_x") return {get_nwg_x()};
+            if (n == "num_workgroups_y") return {get_nwg_y()};
+            if (n == "num_workgroups_z") return {get_nwg_z()};
+            if (n == "num_workgroups") return {get_nwg_x(), get_nwg_y(), get_nwg_z()};
+            if (n == "global_id_x") return {get_gid_x()};
+            if (n == "global_id_y") return {get_gid_y()};
+            if (n == "global_id_z") return {get_gid_z()};
+            if (n == "global_id") return {get_gid_x(), get_gid_y(), get_gid_z()};
+            if (n == "workgroup_size_x") return {get_lsz_x()};
+            if (n == "workgroup_size_y") return {get_lsz_y()};
+            if (n == "workgroup_size_z") return {get_lsz_z()};
+            if (n == "workgroup_size") return {get_lsz_x(), get_lsz_y(), get_lsz_z()};
+            if (n == "local_invocation_index" || n == "local_index") {
+                brass::Value* sx = get_lsz_x();
+                brass::Value* sy = get_lsz_y();
+                brass::Value* xy = b.build_add(get_lid_x(), b.build_mul(get_lid_y(), sx));
+                return {b.build_add(xy, b.build_mul(get_lid_z(), b.build_mul(sx, sy)))};
+            }
             if (n == "subgroup_size") return {is_gpu ? b.build_call("spirv_subgroup_size", brass::Type::i32()) : b.build_iconst_i32(1)};
             if (n == "subgroup_invocation_id") return {is_gpu ? b.build_call("spirv_subgroup_local_id", brass::Type::i32()) : b.build_iconst_i32(0)};
             if (n == "workgroup_barrier" || n == "storage_barrier" || n == "barrier") {
-                if (is_gpu) kb.sync();
+                if (is_gpu) {
+                    kb.sync();
+                } else if (cpu_barrier_fn && cpu_barrier_ctx) {
+                    b.builder().build_call_indirect(cpu_barrier_fn, brass::Type::void_type(), {cpu_barrier_ctx});
+                }
                 return {};
             }
             // Vertex & Fragment intrinsics

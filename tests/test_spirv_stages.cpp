@@ -748,6 +748,186 @@ static void test_const_pruning() {
     assert(has_depth_replacing(indirect->spirv_disassembly));
 }
 
+static void test_compute_shared_and_atomics() {
+    // 1. Histogram kernel: module-level shared bins, shared atomic_add,
+    // workgroup_barrier(), buffer atomic_add, and num_workgroups().
+    const char* hist_src = R"(
+        @binding(0, 0) var samples: read_buffer<u32>;
+        @binding(0, 1) var hist_out: buffer<u32>;
+        shared bins: array<u32, 16>;
+        shared wg_done: bool;
+
+        @compute @workgroup_size(64, 1, 1)
+        fn histogram() {
+            let lid: u32 = u32(local_id_x());
+            let gid: u32 = u32(global_id_x());
+            if (lid < 16u) {
+                bins[lid] = 0u;
+            }
+            if (lid == 0u) {
+                wg_done = false;
+            }
+            workgroup_barrier();
+
+            let n: u32 = u32(samples.len());
+            if (gid < n) {
+                let b: u32 = samples[gid] & 15u;
+                bins.atomic_add(b, 1u);
+            }
+            workgroup_barrier();
+
+            if (lid == 0u) {
+                wg_done = true;
+            }
+            workgroup_barrier();
+
+            if (wg_done && lid < 16u) {
+                hist_out.atomic_add(lid, bins[lid]);
+            }
+            if (gid == 0u) {
+                hist_out[16] = u32(num_workgroups().x);
+            }
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto hist_res = compile_source(hist_src, "histogram.bk", opts);
+    if (!hist_res.ok) std::cerr << hist_res.error_message() << "\n";
+    assert(hist_res.ok);
+    require_valid(hist_res);
+    const CompiledKernel* hist_k = hist_res.find_kernel("histogram");
+    assert(hist_k && hist_k->has_cpu_build());
+
+    std::vector<uint32_t> samples_data(256);
+    std::vector<uint32_t> expected_hist(17, 0);
+    for (uint32_t i = 0; i < 256; ++i) {
+        samples_data[i] = (i * 7u + 3u) & 15u;
+        expected_hist[samples_data[i]] += 1;
+    }
+    expected_hist[16] = 4; // 256 / 64 = 4 workgroups
+    std::vector<uint32_t> hist_out(17, 0);
+    std::vector<KernelArg> hist_args = {
+        KernelArg::buffer(static_cast<const void*>(samples_data.data()), samples_data.size() * sizeof(uint32_t)),
+        KernelArg::buffer(hist_out.data(), hist_out.size() * sizeof(uint32_t)),
+    };
+    if (brass::gpu::vulkan_available()) {
+        auto rep = hist_k->compare_cpu_gpu(GridShape(256, 1, 1), hist_args);
+        if (!rep.ok) std::cerr << "histogram parity: " << rep.message << "\n";
+        assert(rep.ok);
+        for (size_t i = 0; i < 17; ++i) {
+            assert(hist_out[i] == expected_hist[i]);
+        }
+    }
+
+    // 2. Bitset atomic_or (shadow_mark style) plus atomic_and, atomic_xor,
+    // atomic_min, atomic_max, atomic_exchange, atomic_cas on @binding buffer<u32>.
+    const char* bit_src = R"(
+        @binding(0, 0) var tile_indices: read_buffer<u32>;
+        @binding(0, 1) var bitset: buffer<u32>;
+        @binding(0, 2) var stats: buffer<u32>;
+
+        @compute @workgroup_size(64, 1, 1)
+        fn mark_bits() {
+            let gid: u32 = u32(global_id_x());
+            if (gid < u32(tile_indices.len())) {
+                let tile: u32 = tile_indices[gid];
+                let word: u32 = tile >> 5u;
+                let mask: u32 = 1u << (tile & 31u);
+                bitset.atomic_or(word, mask);
+                stats.atomic_min(0, tile);
+                stats.atomic_max(1, tile);
+                stats.atomic_xor(2, tile);
+                stats.atomic_and(3, tile | 0xFFFFFF00u);
+            }
+            if (gid == 0u) {
+                stats.atomic_exchange(4, 42u);
+                stats.atomic_cas(5, 0u, 99u);
+            }
+        }
+    )";
+    auto bit_res = compile_source(bit_src, "bitset.bk", opts);
+    if (!bit_res.ok) std::cerr << bit_res.error_message() << "\n";
+    assert(bit_res.ok);
+    require_valid(bit_res);
+    const CompiledKernel* bit_k = bit_res.find_kernel("mark_bits");
+    assert(bit_k && bit_k->has_cpu_build());
+
+    std::vector<uint32_t> tiles(128);
+    std::vector<uint32_t> expected_bits(8, 0);
+    for (uint32_t i = 0; i < 128; ++i) {
+        tiles[i] = (i * 3u + 5u) & 255u;
+        expected_bits[tiles[i] >> 5u] |= (1u << (tiles[i] & 31u));
+    }
+    std::vector<uint32_t> bitset_out(8, 0);
+    std::vector<uint32_t> stats_out = {0xFFFFFFFFu, 0u, 0u, 0xFFFFFFFFu, 0u, 0u};
+    std::vector<KernelArg> bit_args = {
+        KernelArg::buffer(static_cast<const void*>(tiles.data()), tiles.size() * sizeof(uint32_t)),
+        KernelArg::buffer(bitset_out.data(), bitset_out.size() * sizeof(uint32_t)),
+        KernelArg::buffer(stats_out.data(), stats_out.size() * sizeof(uint32_t)),
+    };
+    if (brass::gpu::vulkan_available()) {
+        auto rep = bit_k->compare_cpu_gpu(GridShape(128, 1, 1), bit_args);
+        if (!rep.ok) std::cerr << "bitset parity: " << rep.message << "\n";
+        assert(rep.ok);
+        for (size_t i = 0; i < 8; ++i) {
+            assert(bitset_out[i] == expected_bits[i]);
+        }
+        assert(stats_out[4] == 42u && stats_out[5] == 99u);
+    }
+
+    // 3. 2D shared workgroup array: `shared c: array<array<vec3f, 64>, 6>`
+    // (atmosphere_skylight tree reduction).
+    const char* sky_src = R"(
+        @binding(0, 0) var sh_out: buffer<vec4f>;
+
+        @compute @workgroup_size(8, 8, 1)
+        fn reduce_skylight() {
+            shared c: array<array<vec3f, 64>, 6>;
+            let i: i32 = local_invocation_index();
+            for (var k: i32 = 0; k < 6; k += 1) {
+                c[k][i] = vec3f(f32(k + 1), f32(i), f32(k * 2 + 1));
+            }
+            workgroup_barrier();
+
+            var s: i32 = 32;
+            while (s > 0) {
+                if (i < s) {
+                    for (var k: i32 = 0; k < 6; k += 1) {
+                        c[k][i] = c[k][i] + c[k][i + s];
+                    }
+                }
+                workgroup_barrier();
+                s = s >> 1;
+            }
+            if (i < 6) {
+                sh_out[i] = vec4f(c[i][0], 1.0);
+            }
+        }
+    )";
+    auto sky_res = compile_source(sky_src, "skylight.bk", opts);
+    if (!sky_res.ok) std::cerr << sky_res.error_message() << "\n";
+    assert(sky_res.ok);
+    require_valid(sky_res);
+    const CompiledKernel* sky_k = sky_res.find_kernel("reduce_skylight");
+    assert(sky_k && sky_k->has_cpu_build());
+
+    std::vector<float> sh_out(6 * 4, 0.0f);
+    std::vector<KernelArg> sky_args = {
+        KernelArg::buffer(sh_out.data(), sh_out.size() * sizeof(float)),
+    };
+    if (brass::gpu::vulkan_available()) {
+        auto rep = sky_k->compare_cpu_gpu(GridShape(8, 8, 1), sky_args);
+        if (!rep.ok) std::cerr << "skylight parity: " << rep.message << "\n";
+        assert(rep.ok);
+        for (int k = 0; k < 6; ++k) {
+            assert(sh_out[k * 4 + 0] == float((k + 1) * 64));
+            assert(sh_out[k * 4 + 1] == float(63 * 64 / 2));
+            assert(sh_out[k * 4 + 2] == float((k * 2 + 1) * 64));
+            assert(sh_out[k * 4 + 3] == 1.0f);
+        }
+    }
+}
+
 int main() {
     test_compute_spirv_and_ptx();
     test_vertex_stage_spirv();
@@ -759,6 +939,7 @@ int main() {
     test_separate_samplers();
     test_module_resources();
     test_const_pruning();
+    test_compute_shared_and_atomics();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

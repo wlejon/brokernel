@@ -116,6 +116,8 @@ bool Type::operator==(const Type& o) const noexcept {
         case TypeKind::Vector:
             return scalar == o.scalar && dimension == o.dimension;
         case TypeKind::Array:
+            if (static_cast<bool>(nested_elem) != static_cast<bool>(o.nested_elem)) return false;
+            if (nested_elem && *nested_elem != *o.nested_elem) return false;
             return scalar == o.scalar && dimension == o.dimension &&
                    elem_kind == o.elem_kind && elem_lanes == o.elem_lanes &&
                    struct_id == o.struct_id;
@@ -138,6 +140,8 @@ bool Type::operator==(const Type& o) const noexcept {
                    elem_kind == o.elem_kind && elem_lanes == o.elem_lanes && image_flags == o.image_flags;
         case TypeKind::Uniform:
         case TypeKind::Buffer:
+            if (static_cast<bool>(nested_elem) != static_cast<bool>(o.nested_elem)) return false;
+            if (nested_elem && *nested_elem != *o.nested_elem) return false;
             return scalar == o.scalar && access == o.access && elem_kind == o.elem_kind &&
                    elem_lanes == o.elem_lanes && struct_id == o.struct_id;
     }

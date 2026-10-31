@@ -43,6 +43,7 @@ enum class TokenKind : uint8_t {
     KwReturn,
     KwTrue,
     KwFalse,
+    KwShared,
 
     // Punctuation & operators
     At,          // @
@@ -262,6 +263,7 @@ struct Stmt {
     TypeExprPtr var_type;
     ExprPtr init_expr;
     Type resolved_var_type;
+    bool is_shared = false;
 
     // Assign
     ExprPtr assign_target;
@@ -360,6 +362,7 @@ struct FnDecl {
 struct BindingDecl {
     SourceSpan span;
     bool is_pub = true;
+    bool is_shared = false;
     std::vector<Attribute> attributes;
     std::string name;
     TypeExprPtr type;

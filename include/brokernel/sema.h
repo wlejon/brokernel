@@ -47,13 +47,14 @@ enum class ParamRole : uint8_t {
     StageInput = 11,   // A vertex or fragment stage's input at @location(n)
     Uniform = 12,      // uniform<T> at a descriptor
     Buffer = 13,       // buffer<T> / read_buffer<T> at a descriptor
+    Shared = 14,       // shared workgroup variable
 };
 
 // A parameter whose value the caller does not pack: the grid (the dispatch's
 // domain), a texture or buffer at a descriptor, or a stage input.
 constexpr bool is_bound_param(ParamRole r) noexcept {
     return r == ParamRole::Grid || r == ParamRole::Image || r == ParamRole::Sampler || r == ParamRole::StageInput ||
-           r == ParamRole::Uniform || r == ParamRole::Buffer;
+           r == ParamRole::Uniform || r == ParamRole::Buffer || r == ParamRole::Shared;
 }
 
 /// Checked parameter metadata for a kernel or helper function.
@@ -102,7 +103,8 @@ struct CheckedFunction {
     bool uses_f64 = false;
     bool uses_grid_coords = false;
     bool uses_barriers_or_shared = false;
-    bool uses_descriptors = false;     // a texture or buffer parameter at a descriptor: GPU only, no CPU build
+    bool uses_descriptors = false;     // a texture or buffer parameter at a descriptor
+    bool uses_textures = false;        // an image or sampler at a descriptor: GPU only, no CPU build
     // Render math on the GPU (a vertex or fragment stage, or a kernel marked
     // @fast): the driver may fuse and reorder float arithmetic, and the
     // transcendentals of f32 are the device's own (GLSL.std.450), not the

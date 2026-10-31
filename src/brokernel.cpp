@@ -15,140 +15,28 @@ const char* version() {
     return "0.1.0";
 }
 
-// ---------------------------------------------------------------------------
-// KernelArg Accessors
-// ---------------------------------------------------------------------------
-
-int32_t KernelArg::as_i32() const noexcept {
-    switch (kind_) {
-        case Kind::I32:
-        case Kind::I64: return static_cast<int32_t>(i64_);
-        case Kind::U32:
-        case Kind::U64: return static_cast<int32_t>(u64_);
-        case Kind::F32:
-        case Kind::F64: return static_cast<int32_t>(f64_);
-        case Kind::ScalarsI32: return i32_vals_.empty() ? 0 : i32_vals_[0];
-        default: return 0;
-    }
-}
-
-uint32_t KernelArg::as_u32() const noexcept {
-    switch (kind_) {
-        case Kind::U32:
-        case Kind::U64: return static_cast<uint32_t>(u64_);
-        case Kind::I32:
-        case Kind::I64: return static_cast<uint32_t>(i64_);
-        case Kind::F32:
-        case Kind::F64: return static_cast<uint32_t>(f64_);
-        default: return 0;
-    }
-}
-
-int64_t KernelArg::as_i64() const noexcept {
-    switch (kind_) {
-        case Kind::I32:
-        case Kind::I64: return i64_;
-        case Kind::U32:
-        case Kind::U64: return static_cast<int64_t>(u64_);
-        case Kind::F32:
-        case Kind::F64: return static_cast<int64_t>(f64_);
-        default: return 0;
-    }
-}
-
-uint64_t KernelArg::as_u64() const noexcept {
-    switch (kind_) {
-        case Kind::U32:
-        case Kind::U64: return u64_;
-        case Kind::I32:
-        case Kind::I64: return static_cast<uint64_t>(i64_);
-        case Kind::F32:
-        case Kind::F64: return static_cast<uint64_t>(f64_);
-        default: return 0;
-    }
-}
-
-float KernelArg::as_f32() const noexcept {
-    switch (kind_) {
-        case Kind::F32:
-        case Kind::F64: return static_cast<float>(f64_);
-        case Kind::I32:
-        case Kind::I64: return static_cast<float>(i64_);
-        case Kind::U32:
-        case Kind::U64: return static_cast<float>(u64_);
-        case Kind::ScalarsF32: return f32_vals_.empty() ? 0.0f : f32_vals_[0];
-        case Kind::ScalarsF64: return f64_vals_.empty() ? 0.0f : static_cast<float>(f64_vals_[0]);
-        default: return 0.0f;
-    }
-}
-
-double KernelArg::as_f64() const noexcept {
-    switch (kind_) {
-        case Kind::F32:
-        case Kind::F64: return f64_;
-        case Kind::I32:
-        case Kind::I64: return static_cast<double>(i64_);
-        case Kind::U32:
-        case Kind::U64: return static_cast<double>(u64_);
-        case Kind::ScalarsF64: return f64_vals_.empty() ? 0.0 : f64_vals_[0];
-        case Kind::ScalarsF32: return f32_vals_.empty() ? 0.0 : static_cast<double>(f32_vals_[0]);
-        default: return 0.0;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CompiledKernel & CompileResult Lookups
-// ---------------------------------------------------------------------------
-
-const KernelParamInfo* CompiledKernel::find_param(std::string_view pname) const noexcept {
-    for (const auto& p : params) {
-        if (p.name == pname) return &p;
-    }
-    return nullptr;
-}
-
-const CompiledKernel* CompileResult::find_kernel(std::string_view name) const noexcept {
-    for (const auto& k : kernels) {
-        if (k.name == name) return &k;
-    }
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// CPU Argument Packing & Execution
-// ---------------------------------------------------------------------------
-
 namespace {
-
-uint64_t pack_f32_bits(float v) noexcept {
-    uint32_t u = 0;
-    std::memcpy(&u, &v, sizeof(float));
-    return static_cast<uint64_t>(u);
-}
-
-uint64_t pack_f64_bits(double v) noexcept {
-    uint64_t u = 0;
-    std::memcpy(&u, &v, sizeof(double));
-    return u;
-}
 
 size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
     size_t c = 0;
     for (const auto& p : params) {
-        if (!is_bound_param(p.role)) {
-            ++c;
-        }
+        if (!is_bound_param(p.role)) ++c;
     }
     return c;
 }
 
-// A store's element count: what every access to it is bounded by.
+size_t count_param_blocks(const std::vector<KernelParamInfo>& params) noexcept {
+    size_t c = 0;
+    for (const auto& p : params) {
+        if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) ++c;
+    }
+    return c;
+}
+
 uint64_t store_count(const KernelParamInfo& p, const KernelArg& a) {
     return p.element_bytes ? a.buffer_bytes() / p.element_bytes : 0;
 }
 
-// A store the kernel accesses at the grid's cells holds them all
-// (KernelParamInfo::grid_cover_dim): those accesses are not bounded.
 bool store_covers(const KernelParamInfo& p, const KernelArg& a, GridShape shape, std::string* err) {
     if (p.grid_cover_dim == 0) return true;
     uint64_t cells = std::max(1u, shape.width);
@@ -163,250 +51,7 @@ bool store_covers(const KernelParamInfo& p, const KernelArg& a, GridShape shape,
     return false;
 }
 
-// What an empty store (or one smaller than an element) points at: an access
-// outside a store still reads its element 0 and discards it, so there has to
-// be an element there.
-const void* empty_store_block() {
-    alignas(64) static const uint8_t zeros[4096] = {};
-    return zeros;
-}
-
-bool pack_cpu_args(
-    const CompiledKernel& kernel,
-    std::span<const KernelArg> args,
-    GridShape shape,
-    std::vector<uint64_t>& slots_out,
-    std::string* err) {
-    const size_t non_grid = count_non_grid_params(kernel.params);
-    const bool skip_domain_args = (args.size() == non_grid && kernel.params.size() != non_grid);
-    if (args.size() != kernel.params.size() && !skip_domain_args) {
-        if (err) {
-            *err = "kernel '" + kernel.name + "' expects " + std::to_string(non_grid) +
-                   " argument(s), got " + std::to_string(args.size());
-        }
-        return false;
-    }
-
-    slots_out.clear();
-    size_t arg_idx = 0;
-    for (const auto& p : kernel.params) {
-        if (is_bound_param(p.role)) {
-            if (!skip_domain_args) ++arg_idx;
-            continue;
-        }
-        const KernelArg& a = args[arg_idx++];
-        if (p.role == ParamRole::Store || p.role == ParamRole::Stencil) {
-            if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
-                if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
-                return false;
-            }
-            if (!store_covers(p, a, shape, err)) return false;
-            const uint64_t count = store_count(p, a);
-            slots_out.push_back(reinterpret_cast<uint64_t>(count ? a.buffer_ptr() : empty_store_block()));
-            slots_out.push_back(count);
-        } else if (p.role == ParamRole::Scalar) {
-            switch (p.type.scalar) {
-                case ScalarKind::F32: slots_out.push_back(pack_f32_bits(a.as_f32())); break;
-                case ScalarKind::F64: slots_out.push_back(pack_f64_bits(a.as_f64())); break;
-                case ScalarKind::U32: slots_out.push_back(static_cast<uint64_t>(a.as_u32())); break;
-                case ScalarKind::U64: slots_out.push_back(a.as_u64()); break;
-                case ScalarKind::I64: slots_out.push_back(static_cast<uint64_t>(a.as_i64())); break;
-                default: slots_out.push_back(static_cast<uint64_t>(static_cast<uint32_t>(a.as_i32()))); break;
-            }
-        } else {
-            // Vector, Array, or Struct parameter
-            if (a.kind() == KernelArg::Kind::ScalarsF32) {
-                for (float v : a.f32_values()) slots_out.push_back(pack_f32_bits(v));
-            } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
-                for (double v : a.f64_values()) slots_out.push_back(pack_f64_bits(v));
-            } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
-                for (int32_t v : a.i32_values()) slots_out.push_back(static_cast<uint64_t>(static_cast<uint32_t>(v)));
-            } else if (a.kind() == KernelArg::Kind::Buffer && a.buffer_ptr()) {
-                // Unpack struct/vector from raw host pointer
-                const auto* raw = static_cast<const uint8_t*>(a.buffer_ptr());
-                size_t off = 0;
-                uint32_t elem_sz = p.type.scalar_size_bytes();
-                if (elem_sz == 0) elem_sz = 4;
-                for (uint32_t k = 0; k < p.mir_param_count; ++k) {
-                    uint64_t word = 0;
-                    if (off + elem_sz <= a.buffer_bytes()) {
-                        std::memcpy(&word, raw + off, elem_sz);
-                    }
-                    slots_out.push_back(word);
-                    off += elem_sz;
-                }
-            } else {
-                // Splat scalar across leaves
-                for (uint32_t k = 0; k < p.mir_param_count; ++k) {
-                    if (p.type.scalar == ScalarKind::F64) slots_out.push_back(pack_f64_bits(a.as_f64()));
-                    else if (p.type.scalar == ScalarKind::F32) slots_out.push_back(pack_f32_bits(a.as_f32()));
-                    else slots_out.push_back(static_cast<uint64_t>(static_cast<uint32_t>(a.as_i32())));
-                }
-            }
-        }
-    }
-    return true;
-}
-
-// A kernel's CPU builds, made once, the first time either is asked for.
-const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::CpuBuild>& cpu) {
-    if (!cpu) return nullptr;
-    std::call_once(cpu->once, [&] {
-        try {
-            brass::codegen::KernelJit jit_point(cpu->options);
-            cpu->point_fn = jit_point.compile(*cpu->point);
-            brass::codegen::KernelJit jit_grid(cpu->options);
-            cpu->grid_fn = jit_grid.compile(*cpu->grid);
-        } catch (const std::exception& ex) {
-            cpu->error = std::string("backend compilation error: ") + ex.what();
-        }
-        cpu->module.reset();
-    });
-    return cpu.get();
-}
-
-const brass::codegen::KernelFunction kNoFunction{};
-const std::string kNoError;
-
 } // namespace
-
-const brass::codegen::KernelFunction& CompiledKernel::cpu_point_fn() const {
-    const CpuBuild* cpu = cpu_build(cpu_);
-    return cpu ? cpu->point_fn : kNoFunction;
-}
-
-const brass::codegen::KernelFunction& CompiledKernel::cpu_grid_fn() const {
-    const CpuBuild* cpu = cpu_build(cpu_);
-    return cpu ? cpu->grid_fn : kNoFunction;
-}
-
-const std::string& CompiledKernel::cpu_error() const {
-    const CpuBuild* cpu = cpu_build(cpu_);
-    return cpu ? cpu->error : kNoError;
-}
-
-bool CompiledKernel::eval_grid_point_cpu(
-    int32_t gx, int32_t gy, int32_t gz,
-    GridShape shape,
-    std::span<const KernelArg> args,
-    void* out_return,
-    std::string* err) const {
-    if (!cpu_point_fn().is_valid()) {
-        if (err) *err = "kernel '" + name + "' has no CPU build" + (cpu_error().empty() ? std::string() : ": " + cpu_error());
-        return false;
-    }
-    // A point query is a call per position (a height for physics or the
-    // camera), so its argument slots reuse one buffer per thread rather than
-    // allocating per call. Kernels do not call back into the host, so the
-    // buffer is never in use twice on one thread.
-    // The cell's own coordinates index its stores unbounded, so it has to
-    // be one of the shape's.
-    if (gx < 0 || gy < 0 || gz < 0 || uint32_t(gx) >= std::max(1u, shape.width) ||
-        uint32_t(gy) >= std::max(1u, shape.height) || uint32_t(gz) >= std::max(1u, shape.depth)) {
-        if (err) *err = "cell (" + std::to_string(gx) + ", " + std::to_string(gy) + ", " + std::to_string(gz) +
-                        ") is outside the grid";
-        return false;
-    }
-    thread_local std::vector<uint64_t> slots;
-    if (!pack_cpu_args(*this, args, shape, slots, err)) return false;
-
-    const int32_t coords_shape[6] = {
-        gx, gy, gz,
-        static_cast<int32_t>( std::max(1u, shape.width)),
-        static_cast<int32_t>(std::max(1u, shape.height)),
-        static_cast<int32_t>(std::max(1u, shape.depth)),
-    };
-
-    alignas(16) uint8_t scratch_ret[256] = {};
-    void* ret_ptr = out_return ? out_return : static_cast<void*>(scratch_ret);
-
-    using PointFn = void (*)(const uint64_t*, const int32_t*, void*);
-    auto fn_ptr = cpu_point_fn().as<PointFn>();
-    fn_ptr(slots.data(), coords_shape, ret_ptr);
-    return true;
-}
-
-bool CompiledKernel::eval_cpu(
-    std::span<const KernelArg> args,
-    void* out_return,
-    std::string* err) const {
-    return eval_grid_point_cpu(0, 0, 0, GridShape(1, 1, 1), args, out_return, err);
-}
-
-float CompiledKernel::eval_f32(std::span<const KernelArg> args) const {
-    float res = 0.0f;
-    eval_cpu(args, &res, nullptr);
-    return res;
-}
-
-double CompiledKernel::eval_f64(std::span<const KernelArg> args) const {
-    double res = 0.0;
-    eval_cpu(args, &res, nullptr);
-    return res;
-}
-
-int32_t CompiledKernel::eval_i32(std::span<const KernelArg> args) const {
-    int32_t res = 0;
-    eval_cpu(args, &res, nullptr);
-    return res;
-}
-
-int64_t CompiledKernel::eval_i64(std::span<const KernelArg> args) const {
-    int64_t res = 0;
-    eval_cpu(args, &res, nullptr);
-    return res;
-}
-
-float CompiledKernel::eval_point_2d_f32(
-    int32_t gx, int32_t gy, uint32_t width, uint32_t height,
-    std::span<const KernelArg> args) const {
-    float res = 0.0f;
-    eval_grid_point_cpu(gx, gy, 0, GridShape(width, height, 1), args, &res, nullptr);
-    return res;
-}
-
-double CompiledKernel::eval_point_2d_f64(
-    int32_t gx, int32_t gy, uint32_t width, uint32_t height,
-    std::span<const KernelArg> args) const {
-    double res = 0.0;
-    eval_grid_point_cpu(gx, gy, 0, GridShape(width, height, 1), args, &res, nullptr);
-    return res;
-}
-
-bool CompiledKernel::dispatch_cpu(
-    GridShape shape,
-    std::span<const KernelArg> args,
-    void* return_store_out,
-    std::string* err) const {
-    if (!cpu_grid_fn().is_valid()) {
-        if (err) *err = "kernel '" + name + "' has no CPU build" + (cpu_error().empty() ? std::string() : ": " + cpu_error());
-        return false;
-    }
-    std::vector<uint64_t> slots;
-    if (!pack_cpu_args(*this, args, shape, slots, err)) return false;
-
-    const int32_t shape4[4] = {
-        static_cast<int32_t>(std::max(1u, shape.width)),
-        static_cast<int32_t>(std::max(1u, shape.height)),
-        static_cast<int32_t>(std::max(1u, shape.depth)),
-        return_store_out != nullptr ? 1 : 0,
-    };
-
-    // With no return store the cells' returns are written to scratch elements
-    // 0 .. cpu_grid_lanes - 1 (the grid loop selects that index rather than
-    // branching).
-    std::vector<uint64_t> scratch_ret;
-    void* ret_ptr = return_store_out;
-    if (!ret_ptr) {
-        scratch_ret.resize((std::max<size_t>(return_byte_size, 8) * cpu_grid_lanes + 7) / 8);
-        ret_ptr = scratch_ret.data();
-    }
-
-    using GridFn = void (*)(const uint64_t*, const int32_t*, void*);
-    auto fn_ptr = cpu_grid_fn().as<GridFn>();
-    fn_ptr(slots.data(), shape4, ret_ptr);
-    return true;
-}
 
 // ---------------------------------------------------------------------------
 // GPU (Vulkan) Dispatch & Evaluation
@@ -434,8 +79,13 @@ bool CompiledKernel::gpu_launch(
     }
 
     const size_t non_grid = count_non_grid_params(params);
-    const bool skip_domain_args = (args.size() == non_grid && params.size() != non_grid);
-    if (args.size() != params.size() && !skip_domain_args) {
+    const size_t param_blocks = count_param_blocks(params);
+    const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
+    const size_t expected_with_blocks = non_grid + block_bindings.size();
+    const size_t expected_full = params.size() + global_blocks;
+    const bool skip_all_bound = (args.size() == non_grid);
+    const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
+    if (args.size() != params.size() && args.size() != expected_full && !skip_all_bound && !skip_non_block_bound) {
         if (err) {
             *err = "kernel '" + name + "' expects " + std::to_string(non_grid) +
                    " argument(s), got " + std::to_string(args.size());
@@ -448,7 +98,11 @@ bool CompiledKernel::gpu_launch(
     size_t arg_idx = 0;
     for (const auto& p : params) {
         if (is_bound_param(p.role)) {
-            if (!skip_domain_args) ++arg_idx;
+            if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
+                if (!skip_all_bound) ++arg_idx;
+            } else if (!skip_all_bound && !skip_non_block_bound) {
+                ++arg_idx;
+            }
             continue;
         }
         const KernelArg& a = args[arg_idx++];
@@ -478,7 +132,6 @@ bool CompiledKernel::gpu_launch(
                 default: vk_args.emplace_back(a.as_i32()); break;
             }
         } else {
-            // Vector or Struct flattened into scalar push constants
             if (a.kind() == KernelArg::Kind::ScalarsF32) {
                 for (float v : a.f32_values()) vk_args.emplace_back(v);
             } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
@@ -486,8 +139,6 @@ bool CompiledKernel::gpu_launch(
             } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
                 for (int32_t v : a.i32_values()) vk_args.emplace_back(v);
             } else if (a.kind() == KernelArg::Kind::Buffer && a.buffer_ptr()) {
-                // The leaves from raw host bytes, as pack_cpu_args reads them,
-                // each as its push constant's kind.
                 const auto* raw = static_cast<const uint8_t*>(a.buffer_ptr());
                 uint32_t elem_sz = p.type.scalar_size_bytes();
                 if (elem_sz == 0) elem_sz = 4;
@@ -522,7 +173,6 @@ bool CompiledKernel::gpu_launch(
         }
     }
 
-    // Implicit grid extent arguments (__grid_w, __grid_h, __grid_d)
     const uint32_t w = std::max(1u, shape.width);
     const uint32_t h = std::max(1u, shape.height);
     const uint32_t d = std::max(1u, shape.depth);
@@ -530,7 +180,6 @@ bool CompiledKernel::gpu_launch(
     if (grid_dim >= 2) vk_args.emplace_back(static_cast<int32_t>(h));
     if (grid_dim >= 3) vk_args.emplace_back(static_cast<int32_t>(d));
 
-    // Implicit output buffer argument (__out) when return_type != void
     if (!return_type.is_void()) {
         if (!return_address) {
             if (err) *err = "kernel '" + name + "' returns a value per cell; its dispatch needs a return buffer";
@@ -540,9 +189,9 @@ bool CompiledKernel::gpu_launch(
     }
 
     for (int i = 0; i < 3; ++i) out.local_size[i] = std::max(1u, local_size[i]);
-    out.groups[0] = (grid_dim >= 1) ? (w + out.local_size[0] - 1) / out.local_size[0] : 1;
-    out.groups[1] = (grid_dim >= 2) ? (h + out.local_size[1] - 1) / out.local_size[1] : 1;
-    out.groups[2] = (grid_dim >= 3) ? (d + out.local_size[2] - 1) / out.local_size[2] : 1;
+    out.groups[0] = (w + out.local_size[0] - 1) / out.local_size[0];
+    out.groups[1] = (grid_dim >= 2 || grid_dim == 0) ? (h + out.local_size[1] - 1) / out.local_size[1] : 1;
+    out.groups[2] = (grid_dim >= 3 || grid_dim == 0) ? (d + out.local_size[2] - 1) / out.local_size[2] : 1;
     return true;
 }
 
@@ -584,21 +233,33 @@ bool CompiledKernel::dispatch_gpu(
             bool write_back = false;
         };
         std::vector<BoundBuffer> bound_buffers;
-        bound_buffers.reserve(params.size() + 1);
+        bound_buffers.reserve(params.size() + block_bindings.size() + 1);
 
-        // Each host store goes into a buffer of brass's device, and its
-        // argument becomes that buffer's address.
         std::vector<KernelArg> dev_args(args.begin(), args.end());
         const size_t non_grid = count_non_grid_params(params);
-        const bool skip_domain_args = (args.size() == non_grid && params.size() != non_grid);
+        const size_t param_blocks = count_param_blocks(params);
+        const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
+        const size_t expected_with_blocks = non_grid + block_bindings.size();
+        const size_t expected_full = params.size() + global_blocks;
+        const bool skip_all_bound = (args.size() == non_grid && block_bindings.empty());
+        const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
+
+        std::vector<size_t> param_block_arg_idx(params.size(), SIZE_MAX);
         size_t arg_idx = 0;
-        for (const auto& p : params) {
+        for (size_t p_i = 0; p_i < params.size(); ++p_i) {
+            const auto& p = params[p_i];
             if (is_bound_param(p.role)) {
-                if (!skip_domain_args) ++arg_idx;
+                if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
+                    if (!skip_all_bound && arg_idx < args.size()) {
+                        param_block_arg_idx[p_i] = arg_idx++;
+                    }
+                } else if (!skip_all_bound && !skip_non_block_bound) {
+                    ++arg_idx;
+                }
                 continue;
             }
             const size_t i = arg_idx++;
-            if (i >= args.size()) break;  // gpu_launch reports the count
+            if (i >= args.size()) break;
             if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
             const KernelArg& a = args[i];
             if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
@@ -606,7 +267,6 @@ bool CompiledKernel::dispatch_gpu(
                 return false;
             }
             if (!store_covers(p, a, shape, err)) return false;
-            // Room for element 0 however small the store (Ops::Bound).
             size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
             BoundBuffer bb;
             bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
@@ -620,6 +280,40 @@ bool CompiledKernel::dispatch_gpu(
             }
             bound_buffers.push_back(std::move(bb));
             dev_args[i] = KernelArg::device(bound_buffers.back().dev_buf.device_address(), a.buffer_bytes(), bytes);
+        }
+
+        std::vector<brass::gpu::VulkanDescriptorBuffer> vk_descriptors;
+        vk_descriptors.reserve(block_bindings.size());
+        for (const auto& binfo : block_bindings) {
+            size_t bi = SIZE_MAX;
+            if (binfo.mir_param_index < params.size()) {
+                bi = param_block_arg_idx[binfo.mir_param_index];
+            } else if (arg_idx < args.size()) {
+                bi = arg_idx++;
+            }
+            if (bi >= args.size() || args[bi].kind() != KernelArg::Kind::Buffer || !args[bi].buffer_ptr()) {
+                if (err) *err = "binding '" + binfo.name + "' requires a buffer argument";
+                return false;
+            }
+            const KernelArg& a = args[bi];
+            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(binfo.element_bytes), 16});
+            BoundBuffer bb;
+            bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
+            bb.host_ptr = a.buffer_ptr();
+            bb.byte_size = a.buffer_bytes();
+            bb.write_back = (binfo.role == ParamRole::Buffer && can_Write(binfo.access) && !a.is_read_only());
+            if (a.buffer_bytes() > 0) {
+                bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
+            } else {
+                bb.dev_buf.zero();
+            }
+            vk_descriptors.push_back(brass::gpu::VulkanDescriptorBuffer{
+                binfo.descriptor_set,
+                binfo.descriptor_binding,
+                bb.dev_buf.handle(),
+                bytes,
+            });
+            bound_buffers.push_back(std::move(bb));
         }
 
         uint64_t return_address = 0;
@@ -642,6 +336,7 @@ bool CompiledKernel::dispatch_gpu(
             disp.grid[i] = launch.groups[i];
             disp.block[i] = launch.local_size[i];
         }
+        disp.descriptors = std::move(vk_descriptors);
 
         if (!vk.launch(disp, launch.args, &vk_err)) {
             if (err) *err = vk_err;
@@ -685,8 +380,6 @@ ParityReport CompiledKernel::compare_cpu_gpu(
     std::span<const KernelArg> args,
     double rel_tol,
     double abs_tol) const {
-    // Agreement means both targets ran: without a device the report fails
-    // (ran_gpu false) rather than passing on the CPU's word alone.
     ParityReport rep;
     if (!brass::gpu::vulkan_available()) {
         rep.ran_gpu = false;
@@ -696,9 +389,13 @@ ParityReport CompiledKernel::compare_cpu_gpu(
     }
 
     const size_t non_grid = count_non_grid_params(params);
-    const bool skip_domain_args = (args.size() == non_grid && params.size() != non_grid);
+    const size_t param_blocks = count_param_blocks(params);
+    const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
+    const size_t expected_with_blocks = non_grid + block_bindings.size();
+    const size_t expected_full = params.size() + global_blocks;
+    const bool skip_all_bound = (args.size() == non_grid && block_bindings.empty());
+    const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
 
-    // Clone buffer arguments so CPU and GPU dispatches operate on independent buffers
     std::vector<std::vector<uint8_t>> cpu_bufs(args.size());
     std::vector<std::vector<uint8_t>> gpu_bufs(args.size());
     std::vector<KernelArg> cpu_args(args.begin(), args.end());
@@ -736,8 +433,6 @@ ParityReport CompiledKernel::compare_cpu_gpu(
     rep.ran_gpu = true;
     rep.ok = true;
 
-    // Floats agree within abs_tol or rel_tol; a NaN agrees only with a NaN.
-    // Integers agree exactly.
     auto compare_float = [&](double x, double y, uint64_t ulps) {
         ++rep.elements_compared;
         if (std::isnan(x) || std::isnan(y)) {
@@ -747,7 +442,7 @@ ParityReport CompiledKernel::compare_cpu_gpu(
             }
             return;
         }
-        if (x == y) return; // equal infinities included
+        if (x == y) return;
         double diff = std::abs(x - y);
         double rdiff = diff / std::max({std::abs(x), std::abs(y), 1e-300});
         rep.max_abs_diff = std::max(rep.max_abs_diff, diff);
@@ -755,7 +450,6 @@ ParityReport CompiledKernel::compare_cpu_gpu(
         rep.max_ulp_diff = std::max(rep.max_ulp_diff, ulps);
         if (!(diff <= abs_tol || rdiff <= rel_tol)) rep.ok = false;
     };
-    // Distance in representable values (both finite, neither NaN).
     auto ulp_distance = [](auto x, auto y) -> uint64_t {
         using F = decltype(x);
         using I = std::conditional_t<sizeof(F) == 8, int64_t, int32_t>;
@@ -806,25 +500,44 @@ ParityReport CompiledKernel::compare_cpu_gpu(
         }
     };
 
-    // Compare writable store buffers (and copy GPU output back to caller's writable buffers)
+    std::vector<size_t> param_block_arg_idx(params.size(), SIZE_MAX);
     size_t arg_idx = 0;
-    for (const auto& p : params) {
+    for (size_t p_i = 0; p_i < params.size(); ++p_i) {
+        const auto& p = params[p_i];
         if (is_bound_param(p.role)) {
-            if (!skip_domain_args) ++arg_idx;
+            if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
+                if (!skip_all_bound && arg_idx < args.size()) {
+                    param_block_arg_idx[p_i] = arg_idx++;
+                }
+            } else if (!skip_all_bound && !skip_non_block_bound) {
+                ++arg_idx;
+            }
             continue;
         }
         size_t cur = arg_idx++;
-        if (p.role == ParamRole::Store && can_Write(p.access) && !cpu_bufs[cur].empty()) {
+        if (p.role == ParamRole::Store && can_Write(p.access) && cur < cpu_bufs.size() && !cpu_bufs[cur].empty()) {
             compare_bytes(cpu_bufs[cur].data(), gpu_bufs[cur].data(), cpu_bufs[cur].size(), p.type.scalar);
             if (!args[cur].is_read_only() && args[cur].buffer_ptr()) {
                 std::memcpy(args[cur].buffer_ptr(), gpu_bufs[cur].data(), gpu_bufs[cur].size());
             }
         }
     }
+    for (const auto& binfo : block_bindings) {
+        size_t bi = SIZE_MAX;
+        if (binfo.mir_param_index < params.size()) {
+            bi = param_block_arg_idx[binfo.mir_param_index];
+        } else if (arg_idx < args.size()) {
+            bi = arg_idx++;
+        }
+        if (binfo.role == ParamRole::Buffer && can_Write(binfo.access) && bi < cpu_bufs.size() && !cpu_bufs[bi].empty()) {
+            compare_bytes(cpu_bufs[bi].data(), gpu_bufs[bi].data(), cpu_bufs[bi].size(), binfo.type.scalar);
+            if (!args[bi].is_read_only() && args[bi].buffer_ptr()) {
+                std::memcpy(args[bi].buffer_ptr(), gpu_bufs[bi].data(), gpu_bufs[bi].size());
+            }
+        }
+    }
 
     if (ret_bytes > 0) {
-        // One element per point; its leaves are packed in order (a struct's
-        // may differ in kind).
         const size_t stride = std::max<size_t>(return_byte_size, 4);
         for (size_t base = 0; base + stride <= ret_bytes; base += stride) {
             size_t off = 0;
@@ -888,6 +601,7 @@ CompileResult Compiler::compile_source(
     res.types = checked->types;
     for (const auto& [key, index] : checked->global_index) {
         const CheckedParam& g = checked->globals[index];
+        if (g.role == ParamRole::Shared) continue;
         res.resources.push_back({g.name, key.substr(0, key.size() - g.name.size() - 2), g.descriptor_set,
                                  g.descriptor_binding, g.type, g.image_format});
     }
@@ -895,7 +609,6 @@ CompileResult Compiler::compile_source(
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;
     });
 
-    // Determine which functions in root module should be compiled as entry points
     bool any_explicit_kernel = false;
     for (const auto& fn : checked->functions) {
         if (fn.module_name == checked->module_name && fn.is_entry_kernel) {
@@ -940,6 +653,9 @@ CompileResult Compiler::compile_source(
                                : (fn->grid_dim >= 2 ? fn->local_size[i] : opts.local_size[i]);
         }
         ck.params = lowered.param_infos;
+        ck.block_bindings = lowered.block_bindings;
+        ck.uses_barriers_or_shared = lowered.uses_barriers_or_shared;
+        ck.cpu_shared_bytes = lowered.cpu_shared_bytes;
         ck.return_type = fn->return_type;
         ck.return_leaf_kinds = checked->types.flatten_scalars(fn->return_type);
         ck.return_flat_leaves = static_cast<uint32_t>(ck.return_leaf_kinds.size());
@@ -960,7 +676,6 @@ CompileResult Compiler::compile_source(
                 spv_opts.local_size_z = ck.local_size[2];
                 spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
                 spv_opts.spirv_version = opts.spirv_version;
-                // The GPU rounds as the CPU build does, but for render math.
                 spv_opts.precise_float = !fn->fast_math;
 
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
@@ -968,7 +683,6 @@ CompileResult Compiler::compile_source(
                     ck.spirv_disassembly = brass::target::SpirvTarget::dump_function(*lowered.gpu_function, spv_opts);
                 }
 
-                // Populate push constant offsets on `ck.params`
                 for (auto& p : ck.params) {
                     if (p.mir_param_count > 0 && p.mir_param_index < ck.spirv.params.size()) {
                         p.push_constant_offset = ck.spirv.params[p.mir_param_index].offset;
@@ -990,7 +704,6 @@ CompileResult Compiler::compile_source(
                 ck.ptx = brass::target::PtxTarget::emit_function(*lowered.gpu_function);
             }
 
-            // The CPU builds wait for their first use (cpu_point_fn()).
             if (opts.compile_cpu && lowered.cpu_point_function) {
                 auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
                 cpu->options.opt_level = opts.opt_level;

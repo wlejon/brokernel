@@ -61,6 +61,23 @@ struct MirBodyLowerer {
     brass::Value* gw = nullptr;
     brass::Value* gh = nullptr;
     brass::Value* gd = nullptr;
+    brass::Value* lid_x = nullptr;
+    brass::Value* lid_y = nullptr;
+    brass::Value* lid_z = nullptr;
+    brass::Value* wgid_x = nullptr;
+    brass::Value* wgid_y = nullptr;
+    brass::Value* wgid_z = nullptr;
+    brass::Value* lsz_x = nullptr;
+    brass::Value* lsz_y = nullptr;
+    brass::Value* lsz_z = nullptr;
+    brass::Value* nwg_x = nullptr;
+    brass::Value* nwg_y = nullptr;
+    brass::Value* nwg_z = nullptr;
+    brass::Value* cpu_shared_base = nullptr;
+    brass::Value* cpu_barrier_fn = nullptr;
+    brass::Value* cpu_barrier_ctx = nullptr;
+    std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> cpu_block_ptrs;
+    std::set<size_t> used_block_params;
 
     int next_var_id = 1;
     std::unordered_map<int, ValueList> var_values;
@@ -108,6 +125,8 @@ struct MirBodyLowerer {
     ValueList global_value(const Expr* e) {
         const size_t index = root_fn.params.size() + static_cast<size_t>(e->global_index);
         const CheckedParam& p = bound_param(index);
+        if (p.role == ParamRole::Shared) return {b.build_iconst_i32(0)};
+        if (p.type.is_block()) used_block_params.insert(index);
         brass::Value* v = b.build_iconst_i32(static_cast<int32_t>((p.descriptor_set << 16) | p.descriptor_binding));
         (p.type.is_block() ? block_param : texture_param)[v] = index;
         return {v};
@@ -143,6 +162,35 @@ struct MirBodyLowerer {
     void block_store(const Expr* e, const BlockPlace& p, const ValueList& value);
     std::optional<ValueList> try_block_read(const Expr* e);
     bool try_block_assign(const Stmt* s, ValueList rhs);
+    ValueList block_atomic(const Expr* e, const BlockPlace& p, const std::string& op,
+                           const std::vector<ValueList>& args);
+
+    // Shared workgroup memory (lowering_block.cpp).
+    struct SharedVar {
+        brass::Value* gpu_base = nullptr;
+        uint32_t cpu_byte_offset = 0;
+        Type type;
+    };
+    std::unordered_map<std::string, SharedVar> shared_vars;
+    uint32_t total_cpu_shared_bytes = 0;
+    std::string active_fn_name;
+    struct SharedPlace {
+        const SharedVar* var = nullptr;
+        brass::Value* word_offset = nullptr;   // words (4 bytes), i32
+        Type type;
+        std::vector<uint32_t> lanes;
+    };
+    std::unordered_map<int, SharedPlace> shared_places;
+    void init_shared_memory();
+    bool shared_place(const Expr* e, SharedPlace& p);
+    bool is_shared_path(const Expr* e) const;
+    ValueList shared_load(const Expr* e, const SharedPlace& p);
+    void shared_store(const Expr* e, const SharedPlace& p, const ValueList& value);
+    std::optional<ValueList> try_shared_read(const Expr* e);
+    bool try_shared_assign(const Stmt* s, ValueList rhs);
+    ValueList shared_atomic(const Expr* e, const SharedPlace& p, const std::string& op,
+                            const std::vector<ValueList>& args);
+
     // `store` accessed at a cell, covering `dim` axes: its pointer alone.
     ValueList at_cells(const ValueList& store, uint32_t dim);
     // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are
@@ -153,13 +201,14 @@ struct MirBodyLowerer {
                    brass::codegen::KernelBuilder& kbuilder, bool gpu)
         : mod(m), root_fn(f), diags(d), kb(kbuilder), b(kbuilder.builder()), is_gpu(gpu),
           cell_coords_in_grid(f.stage == Stage::Compute && f.grid_dim > 0 && !f.uses_barriers_or_shared),
-          grid_cover(f.params.size(), 0) {}
+          grid_cover(f.params.size(), 0), active_fn_name(f.name) {}
 
     void push_scope() { scopes.emplace_back(); }
     void pop_scope() {
         for (const auto& [name, id] : scopes.back()) {
             var_values.erase(id);
             block_places.erase(id);
+            shared_places.erase(id);
         }
         scopes.pop_back();
     }

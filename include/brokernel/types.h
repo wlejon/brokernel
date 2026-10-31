@@ -3,6 +3,7 @@
 // fixed arrays, structs, grids, stencils, stores, images, and samplers.
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,9 +52,10 @@ struct Type {
     uint32_t struct_id = UINT32_MAX;
     std::string struct_name;
 
-    // For composite stores/stencils/arrays whose element is a vector or struct:
+    // For composite stores/stencils/arrays whose element is a vector, struct, or nested array:
     TypeKind elem_kind = TypeKind::Scalar;
     uint32_t elem_lanes = 1;
+    std::shared_ptr<const Type> nested_elem;
     // Images and samplers: an array of layers, a depth texture read by
     // comparison, a cube.
     // kImageSeparate: a texture sampled through a separate `sampler` (a
@@ -97,6 +99,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
+        if (elem.is_array()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -179,6 +182,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
+        if (elem.is_array()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -237,6 +241,7 @@ struct Type {
     Type element_type() const {
         if (is_vector()) return scalar_type(scalar);
         if (is_array() || is_store() || is_stencil() || is_image() || is_sampler() || is_block()) {
+            if (nested_elem) return *nested_elem;
             if (elem_kind == TypeKind::Struct) return make_struct(struct_id, struct_name);
             if (elem_kind == TypeKind::Vector) return vec(scalar, elem_lanes);
             return scalar_type(scalar);

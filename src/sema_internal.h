@@ -22,6 +22,7 @@ struct LocalVar {
     Type type;
     bool is_mutable = false;
     bool is_const = false;
+    bool is_shared = false;
     ConstValue const_val{};
     int param_index = -1; // >= 0 if this refers to a CheckedFunction parameter
 };
@@ -84,6 +85,9 @@ bool coerce_expr_to_type(Expr* e, const Type& target_type);
 /// Checks if `from` can assign to `to` (updating `expr` if `expr` is an unsuffixed literal).
 bool check_assignable(Expr* expr, const Type& to, DiagnosticBag& diags, const SourceSpan& span);
 bool is_unsuffixed_literal(const Expr* e);
+ConstValue convert_const_value(const ConstValue& cv, const Type& target, const TypeRegistry& types);
+void fold_const_into_expr(Expr* e, const ConstValue& cv);
+bool validate_shared_type(const Type& t, const TypeRegistry& types, DiagnosticBag& diags, const SourceSpan& span, const std::string& name);
 struct FnCheckState {
     SemaContext& ctx;
     CheckedFunction& fn;

@@ -361,4 +361,337 @@ brass::Value* lower_float_class(Ops& b, std::string_view name, brass::Value* x, 
     return name == "isnan" ? m.is_nan(x) : m.is_inf(x);
 }
 
+brass::Value* MirBodyLowerer::clamp_coord(brass::Value* c, brass::Value* extent) {
+    brass::Value* zero = b.build_iconst_i32(0);
+    brass::Value* one = b.build_iconst_i32(1);
+    brass::Value* hi = b.build_sub(extent, one);
+    brass::Value* c_lo = b.build_select(b.build_slt(c, zero), zero, c);
+    return b.build_select(b.build_sgt(c_lo, hi), hi, c_lo);
+}
+
+ValueList MirBodyLowerer::at_cells(const ValueList& store, uint32_t dim) {
+    auto it = store_param.find(store[0]);
+    if (it == store_param.end()) return store;
+    grid_cover[it->second] = std::max(grid_cover[it->second], dim);
+    return {store[0]};
+}
+
+ValueList MirBodyLowerer::store_access(const ValueList& store, uint32_t dim, brass::Value* x, brass::Value* y,
+                                       brass::Value* z) {
+    if (!cell_coords_in_grid) return store;
+    if (dim == 1 && linear_indices.count(x)) return at_cells(store, std::max(1u, root_fn.grid_dim));
+    if (x != gx || (dim >= 2 && y != gy) || (dim >= 3 && z != gz)) return store;
+    return at_cells(store, dim);
+}
+
+ValueList MirBodyLowerer::lower_stencil_read(const Expr* stencil, const Type& st, const std::vector<ExprPtr>& offsets) {
+    ValueList base = lower_expr(stencil);
+    auto offset = [&](size_t i) -> brass::Value* {
+        return i < offsets.size() ? lower_expr(offsets[i].get())[0] : b.build_iconst_i32(0);
+    };
+    brass::Value* x = b.build_add(gx, offset(0));
+    if (!x_interior) x = clamp_coord(x, gw);
+    brass::Value* y = (st.dimension >= 2) ? clamp_coord(b.build_add(gy, offset(1)), gh) : b.build_iconst_i32(0);
+    brass::Value* z = (st.dimension >= 3) ? clamp_coord(b.build_add(gz, offset(2)), gd) : b.build_iconst_i32(0);
+    return load_element_from_buffer(st.element_type(), at_cells(base, st.dimension),
+                                    compute_linear_index(st.dimension, x, y, z));
+}
+
+brass::Value* MirBodyLowerer::compute_linear_index(uint32_t dim, brass::Value* x, brass::Value* y, brass::Value* z) {
+    auto to_i64 = [&](brass::Value* v) -> brass::Value* {
+        return (v->type() == brass::Type::i64()) ? v : b.build_sext_i64(v);
+    };
+    brass::Value* x64 = to_i64(x);
+    if (dim == 1) return x64;
+    brass::Value* y64 = to_i64(y);
+    brass::Value* gw64 = to_i64(gw);
+    if (dim == 2) return b.build_add(b.build_mul(y64, gw64), x64);
+    brass::Value* z64 = to_i64(z);
+    brass::Value* gh64 = to_i64(gh);
+    brass::Value* zy = b.build_add(b.build_mul(z64, gh64), y64);
+    return b.build_add(b.build_mul(zy, gw64), x64);
+}
+
+ValueList MirBodyLowerer::load_element_from_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx) {
+    brass::Value* base_ptr = store[0];
+    brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
+    const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
+    const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
+    auto kinds = mod.types.flatten_scalars(elem_type);
+    ValueList res;
+    res.reserve(kinds.size());
+    if (kinds.size() == 1) {
+        brass::Type mt = to_mir_scalar_type(kinds[0]);
+        brass::Value* v = b.build_load_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, bound);
+        if (kinds[0] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+        res.push_back(v);
+        return res;
+    }
+    bool uniform = true;
+    for (size_t i = 1; i < kinds.size(); ++i) {
+        if (kinds[i] != kinds[0]) { uniform = false; break; }
+    }
+    if (uniform) {
+        brass::Type mt = to_mir_scalar_type(kinds[0]);
+        uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
+        brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
+        for (size_t i = 0; i < kinds.size(); ++i) {
+            brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
+            brass::Value* v = b.build_load_indexed(mt, base_ptr, idx_i, scale, 0, bound);
+            if (kinds[i] == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+            res.push_back(v);
+        }
+        return res;
+    }
+    uint32_t elem_bytes = mod.types.byte_size(elem_type);
+    brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
+    uint32_t cur_off = 0;
+    for (ScalarKind sk : kinds) {
+        brass::Type mt = to_mir_scalar_type(sk);
+        brass::Value* v = b.build_load_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), bound);
+        if (sk == ScalarKind::Bool && b.vector_mode()) v = b.build_ne(v, b.build_iconst_i32(0));
+        res.push_back(v);
+        cur_off += static_cast<uint32_t>(mt.size_in_bytes());
+    }
+    return res;
+}
+
+void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueList& store, brass::Value* linear_idx,
+                                             const ValueList& vals) {
+    brass::Value* base_ptr = store[0];
+    brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
+    const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
+    const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
+    auto kinds = mod.types.flatten_scalars(elem_type);
+    auto norm_bool = [&](ScalarKind sk, brass::Value* v) -> brass::Value* {
+        return (sk == ScalarKind::Bool && b.vector_mode()) ? b.build_and(v, b.build_iconst_i32(1)) : v;
+    };
+    if (kinds.size() == 1 && !vals.empty()) {
+        brass::Type mt = to_mir_scalar_type(kinds[0]);
+        b.build_store_indexed(mt, base_ptr, idx64, static_cast<uint8_t>(mt.size_in_bytes()), 0, norm_bool(kinds[0], vals[0]), bound);
+        return;
+    }
+    bool uniform = true;
+    for (size_t i = 1; i < kinds.size(); ++i) {
+        if (kinds[i] != kinds[0]) { uniform = false; break; }
+    }
+    if (uniform) {
+        brass::Type mt = to_mir_scalar_type(kinds[0]);
+        uint8_t scale = static_cast<uint8_t>(mt.size_in_bytes());
+        brass::Value* base_elem = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(kinds.size())));
+        for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
+            brass::Value* idx_i = (i == 0) ? base_elem : b.build_add(base_elem, b.build_iconst_i64(static_cast<int64_t>(i)));
+            b.build_store_indexed(mt, base_ptr, idx_i, scale, 0, norm_bool(kinds[i], vals[i]), bound);
+        }
+        return;
+    }
+    uint32_t elem_bytes = mod.types.byte_size(elem_type);
+    brass::Value* byte_base = b.build_mul(idx64, b.build_iconst_i64(static_cast<int64_t>(elem_bytes)));
+    uint32_t cur_off = 0;
+    for (size_t i = 0; i < kinds.size() && i < vals.size(); ++i) {
+        brass::Type mt = to_mir_scalar_type(kinds[i]);
+        b.build_store_indexed(mt, base_ptr, byte_base, 1, static_cast<int32_t>(cur_off), norm_bool(kinds[i], vals[i]), bound);
+        cur_off += static_cast<uint32_t>(mt.size_in_bytes());
+    }
+}
+
+brass::Value* MirBodyLowerer::lower_scalar_cast(brass::Value* v, ScalarKind from_sk, ScalarKind to_sk) {
+    if (from_sk == to_sk) return v;
+    if (to_sk == ScalarKind::Bool) {
+        if (from_sk == ScalarKind::F32) return b.build_ne(v, b.build_fconst_f32(0.0f));
+        if (from_sk == ScalarKind::F64) return b.build_ne(v, b.build_fconst_f64(0.0));
+        if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_ne(v, b.build_iconst_i64(0));
+        return b.build_ne(v, b.build_iconst_i32(0));
+    }
+    if (from_sk == ScalarKind::Bool && b.vector_mode()) {
+        v = b.build_and(v, b.build_iconst_i32(1));
+    }
+    if (to_sk == ScalarKind::F32) {
+        if (from_sk == ScalarKind::F64) return b.build_fptrunc_f32_f64(v);
+        if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f32_i64(v);
+        return b.build_sitofp_f32_i32(v);
+    }
+    if (to_sk == ScalarKind::F64) {
+        if (from_sk == ScalarKind::F32) return b.build_fpext_f64_f32(v);
+        if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_sitofp_f64_i64(v);
+        return b.build_sitofp_f64_i32(v);
+    }
+    if (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64) {
+        if (from_sk == ScalarKind::F32) return b.build_fptosi_i64_f32(v);
+        if (from_sk == ScalarKind::F64) return b.build_fptosi_i64(v);
+        if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return v;
+        return (from_sk == ScalarKind::U32 || from_sk == ScalarKind::Bool) ? b.build_zext_i64(v) : b.build_sext_i64(v);
+    }
+    if (from_sk == ScalarKind::F32) return b.build_fptosi_i32_f32(v);
+    if (from_sk == ScalarKind::F64) return b.build_fptosi_i32(v);
+    if (from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) return b.build_trunc_i32(v);
+    return v;
+}
+
+brass::Value* MirBodyLowerer::lower_scalar_binary(BinaryOp op, brass::Value* l, brass::Value* r, ScalarKind sk) {
+    bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
+    bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
+    switch (op) {
+        case BinaryOp::Add: return b.build_add(l, r);
+        case BinaryOp::Sub: return b.build_sub(l, r);
+        case BinaryOp::Mul: return b.build_mul(l, r);
+        case BinaryOp::Div:
+            if (is_fp) return b.build_sdiv(l, r);
+            return is_unsigned ? b.build_udiv(l, r) : b.build_sdiv(l, r);
+        case BinaryOp::Mod:
+            if (is_fp) {
+                brass::Value* q = b.build_floor(b.build_sdiv(l, r));
+                return b.build_sub(l, b.build_mul(r, q));
+            }
+            return is_unsigned ? b.build_umod(l, r) : b.build_smod(l, r);
+        case BinaryOp::BitAnd:
+        case BinaryOp::LogAnd: return b.build_and(l, r);
+        case BinaryOp::BitOr:
+        case BinaryOp::LogOr:  return b.build_or(l, r);
+        case BinaryOp::BitXor: return b.build_xor(l, r);
+        case BinaryOp::Shl:    return b.build_shl(l, r);
+        case BinaryOp::Shr:    return is_unsigned ? b.build_lshr(l, r) : b.build_ashr(l, r);
+        case BinaryOp::Eq:     return b.build_eq(l, r);
+        case BinaryOp::Ne:     return b.build_ne(l, r);
+        case BinaryOp::Lt:     return (!is_fp && is_unsigned) ? b.build_ult(l, r) : b.build_slt(l, r);
+        case BinaryOp::Le:     return (!is_fp && is_unsigned) ? b.build_ule(l, r) : b.build_sle(l, r);
+        case BinaryOp::Gt:     return (!is_fp && is_unsigned) ? b.build_ugt(l, r) : b.build_sgt(l, r);
+        case BinaryOp::Ge:     return (!is_fp && is_unsigned) ? b.build_uge(l, r) : b.build_sge(l, r);
+    }
+    return l;
+}
+
+brass::Value* MirBodyLowerer::lower_native_math_1(const std::string& name, brass::Value* x) {
+    static const char* const kNative[][2] = {
+        {"sin", "sinf"}, {"cos", "cosf"}, {"tan", "tanf"}, {"asin", "asinf"}, {"acos", "acosf"},
+        {"atan", "atanf"}, {"sinh", "sinhf"}, {"cosh", "coshf"}, {"tanh", "tanhf"},
+        {"exp", "expf"}, {"exp2", "ex2f"}, {"log", "logf"}, {"log2", "lg2f"},
+    };
+    for (const auto& n : kNative) {
+        if (name == n[0]) return b.build_call(n[1], brass::Type::f32(), {x});
+    }
+    return nullptr;
+}
+
+brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass::Value* x, ScalarKind sk) {
+    bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
+    brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0)
+                         : (sk == ScalarKind::F32) ? b.build_fconst_f32(0.0f)
+                         : (sk == ScalarKind::I64 || sk == ScalarKind::U64) ? b.build_iconst_i64(0)
+                                                                            : b.build_iconst_i32(0);
+    brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0)
+                        : (sk == ScalarKind::F32) ? b.build_fconst_f32(1.0f)
+                        : (sk == ScalarKind::I64 || sk == ScalarKind::U64) ? b.build_iconst_i64(1)
+                                                                           : b.build_iconst_i32(1);
+    if (name == "abs") {
+        if (is_fp) return b.build_fabs(x);
+        return b.build_select(b.build_slt(x, zero), b.build_neg(x), x);
+    }
+    if (name == "sign") {
+        brass::Value* neg_one = b.build_neg(one);
+        return b.build_select(b.build_sgt(x, zero), one, b.build_select(b.build_slt(x, zero), neg_one, zero));
+    }
+    if (name == "sqrt") return b.build_sqrt(x);
+    if (name == "rsqrt" || name == "inversesqrt") return b.build_sdiv(one, b.build_sqrt(x));
+    if (name == "floor") return b.build_floor(x);
+    if (name == "ceil") return b.build_ceil(x);
+    if (name == "round") return b.build_round(x);
+    if (name == "trunc") return b.build_select(b.build_sge(x, zero), b.build_floor(x), b.build_ceil(x));
+    if (name == "fract") return b.build_sub(x, b.build_floor(x));
+    if (name == "saturate") return b.build_fmin(b.build_fmax(x, zero), one);
+    if (name == "degrees") {
+        constexpr double kRadToDeg = 57.2957795130823208768;
+        brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kRadToDeg) : b.build_fconst_f32(static_cast<float>(kRadToDeg));
+        return b.build_mul(x, c);
+    }
+    if (name == "radians") {
+        constexpr double kDegToRad = 0.017453292519943295769;
+        brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kDegToRad) : b.build_fconst_f32(static_cast<float>(kDegToRad));
+        return b.build_mul(x, c);
+    }
+    if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) {
+        if (brass::Value* t = lower_native_math_1(name, x)) return t;
+    }
+    if (brass::Value* t = lower_transcendental_1(b, name, x, sk)) return t;
+    if (name == "dpdx" || name == "dpdy" || name == "fwidth") {
+        return b.build_call("spirv_" + name + "_f32", brass::Type::f32(), {x});
+    }
+    if (name == "subgroup_broadcast_first" || name == "subgroup_add" || name == "subgroup_min" ||
+        name == "subgroup_max") {
+        if (!is_gpu) return x;
+        return b.build_call("spirv_" + name + (sk == ScalarKind::F32 ? "_f32" : "_i32"), to_mir_scalar_type(sk), {x});
+    }
+    if (name == "subgroup_all" || name == "subgroup_any") {
+        if (!is_gpu) return b.build_ne(x, b.build_iconst_i32(0));
+        return b.build_call("spirv_" + name, brass::Type::i32(), {x});
+    }
+    if (name == "isnan" || name == "isinf") return lower_float_class(b, name, x, sk);
+    diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
+    return x;
+}
+
+brass::Value* MirBodyLowerer::lower_scalar_math_2(const std::string& name, brass::Value* a, brass::Value* c, ScalarKind sk) {
+    bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
+    bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
+    if (name == "min") {
+        if (is_fp) return b.build_fmin(a, c);
+        return b.build_select(is_unsigned ? b.build_ult(a, c) : b.build_slt(a, c), a, c);
+    }
+    if (name == "max") {
+        if (is_fp) return b.build_fmax(a, c);
+        return b.build_select(is_unsigned ? b.build_ugt(a, c) : b.build_sgt(a, c), a, c);
+    }
+    if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32 && (name == "pow" || name == "atan2")) {
+        return b.build_call(name == "pow" ? "powf" : "atan2f", brass::Type::f32(), {a, c});
+    }
+    if (brass::Value* t = lower_transcendental_2(b, name, a, c, sk)) return t;
+    if (name == "step") {
+        brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
+        brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0) : b.build_fconst_f32(1.0f);
+        return b.build_select(b.build_slt(c, a), zero, one);
+    }
+    if (name == "mod") {
+        brass::Value* q = b.build_floor(b.build_sdiv(a, c));
+        return b.build_sub(a, b.build_mul(c, q));
+    }
+    if (name == "fmod") {
+        if (!is_fp) return is_unsigned ? b.build_umod(a, c) : b.build_smod(a, c);
+        brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
+        brass::Value* q = b.build_sdiv(a, c);
+        q = b.build_select(b.build_sge(q, zero), b.build_floor(q), b.build_ceil(q));
+        return b.build_sub(a, b.build_mul(c, q));
+    }
+    diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
+    return a;
+}
+
+brass::Value* MirBodyLowerer::lower_scalar_math_3(const std::string& name, brass::Value* x, brass::Value* y, brass::Value* z, ScalarKind sk) {
+    bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
+    if (name == "clamp") {
+        if (is_fp) return b.build_fmin(b.build_fmax(x, y), z);
+        bool is_unsigned = (sk == ScalarKind::U32 || sk == ScalarKind::U64);
+        brass::Value* lo = b.build_select(is_unsigned ? b.build_ult(x, y) : b.build_slt(x, y), y, x);
+        return b.build_select(is_unsigned ? b.build_ugt(lo, z) : b.build_sgt(lo, z), z, lo);
+    }
+    if (name == "mix" || name == "lerp") {
+        return b.build_add(x, b.build_mul(b.build_sub(y, x), z));
+    }
+    if (name == "fma") {
+        if (is_fp) return b.build_fma(x, y, z);
+        return b.build_add(b.build_mul(x, y), z);
+    }
+    if (name == "smoothstep") {
+        brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0) : b.build_fconst_f32(0.0f);
+        brass::Value* one = (sk == ScalarKind::F64) ? b.build_fconst_f64(1.0) : b.build_fconst_f32(1.0f);
+        brass::Value* two = (sk == ScalarKind::F64) ? b.build_fconst_f64(2.0) : b.build_fconst_f32(2.0f);
+        brass::Value* three = (sk == ScalarKind::F64) ? b.build_fconst_f64(3.0) : b.build_fconst_f32(3.0f);
+        brass::Value* raw = b.build_sdiv(b.build_sub(z, x), b.build_sub(y, x));
+        brass::Value* t = b.build_fmin(b.build_fmax(raw, zero), one);
+        brass::Value* tt = b.build_mul(t, t);
+        return b.build_mul(tt, b.build_sub(three, b.build_mul(two, t)));
+    }
+    diags.error(SourceSpan{}, "internal: no lowering for builtin '" + name + "'");
+    return x;
+}
+
 } // namespace brokernel::detail

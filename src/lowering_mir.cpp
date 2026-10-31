@@ -147,7 +147,10 @@ void MirBodyLowerer::lower_loop(int broke_var_id, int cont_var_id, int counter_v
     {
         std::set<std::string> names;
         for (const Stmt* w : writers) collect_assigned_names(w, names);
-        for (const auto& n : names) carried.insert(lookup_var_id(n));
+        for (const auto& n : names) {
+            int vid = lookup_var_id(n);
+            if (vid >= 0 && !shared_places.count(vid) && !block_places.count(vid)) carried.insert(vid);
+        }
     }
     std::vector<int> live_ids;
     for (int id : sorted_live_var_ids()) {
@@ -227,6 +230,14 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
             break;
         case Stmt::Kind::Let:
         case Stmt::Kind::Var: {
+            if (s->is_shared) {
+                int id = alloc_var(s->var_name, {});
+                auto it = shared_vars.find("l:" + active_fn_name + ":" + s->var_name);
+                if (it != shared_vars.end()) {
+                    shared_places[id] = SharedPlace{&it->second, b.build_iconst_i32(0), s->resolved_var_type, {}};
+                }
+                break;
+            }
             if (s->kind == Stmt::Kind::Let && s->init_expr &&
                 (s->resolved_var_type.is_struct() || s->resolved_var_type.is_array())) {
                 BlockPlace bp;
@@ -243,8 +254,8 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
         }
         case Stmt::Kind::Assign: {
             ValueList rhs = lower_expr(s->assign_value.get());
-            // 0. A place in a storage buffer at a descriptor.
-            if (try_block_assign(s, rhs)) return;
+            // 0. A place in a storage buffer at a descriptor or in shared memory.
+            if (try_block_assign(s, rhs) || try_shared_assign(s, rhs)) return;
             // 1. Store indexing assignment: `st[x, y] = val` or `st[x, y] += val`
             if (s->assign_target->kind == Expr::Kind::Index &&
                 s->assign_target->lhs->resolved_type.is_store()) {
@@ -389,20 +400,9 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
             brass::Value* cond = cv.empty() ? b.build_iconst_i32(0) : cv[0];
             std::function<void()> else_arm;
             if (!s->else_body.empty()) {
-                else_arm = [&] {
-                    push_scope();
-                    lower_stmt_list(s->else_body);
-                    pop_scope();
-                };
+                else_arm = [&] { push_scope(); lower_stmt_list(s->else_body); pop_scope(); };
             }
-            lower_branch(
-                cond,
-                [&] {
-                    push_scope();
-                    lower_stmt_list(s->body);
-                    pop_scope();
-                },
-                else_arm);
+            lower_branch(cond, [&] { push_scope(); lower_stmt_list(s->body); pop_scope(); }, else_arm);
             break;
         }
         case Stmt::Kind::ForRange: {
@@ -432,9 +432,7 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
         case Stmt::Kind::ForC:
         case Stmt::Kind::While: {
             push_scope();
-            if (s->kind == Stmt::Kind::ForC && s->for_init) {
-                lower_stmt(s->for_init.get());
-            }
+            if (s->kind == Stmt::Kind::ForC && s->for_init) lower_stmt(s->for_init.get());
             int broke_var_id = alloc_var("__loop_broke_" + std::to_string(next_var_id), {b.build_iconst_i32(0)});
             int cont_var_id = alloc_var("__loop_cont_" + std::to_string(next_var_id), {b.build_iconst_i32(0)});
             lower_loop(
@@ -445,33 +443,20 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
                     return cv.empty() ? b.true_value() : cv[0];
                 },
                 [&] { lower_stmt_list(s->body); },
-                [&] {
-                    if (s->kind == Stmt::Kind::ForC && s->for_step) lower_stmt(s->for_step.get());
-                });
+                [&] { if (s->kind == Stmt::Kind::ForC && s->for_step) lower_stmt(s->for_step.get()); });
             pop_scope();
             break;
         }
-        case Stmt::Kind::Break: {
-            if (!loop_stack.empty()) {
-                var_values[loop_stack.back().broke_var_id] = {b.true_value()};
-            }
+        case Stmt::Kind::Break:
+            if (!loop_stack.empty()) var_values[loop_stack.back().broke_var_id] = {b.true_value()};
             break;
-        }
-        case Stmt::Kind::Continue: {
-            if (!loop_stack.empty()) {
-                var_values[loop_stack.back().cont_var_id] = {b.true_value()};
-            }
+        case Stmt::Kind::Continue:
+            if (!loop_stack.empty()) var_values[loop_stack.back().cont_var_id] = {b.true_value()};
             break;
-        }
-        case Stmt::Kind::Return: {
-            if (s->expr && ret_val_var_id >= 0) {
-                var_values[ret_val_var_id] = lower_expr(s->expr.get());
-            }
-            if (has_returned_var_id >= 0) {
-                var_values[has_returned_var_id] = {b.true_value()};
-            }
+        case Stmt::Kind::Return:
+            if (s->expr && ret_val_var_id >= 0) var_values[ret_val_var_id] = lower_expr(s->expr.get());
+            if (has_returned_var_id >= 0) var_values[has_returned_var_id] = {b.true_value()};
             break;
-        }
         case Stmt::Kind::Expr:
             lower_expr(s->expr.get());
             break;
@@ -486,10 +471,17 @@ struct GridFrame {
     brass::Value* gw = nullptr;
     brass::Value* gh = nullptr;
     brass::Value* gd = nullptr;
+    brass::Value* lsz_x = nullptr;
+    brass::Value* lsz_y = nullptr;
+    brass::Value* lsz_z = nullptr;
+    brass::Value* nwg_x = nullptr;
+    brass::Value* nwg_y = nullptr;
+    brass::Value* nwg_z = nullptr;
     brass::Value* has_out_i32 = nullptr;   // the shape's fourth word: nonzero when out_ret is a store
     brass::Value* out_ret = nullptr;
     brass::Value* scratch = nullptr;       // a vector build's masked-off stores
     std::vector<ValueList> params;
+    std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> block_ptrs;
 };
 
 // One cell of the grid (lanes 0), or `lanes` cells from x on (x a uniform
@@ -510,6 +502,19 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     lowerer.gx = lanes ? lowerer.b.build_add(x, lowerer.b.iota_i32()) : x;
     lowerer.gy = gy;
     lowerer.gz = gz;
+    lowerer.lsz_x = f.lsz_x;
+    lowerer.lsz_y = f.lsz_y;
+    lowerer.lsz_z = f.lsz_z;
+    lowerer.nwg_x = f.nwg_x;
+    lowerer.nwg_y = f.nwg_y;
+    lowerer.nwg_z = f.nwg_z;
+    lowerer.wgid_x = lowerer.b.build_udiv(lowerer.gx, f.lsz_x);
+    lowerer.wgid_y = b.build_udiv(gy, f.lsz_y);
+    lowerer.wgid_z = b.build_udiv(gz, f.lsz_z);
+    lowerer.lid_x = lowerer.b.build_sub(lowerer.gx, lowerer.b.build_mul(lowerer.wgid_x, f.lsz_x));
+    lowerer.lid_y = b.build_sub(gy, b.build_mul(lowerer.wgid_y, f.lsz_y));
+    lowerer.lid_z = b.build_sub(gz, b.build_mul(lowerer.wgid_z, f.lsz_z));
+    lowerer.cpu_block_ptrs = f.block_ptrs;
     lowerer.active_return_type = fn.return_type;
     lowerer.has_returned_var_id = lowerer.alloc_var("__has_returned", {b.build_iconst_i32(0)});
     if (!fn.return_type.is_void()) {
@@ -527,7 +532,11 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
         }
         lowerer.alloc_var(fn.params[i].name, pvals);
         const ParamRole role = fn.params[i].role;
-        if (role == ParamRole::Store || role == ParamRole::Stencil) lowerer.bind_store_param(i, f.params[i]);
+        if (role == ParamRole::Store || role == ParamRole::Stencil) {
+            lowerer.bind_store_param(i, f.params[i]);
+        } else if (role == ParamRole::Uniform || role == ParamRole::Buffer) {
+            lowerer.block_param[pvals[0]] = i;
+        }
     }
     lowerer.lower_stmt_list(fn.body);
     if (lowerer.ret_val_var_id < 0) return;
@@ -546,12 +555,13 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
 }
 
 // The CPU grid function:
-//   void __cpu_grid(const uint64_t* args_pack, const int32_t* shape4, void* out_ret)
+//   void __cpu_grid(const uint64_t* args_pack, const int32_t* shape7, void* out_ret)
 // Nested loops over (gz, gy, gx) with 64-bit linear indexing, so a grid past
 // 2^31 cells never overflows and the inner loop has no divisions. With
 // `lanes`, each row runs `lanes` cells at a time up to the last whole group,
 // the rest one by one.
 brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, const CheckedFunction& fn,
+                                const std::vector<KernelParamInfo>& block_bindings,
                                 DiagnosticBag& diags, uint32_t lanes, VectorPlan* plan) {
     brass::Function* grid_fn = m.create_function(fn.name + "_cpu_grid", brass::Type::void_type(),
                                                  {brass::Type::ptr(), brass::Type::ptr(), brass::Type::ptr()});
@@ -567,12 +577,23 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
     f.gh = b.build_load(brass::Type::i32(), shape_ptr, 4);
     f.gd = b.build_load(brass::Type::i32(), shape_ptr, 8);
     f.has_out_i32 = b.build_load(brass::Type::i32(), shape_ptr, 12);
+    f.lsz_x = b.build_load(brass::Type::i32(), shape_ptr, 16);
+    f.lsz_y = b.build_load(brass::Type::i32(), shape_ptr, 20);
+    f.lsz_z = b.build_load(brass::Type::i32(), shape_ptr, 24);
+    auto ceil_div = [&](brass::Value* ext, brass::Value* lsz) {
+        return b.build_udiv(b.build_sub(b.build_add(ext, lsz), b.build_iconst_i32(1)), lsz);
+    };
+    f.nwg_x = ceil_div(f.gw, f.lsz_x);
+    f.nwg_y = ceil_div(f.gh, f.lsz_y);
+    f.nwg_z = ceil_div(f.gd, f.lsz_z);
     if (lanes) f.scratch = b.build_alloca(256, 32);
     f.params.reserve(fn.params.size());
     int32_t slot = 0;
     for (const auto& cp : fn.params) {
         if (is_bound_param(cp.role)) {
-            f.params.push_back({b.build_iconst_i32(0)});
+            brass::Value* placeholder =
+                b.build_iconst_i32(static_cast<int32_t>((cp.descriptor_set << 16) | cp.descriptor_binding));
+            f.params.push_back({placeholder});
         } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
             f.params.push_back({b.build_load(brass::Type::ptr(), args_pack, slot * 8),
                                 b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8)});
@@ -587,6 +608,12 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
             }
             f.params.push_back(std::move(leaves));
         }
+    }
+    for (const auto& bb : block_bindings) {
+        brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+        brass::Value* bytes_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
+        f.block_ptrs[bb.mir_param_index] = {ptr_v, bytes_v};
+        slot += 2;
     }
     brass::BasicBlock* z_head = new_block(b, "grid_z_head");
     brass::BasicBlock* z_body = new_block(b, "grid_z_body");
@@ -758,29 +785,17 @@ LoweredKernelMir lower_kernel_to_mir(
             }
             out.param_infos.push_back(std::move(pinfo));
         }
-        // Implicit grid extent parameters (__grid_w, __grid_h, __grid_d) when grid_dim > 0
         if (fn.grid_dim > 0) {
             out.grid_dim_mir_index = mir_idx;
             lowerer.gw = b.add_param(brass::Type::i32());
             mir_idx += 1;
-            if (fn.grid_dim >= 2) {
-                lowerer.gh = b.add_param(brass::Type::i32());
-                mir_idx += 1;
-            } else {
-                lowerer.gh = b.build_iconst_i32(1);
-            }
-            if (fn.grid_dim >= 3) {
-                lowerer.gd = b.add_param(brass::Type::i32());
-                mir_idx += 1;
-            } else {
-                lowerer.gd = b.build_iconst_i32(1);
-            }
+            lowerer.gh = fn.grid_dim >= 2 ? (mir_idx += 1, b.add_param(brass::Type::i32())) : b.build_iconst_i32(1);
+            lowerer.gd = fn.grid_dim >= 3 ? (mir_idx += 1, b.add_param(brass::Type::i32())) : b.build_iconst_i32(1);
         } else {
             lowerer.gw = b.build_iconst_i32(1);
             lowerer.gh = b.build_iconst_i32(1);
             lowerer.gd = b.build_iconst_i32(1);
         }
-        // Implicit output buffer parameter (__out) when return_type != void
         brass::Value* gpu_out_ptr = nullptr;
         if (!fn.return_type.is_void()) {
             out.return_out_mir_index = mir_idx;
@@ -793,34 +808,21 @@ LoweredKernelMir lower_kernel_to_mir(
             for (brass::Value* p : entry->params()) ptypes.push_back(p->type());
             out.gpu_function->set_param_types(std::move(ptypes));
         }
-        // Compute global grid coordinates (gx, gy, gz)
         if (fn.stage == Stage::Compute) {
             lowerer.gx = kb.global_tid_x();
-            if (fn.grid_dim >= 2) {
-                lowerer.gy = b.build_add(b.build_mul(kb.ctaid_y(), kb.ntid_y()), kb.tid_y());
-            } else {
-                lowerer.gy = b.build_iconst_i32(0);
-            }
-            if (fn.grid_dim >= 3) {
-                lowerer.gz = b.build_add(b.build_mul(kb.ctaid_z(), kb.ntid_z()), kb.tid_z());
-            } else {
-                lowerer.gz = b.build_iconst_i32(0);
-            }
+            lowerer.gy = fn.grid_dim >= 2 ? b.build_add(b.build_mul(kb.ctaid_y(), kb.ntid_y()), kb.tid_y()) : b.build_iconst_i32(0);
+            lowerer.gz = fn.grid_dim >= 3 ? b.build_add(b.build_mul(kb.ctaid_z(), kb.ntid_z()), kb.tid_z()) : b.build_iconst_i32(0);
         } else {
             lowerer.gx = b.build_iconst_i32(0);
             lowerer.gy = b.build_iconst_i32(0);
             lowerer.gz = b.build_iconst_i32(0);
         }
-        // Bounds guard for grid compute kernels (skipped if kernel uses workgroup barriers)
+        lowerer.init_shared_memory();
         brass::BasicBlock* done_bb = nullptr;
         if (fn.stage == Stage::Compute && fn.grid_dim > 0 && !fn.uses_barriers_or_shared) {
             brass::Value* in_bounds = b.build_ult(lowerer.gx, lowerer.gw);
-            if (fn.grid_dim >= 2) {
-                in_bounds = b.build_and(in_bounds, b.build_ult(lowerer.gy, lowerer.gh));
-            }
-            if (fn.grid_dim >= 3) {
-                in_bounds = b.build_and(in_bounds, b.build_ult(lowerer.gz, lowerer.gd));
-            }
+            if (fn.grid_dim >= 2) in_bounds = b.build_and(in_bounds, b.build_ult(lowerer.gy, lowerer.gh));
+            if (fn.grid_dim >= 3) in_bounds = b.build_and(in_bounds, b.build_ult(lowerer.gz, lowerer.gd));
             brass::BasicBlock* body_bb = new_block(b, "in_bounds");
             done_bb = new_block(b, "done");
             b.build_br_if(in_bounds, body_bb, done_bb);
@@ -829,6 +831,37 @@ LoweredKernelMir lower_kernel_to_mir(
         lowerer.lower_stmt_list(fn.body);
         for (size_t i = 0; i < out.param_infos.size(); ++i) {
             out.param_infos[i].grid_cover_dim = lowerer.grid_cover[i];
+        }
+        out.uses_barriers_or_shared = fn.uses_barriers_or_shared;
+        auto make_block_info = [&](const CheckedParam& cp, size_t idx) {
+            KernelParamInfo bi;
+            bi.name = cp.name;
+            bi.type = cp.type;
+            bi.role = cp.role;
+            bi.access = cp.access;
+            bi.descriptor_set = cp.descriptor_set;
+            bi.descriptor_binding = cp.descriptor_binding;
+            bi.mir_param_index = static_cast<uint32_t>(idx);
+            bi.element_bytes = mod.types.block_stride(cp.type.element_type(), cp.type.is_uniform());
+            return bi;
+        };
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+            if (fn.params[i].role == ParamRole::Uniform || fn.params[i].role == ParamRole::Buffer) {
+                out.block_bindings.push_back(make_block_info(fn.params[i], i));
+            }
+        }
+        std::vector<size_t> used_globals;
+        for (size_t idx : lowerer.used_block_params) {
+            if (idx >= fn.params.size()) used_globals.push_back(idx);
+        }
+        std::sort(used_globals.begin(), used_globals.end(), [&](size_t a, size_t b_idx) {
+            const auto& ga = mod.globals[a - fn.params.size()];
+            const auto& gb = mod.globals[b_idx - fn.params.size()];
+            if (ga.descriptor_set != gb.descriptor_set) return ga.descriptor_set < gb.descriptor_set;
+            return ga.descriptor_binding < gb.descriptor_binding;
+        });
+        for (size_t idx : used_globals) {
+            out.block_bindings.push_back(make_block_info(mod.globals[idx - fn.params.size()], idx));
         }
         if (gpu_out_ptr && lowerer.ret_val_var_id >= 0) {
             brass::Value* lin = (fn.grid_dim > 0)
@@ -842,18 +875,8 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         b.build_ret_void();
     }
-    // -----------------------------------------------------------------------
     // 2. Build CPU Point & Grid MIR Functions (`cpu_point_function`, `cpu_grid_function`)
-    // -----------------------------------------------------------------------
-    // Signature of `cpu_point_function`:
-    //   void __cpu_point(const uint64_t* args_pack, const int32_t* coords_and_shape6, void* out_ret)
-    //
-    // The CPU runs compute kernels cell by cell, a subgroup and workgroup of
-    // one. Vertex and fragment stages (rasterizer inputs, derivatives,
-    // discard), kernels that cooperate through barriers or shared memory
-    // and kernels that bind textures or buffers at descriptors have no
-    // meaning there, so they get no CPU build.
-    if (fn.stage != Stage::Compute || fn.uses_barriers_or_shared || fn.uses_descriptors) return out;
+    if (fn.stage != Stage::Compute || fn.uses_textures) return out;
     out.cpu_point_function = out.cpu_module->create_function(
         fn.name + "_cpu_point", brass::Type::void_type(),
         {brass::Type::ptr(), brass::Type::ptr(), brass::Type::ptr()});
@@ -878,15 +901,37 @@ LoweredKernelMir lower_kernel_to_mir(
         lowerer.gw = b.build_load(brass::Type::i32(), coords_shape, 12);
         lowerer.gh = b.build_load(brass::Type::i32(), coords_shape, 16);
         lowerer.gd = b.build_load(brass::Type::i32(), coords_shape, 20);
+        lowerer.lid_x = b.build_load(brass::Type::i32(), coords_shape, 24);
+        lowerer.lid_y = b.build_load(brass::Type::i32(), coords_shape, 28);
+        lowerer.lid_z = b.build_load(brass::Type::i32(), coords_shape, 32);
+        lowerer.wgid_x = b.build_load(brass::Type::i32(), coords_shape, 36);
+        lowerer.wgid_y = b.build_load(brass::Type::i32(), coords_shape, 40);
+        lowerer.wgid_z = b.build_load(brass::Type::i32(), coords_shape, 44);
+        lowerer.lsz_x = b.build_load(brass::Type::i32(), coords_shape, 48);
+        lowerer.lsz_y = b.build_load(brass::Type::i32(), coords_shape, 52);
+        lowerer.lsz_z = b.build_load(brass::Type::i32(), coords_shape, 56);
+        lowerer.nwg_x = b.build_load(brass::Type::i32(), coords_shape, 60);
+        lowerer.nwg_y = b.build_load(brass::Type::i32(), coords_shape, 64);
+        lowerer.nwg_z = b.build_load(brass::Type::i32(), coords_shape, 68);
+        lowerer.cpu_shared_base = b.build_load(brass::Type::ptr(), coords_shape, 72);
+        lowerer.cpu_barrier_fn = b.build_load(brass::Type::ptr(), coords_shape, 80);
+        lowerer.cpu_barrier_ctx = b.build_load(brass::Type::ptr(), coords_shape, 88);
+        lowerer.init_shared_memory();
         int32_t slot = 0;
-        for (const auto& cp : fn.params) {
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+            const auto& cp = fn.params[i];
             if (is_bound_param(cp.role)) {
-                lowerer.alloc_var(cp.name, {b.build_iconst_i32(0)});
+                brass::Value* placeholder =
+                    b.build_iconst_i32(static_cast<int32_t>((cp.descriptor_set << 16) | cp.descriptor_binding));
+                if (cp.role == ParamRole::Uniform || cp.role == ParamRole::Buffer) {
+                    lowerer.block_param[placeholder] = i;
+                }
+                lowerer.alloc_var(cp.name, {placeholder});
             } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
                 brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
                 brass::Value* count_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
                 lowerer.alloc_var(cp.name, {ptr_v, count_v});
-                lowerer.bind_store_param(static_cast<size_t>(&cp - fn.params.data()), {ptr_v, count_v});
+                lowerer.bind_store_param(i, {ptr_v, count_v});
                 slot += 2;
             } else {
                 auto kinds = mod.types.flatten_scalars(cp.type);
@@ -899,19 +944,21 @@ LoweredKernelMir lower_kernel_to_mir(
                 lowerer.alloc_var(cp.name, std::move(leaves));
             }
         }
+        for (const auto& bb : out.block_bindings) {
+            brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+            brass::Value* bytes_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
+            lowerer.cpu_block_ptrs[bb.mir_param_index] = {ptr_v, bytes_v};
+            slot += 2;
+        }
         lowerer.lower_stmt_list(fn.body);
+        out.cpu_shared_bytes = lowerer.total_cpu_shared_bytes;
         if (lowerer.ret_val_var_id >= 0) {
             lowerer.store_element_to_buffer(fn.return_type, {out_ret}, b.build_iconst_i32(0),
                                             lowerer.var_values[lowerer.ret_val_var_id]);
         }
         b.build_ret_void();
     }
-    // The grid function: 8 lanes, or 4 when a varying value is 64-bit, or one
-    // cell at a time when the body has something no lanes can run (a call
-    // with varying arguments, an atomic). A vector build that has to widen a
-    // loop-carried value is redone with it widened (VectorPlan).
-    // The vector loop is AVX2 code (brass's vector opcodes on x64); other
-    // hosts run the grid one cell at a time.
+    if (fn.uses_barriers_or_shared || (fn.grid_dim == 0 && fn.return_type.is_void())) return out;
     for (uint32_t lanes : {8u, 4u}) {
         if (!brass::host_has_avx2()) break;
         VectorPlan plan;
@@ -921,7 +968,7 @@ LoweredKernelMir lower_kernel_to_mir(
             DiagnosticBag attempt_diags;
             brass::Function* grid = nullptr;
             try {
-                grid = build_cpu_grid(*out.cpu_module, mod, fn, attempt_diags, lanes, &plan);
+                grid = build_cpu_grid(*out.cpu_module, mod, fn, out.block_bindings, attempt_diags, lanes, &plan);
             } catch (const NeedNarrowLanes&) {
                 narrow = true;
             } catch (const VectorUnsupported&) {
@@ -933,7 +980,6 @@ LoweredKernelMir lower_kernel_to_mir(
                 break;
             }
             if (!grid) {
-                // The partly built function is the module's last.
                 out.cpu_module->remove_function(out.cpu_module->functions().back());
             } else {
                 out.cpu_module->remove_function(grid);
@@ -944,7 +990,7 @@ LoweredKernelMir lower_kernel_to_mir(
         if (out.cpu_grid_function || scalar_only) break;
     }
     if (!out.cpu_grid_function) {
-        out.cpu_grid_function = build_cpu_grid(*out.cpu_module, mod, fn, diags, 0, nullptr);
+        out.cpu_grid_function = build_cpu_grid(*out.cpu_module, mod, fn, out.block_bindings, diags, 0, nullptr);
     }
     return out;
 }

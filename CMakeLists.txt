@@ -28,12 +28,14 @@ endif()
 
 add_library(brokernel STATIC
     src/brokernel.cpp
+    src/runtime_cpu.cpp
     src/diagnostics.cpp
     src/types.cpp
     src/lexer.cpp
     src/parser.cpp
     src/stdlib_modules.cpp
     src/sema.cpp
+    src/sema_const.cpp
     src/sema_check.cpp
     src/sema_builtins.cpp
     src/lowering_mir.cpp

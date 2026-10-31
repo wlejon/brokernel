@@ -57,8 +57,11 @@ struct LoweredKernelMir {
     uint32_t cpu_grid_lanes = 0;
 
     std::vector<KernelParamInfo> param_infos;
+    std::vector<KernelParamInfo> block_bindings;
     uint32_t grid_dim_mir_index = UINT32_MAX;   // Index of __grid_w in GPU MIR params (if grid_dim > 0)
     uint32_t return_out_mir_index = UINT32_MAX; // Index of __out in GPU MIR params (if return_type != void)
+    uint32_t cpu_shared_bytes = 0;              // Total workgroup shared memory bytes needed on CPU
+    bool uses_barriers_or_shared = false;       // Needs workgroup fiber runner on CPU
 };
 
 /// Lowers a single checked function `fn` (and any helper functions it calls from `mod`)
