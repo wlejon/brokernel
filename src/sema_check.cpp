@@ -824,6 +824,7 @@ Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
             if (m == "compare") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::f32()); }
             if (m == "compare_lod") { takes({fcoord, Type::f32(), Type::f32()}, "coordinates, reference, lod"); return done(Type::f32()); }
             if (m == "gather") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::vec(ScalarKind::F32, 4)); }
+            if (m == "fetch") { no_cube(); takes({icoord, Type::i32()}, "texel coordinates, lod"); return done(elem); }
         } else {
             if (m == "sample") { takes({fcoord}, "coordinates"); return done(elem); }
             if (m == "sample_offset") { no_cube(); takes({fcoord, offset}, "coordinates, offset"); return done(elem); }

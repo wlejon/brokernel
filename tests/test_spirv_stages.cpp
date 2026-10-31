@@ -453,7 +453,8 @@ static void test_textures() {
                                albedo.sample_grad(uv, vec2<f32>(k, 0.0), vec2<f32>(0.0, k)) +
                                albedo.fetch(vec2<i32>(3, 4), 0) + albedo.gather(uv, 1);
             let s: vec3<f32> = sky.sample(vec3<f32>(uv, 1.0));
-            let lit_by: f32 = shadows.compare(vec3<f32>(uv, 2.0), k) + shadows.compare_lod(vec3<f32>(uv, 1.0), k, 0.0);
+            let lit_by: f32 = shadows.compare(vec3<f32>(uv, 2.0), k) + shadows.compare_lod(vec3<f32>(uv, 1.0), k, 0.0) +
+                              shadows.fetch(vec3<i32>(1, 2, 0), 0);
             let size: vec2<i32> = albedo.size(0);
             let m: u32 = mask.fetch(vec2<i32>(size.x - 1, 0), albedo.levels() - 1);
             set_frag_color(c + vec4<f32>(s * lit_by, f32(m)));
