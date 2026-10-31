@@ -591,7 +591,7 @@ CompileResult Compiler::compile_source(
         if (p.has_parent_path()) root_dir = p.parent_path();
     }
 
-    auto checked = check_module(*ast, modules_, res.diagnostics, root_dir);
+    auto checked = check_module(*ast, modules_, res.diagnostics, root_dir, opts.entry_name);
     if (!checked || res.diagnostics.has_errors()) {
         res.ok = false;
         return res;

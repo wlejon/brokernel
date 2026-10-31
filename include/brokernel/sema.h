@@ -140,6 +140,7 @@ std::unique_ptr<CheckedModule> check_module(
     const ModuleAst& root_ast,
     ModuleRegistry& registry,
     DiagnosticBag& diags,
-    const std::filesystem::path& root_dir = {});
+    const std::filesystem::path& root_dir = {},
+    std::string_view entry_name = {});
 
 } // namespace brokernel

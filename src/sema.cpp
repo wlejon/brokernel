@@ -794,7 +794,8 @@ std::unique_ptr<CheckedModule> check_module(
     const ModuleAst& root_ast,
     ModuleRegistry& registry,
     DiagnosticBag& diags,
-    const std::filesystem::path& root_dir) {
+    const std::filesystem::path& root_dir,
+    std::string_view entry_name) {
     detail::SemaContext ctx(registry, diags, root_dir);
     std::string root_name = !root_ast.module_name.empty() ? root_ast.module_name : "root";
     ctx.out->module_name = root_name;
@@ -835,10 +836,11 @@ std::unique_ptr<CheckedModule> check_module(
     }
     ctx.resolve_globals();
 
-    // Type-check all non-generic functions in the root module (kernels first, plus non-generic functions)
+    // Type-check all non-generic functions in the root module (or just entry_name when specified)
     for (const auto& fn : root_ast.functions) {
+        if (!entry_name.empty() && fn.name != entry_name) continue;
         if (!fn.generic_params.empty()) {
-            if (fn.is_entry_kernel()) {
+            if (fn.is_entry_kernel() || !entry_name.empty()) {
                 diags.error(fn.span, "entry kernel '" + fn.name + "' cannot have generic parameters");
             }
             continue;
