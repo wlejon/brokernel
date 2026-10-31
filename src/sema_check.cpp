@@ -3,13 +3,9 @@
 #include <cmath>
 #include <cstdlib>
 namespace brokernel::detail {
-static bool match_type_pattern(
-    const TypeExpr* pattern,
-    const Type& actual,
-    const std::string& decl_mod,
-    const std::vector<GenericParamDecl>& generic_params,
-    SemaContext& ctx,
-    GenericEnv& inferred) {
+static bool match_type_pattern(const TypeExpr* pattern, const Type& actual, const std::string& decl_mod,
+                               const std::vector<GenericParamDecl>& generic_params, SemaContext& ctx,
+                               GenericEnv& inferred) {
     if (!pattern || actual.is_void()) return false;
     auto bind_const_param = [&](const std::string& name, int64_t val) {
         if (name.empty()) return;
@@ -20,16 +16,11 @@ static bool match_type_pattern(
             }
         }
     };
-    // Direct generic parameter name
     if (pattern->args.empty()) {
         for (const auto& gp : generic_params) {
             if (!gp.is_const && gp.name == pattern->name) {
-                auto it = inferred.type_params.find(pattern->name);
-                if (it == inferred.type_params.end()) {
-                    inferred.type_params[pattern->name] = actual;
-                    return true;
-                }
-                return it->second == actual;
+                auto [it, inserted] = inferred.type_params.emplace(pattern->name, actual);
+                return inserted || it->second == actual;
             }
         }
     }

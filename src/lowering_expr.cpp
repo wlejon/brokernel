@@ -103,16 +103,22 @@ std::vector<brass::Value*> MirBodyLowerer::pack_var_ids(const std::vector<int>& 
 ValueList MirBodyLowerer::lower_inlined_call(
     const CheckedFunction& callee,
     const std::vector<ValueList>& arg_vals,
-    const std::vector<std::optional<BlockPlace>>& arg_places) {
+    const std::vector<std::optional<BlockPlace>>& arg_places,
+    const std::vector<std::optional<LocalPlace>>& arg_local_places) {
     // Save outer return tracking, loop stack, and scopes
     int saved_has_ret = has_returned_var_id;
     int saved_ret_val = ret_val_var_id;
     Type saved_ret_type = active_return_type;
     std::string saved_fn_name = active_fn_name;
+    auto saved_dyn_vars = std::move(dyn_indexed_vars);
     auto saved_scopes = std::move(scopes);
     auto saved_loops = std::move(loop_stack);
     scopes.clear();
     loop_stack.clear();
+    dyn_indexed_vars.clear();
+    collect_dyn_indexed_vars(callee.body);
+    std::set<std::string> callee_assigned;
+    for (const auto& st : callee.body) collect_assigned_names(st.get(), callee_assigned);
     push_scope();
     active_return_type = callee.return_type;
     active_fn_name = callee.name;
@@ -123,9 +129,17 @@ ValueList MirBodyLowerer::lower_inlined_call(
         ret_val_var_id = -1;
     }
     for (size_t i = 0; i < callee.params.size() && i < arg_vals.size(); ++i) {
-        int id = alloc_var(callee.params[i].name, arg_vals[i]);
+        const auto& cp = callee.params[i];
         if (i < arg_places.size() && arg_places[i].has_value()) {
+            int id = alloc_var(cp.name, {});
             block_places[id] = *arg_places[i];
+        } else if (i < arg_local_places.size() && arg_local_places[i].has_value()) {
+            int id = alloc_var(cp.name, {});
+            local_places[id] = *arg_local_places[i];
+        } else if ((cp.type.is_array() || cp.type.is_struct()) && dyn_indexed_vars.count(cp.name)) {
+            alloc_local_place_var(cp.name, cp.type, arg_vals[i], !callee_assigned.count(cp.name));
+        } else {
+            alloc_var(cp.name, arg_vals[i]);
         }
     }
     lower_stmt_list(callee.body);
@@ -138,6 +152,7 @@ ValueList MirBodyLowerer::lower_inlined_call(
     if (ret_val_var_id >= 0) var_values.erase(ret_val_var_id);
     scopes = std::move(saved_scopes);
     loop_stack = std::move(saved_loops);
+    dyn_indexed_vars = std::move(saved_dyn_vars);
     has_returned_var_id = saved_has_ret;
     ret_val_var_id = saved_ret_val;
     active_return_type = saved_ret_type;
@@ -166,6 +181,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (auto v = try_shared_read(e)) return *v;
             if (e->global_index >= 0) return global_value(e);
             if (auto v = try_block_read(e)) return *v;
+            if (auto v = try_local_read(e)) return *v;
             int id = lookup_var_id(e->name);
             if (id >= 0) return var_values[id];
             return make_zero_leaves(e->resolved_type);
@@ -258,6 +274,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         case Expr::Kind::Field: {
             if (auto v = try_block_read(e)) return *v;
             if (auto v = try_shared_read(e)) return *v;
+            if (auto v = try_local_read(e)) return *v;
             ValueList recv = lower_expr(e->lhs.get());
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_scalar()) return recv;
@@ -288,6 +305,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         case Expr::Kind::Index: {
             if (auto v = try_block_read(e)) return *v;
             if (auto v = try_shared_read(e)) return *v;
+            if (auto v = try_local_read(e)) return *v;
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_store()) {
@@ -307,6 +325,15 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             Type elem_t = rt.element_type();
             uint32_t elem_leaves = mod.types.flat_leaf_count(elem_t);
             uint32_t count = rt.dimension;
+            const brass::Instruction* def = idx && idx->is_instruction() ? idx->defining_instruction() : nullptr;
+            if (def && def->opcode() == brass::Opcode::iconst_i32) {
+                uint32_t c = static_cast<uint32_t>(
+                    std::clamp<int32_t>(def->imm_i32(), 0, static_cast<int32_t>(count) - 1));
+                uint32_t off = c * elem_leaves;
+                if (off + elem_leaves <= recv.size()) {
+                    return ValueList(recv.begin() + off, recv.begin() + off + elem_leaves);
+                }
+            }
             ValueList res(elem_leaves, recv[0]);
             for (uint32_t k = 0; k < elem_leaves; ++k) {
                 brass::Value* acc = recv[k];
@@ -538,24 +565,38 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             const std::string& n = e->name;
             // 1. User / stdlib function call (inlined)
             if (const CheckedFunction* callee = mod.find_function(n)) {
+                std::set<std::string> callee_assigned;
+                for (const auto& st : callee->body) collect_assigned_names(st.get(), callee_assigned);
                 std::vector<ValueList> arg_vals;
                 std::vector<std::optional<BlockPlace>> arg_places;
+                std::vector<std::optional<LocalPlace>> arg_local_places;
                 arg_vals.reserve(e->args.size());
                 arg_places.reserve(e->args.size());
+                arg_local_places.reserve(e->args.size());
                 for (size_t i = 0; i < e->args.size(); ++i) {
                     const Expr* a = e->args[i].get();
                     BlockPlace bp;
+                    LocalPlace lp;
                     if (i < callee->params.size() &&
                         (callee->params[i].type.is_struct() || callee->params[i].type.is_array()) &&
                         is_block_path(a) && block_place(a, bp)) {
                         arg_vals.emplace_back();
                         arg_places.emplace_back(std::move(bp));
+                        arg_local_places.emplace_back(std::nullopt);
+                    } else if (i < callee->params.size() &&
+                               (callee->params[i].type.is_struct() || callee->params[i].type.is_array()) &&
+                               !callee_assigned.count(callee->params[i].name) &&
+                               is_local_path(a, false) && local_place(a, lp)) {
+                        arg_vals.emplace_back();
+                        arg_places.emplace_back(std::nullopt);
+                        arg_local_places.emplace_back(std::move(lp));
                     } else {
                         arg_vals.push_back(lower_expr(a));
                         arg_places.emplace_back(std::nullopt);
+                        arg_local_places.emplace_back(std::nullopt);
                     }
                 }
-                return lower_inlined_call(*callee, arg_vals, arg_places);
+                return lower_inlined_call(*callee, arg_vals, arg_places, arg_local_places);
             }
             // 2. Internal splat helper inserted by Sema
             if (n == "__splat") {

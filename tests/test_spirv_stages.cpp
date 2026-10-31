@@ -670,14 +670,8 @@ static void test_builtin_type_diagnostics() {
 }
 
 static void test_stage_misuse_diagnostics() {
-    const char* bad_src = R"(
-        @compute fn bad_compute() {
-            let fc = frag_coord();
-        }
-    )";
-    auto res = compile_source(bad_src, "bad_stage.bk");
-    assert(!res.ok);
-    assert(res.error_message().find("@fragment") != std::string::npos);
+    auto res = compile_source("@compute fn bad_compute() { let fc = frag_coord(); }", "bad_stage.bk");
+    assert(!res.ok && res.error_message().find("@fragment") != std::string::npos);
 }
 
 static void test_const_pruning() {
@@ -686,27 +680,14 @@ static void test_const_pruning() {
         @binding(0, 0) var camera: uniform<Camera>;
         @binding(0, 1) var indirect_buf: read_buffer<vec4<f32>>;
         @binding(0, 2) var extra_buf: read_buffer<vec4<f32>>;
-
         fn mesh_impl<const INDIRECT: i32, const WRITE_DEPTH: i32>(uv: vec2<f32>, extra_flag: bool) {
             set_frag_output(0, camera.tint);
-            if ((INDIRECT & 1) != 0) {
-                set_frag_output(1, indirect_buf[0]);
-            }
-            if (extra_flag) {
-                set_frag_output(2, extra_buf[0]);
-            }
-            if (WRITE_DEPTH != 0) {
-                set_frag_depth(uv.x);
-            }
+            if ((INDIRECT & 1) != 0) { set_frag_output(1, indirect_buf[0]); }
+            if (extra_flag) { set_frag_output(2, extra_buf[0]); }
+            if (WRITE_DEPTH != 0) { set_frag_depth(uv.x); }
         }
-
-        @fragment fn mesh_main(@location(0) uv: vec2<f32>) {
-            mesh_impl<0, 0>(uv, false);
-        }
-
-        @fragment fn mesh_indirect_main(@location(0) uv: vec2<f32>) {
-            mesh_impl<1, 1>(uv, true);
-        }
+        @fragment fn mesh_main(@location(0) uv: vec2<f32>) { mesh_impl<0, 0>(uv, false); }
+        @fragment fn mesh_indirect_main(@location(0) uv: vec2<f32>) { mesh_impl<1, 1>(uv, true); }
     )";
     CompileOptions opts;
     opts.emit_spirv_disassembly = true;
@@ -714,23 +695,18 @@ static void test_const_pruning() {
     if (!res.ok) std::cerr << res.error_message() << "\n";
     assert(res.ok);
     require_valid(res);
-
     const CompiledKernel* direct = res.find_kernel("mesh_main");
     const CompiledKernel* indirect = res.find_kernel("mesh_indirect_main");
     assert(direct && indirect);
-
     auto has_depth_replacing = [](const std::string& dis) {
         std::istringstream lines(dis);
-        std::string line;
-        while (std::getline(lines, line)) {
+        for (std::string line; std::getline(lines, line);) {
             std::istringstream w(line);
             std::string o, id, v, more;
             if (w >> o >> id >> v && !(w >> more) && o == "OpExecutionMode" && v == "12") return true;
         }
         return false;
     };
-
-    // mesh_main reaches only binding (0, 0), writes only @location(0), and does not replace FragDepth.
     assert(direct->spirv.descriptors.size() == 1);
     assert(direct->spirv.descriptors[0].set == 0 && direct->spirv.descriptors[0].binding == 0);
     assert(direct->spirv_disassembly.find("out_loc0") != std::string::npos);
@@ -738,8 +714,6 @@ static void test_const_pruning() {
     assert(direct->spirv_disassembly.find("out_loc2") == std::string::npos);
     assert(direct->spirv_disassembly.find("gl_FragDepth") == std::string::npos);
     assert(!has_depth_replacing(direct->spirv_disassembly));
-
-    // mesh_indirect_main reaches bindings (0, 0), (0, 1), and (0, 2), writes @location(0..2), and has DepthReplacing (12).
     assert(indirect->spirv.descriptors.size() == 3);
     assert(indirect->spirv_disassembly.find("out_loc0") != std::string::npos);
     assert(indirect->spirv_disassembly.find("out_loc1") != std::string::npos);
@@ -928,6 +902,80 @@ static void test_compute_shared_and_atomics() {
     }
 }
 
+static void test_dynamic_local_and_const_arrays() {
+    // 1. 14-entry const table indexed by a loop variable, plus local array<vec3f, 6> (SkySh replacement).
+    const char* src = R"(
+        const WEIGHTS: array<f32, 14> = array<f32, 14>(
+            1.0, 2.5, 3.25, 4.75, 5.5, 6.125, 7.875,
+            8.0, 9.5, 10.25, 11.75, 12.5, 13.125, 14.375
+        );
+
+        fn eval_sky_sh(sh: array<vec3f, 6>, dir: vec3f) -> vec3f {
+            let weights: array<f32, 6> = array<f32, 6>(
+                max(0.0, dir.x), max(0.0, -dir.x),
+                max(0.0, dir.y), max(0.0, -dir.y),
+                max(0.0, dir.z), max(0.0, -dir.z)
+            );
+            var sum: vec3f = vec3f(0.0);
+            for (var i: i32 = 0; i < 6; i += 1) {
+                sum += sh[i] * weights[i];
+            }
+            return sum;
+        }
+
+        @kernel @grid(1)
+        fn eval_table_and_sh(g: grid<1>, out: write_store<vec4f, 1>) {
+            let x: i32 = g.x();
+            var tbl_acc: f32 = 0.0;
+            for (var i: i32 = 0; i < 14; i += 1) {
+                let idx: i32 = (i + x) % 14;
+                tbl_acc += WEIGHTS[idx] * f32(i + 1);
+            }
+
+            var sh: array<vec3f, 6>;
+            for (var k: i32 = 0; k < 6; k += 1) {
+                sh[k] = vec3f(f32(k + 1), f32(k * 2 + 1), f32(x + k));
+            }
+            let dir: vec3f = normalize(vec3f(f32(x) - 7.5, 2.0, -3.0));
+            let col: vec3f = eval_sky_sh(sh, dir);
+            out.write(vec4f(col, tbl_acc));
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "dyn_arrays.bk", opts);
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    require_valid(res);
+
+    const CompiledKernel* k = res.find_kernel("eval_table_and_sh");
+    assert(k && k->has_cpu_build());
+    assert(k->spirv_disassembly.find("OpConstantComposite") != std::string::npos);
+    assert(k->spirv_disassembly.find("OpAccessChain") != std::string::npos);
+    // Neither WEIGHTS[idx] nor sh[i] / weights[i] should emit a float OpSelect ladder.
+    assert(k->spirv_disassembly.find("OpSelect %50") == std::string::npos);
+    size_t select_count = 0;
+    for (size_t pos = 0; (pos = k->spirv_disassembly.find("OpSelect ", pos)) != std::string::npos; pos += 9) {
+        ++select_count;
+    }
+    assert(select_count <= 9); // only loop-header bool materializations, no array ladder
+    size_t fn_pos = k->spirv_disassembly.find("OpFunction ");
+    assert(fn_pos != std::string::npos);
+    size_t inst_count = 0;
+    for (size_t pos = fn_pos; (pos = k->spirv_disassembly.find('\n', pos)) != std::string::npos; ++pos) {
+        ++inst_count;
+    }
+    assert(inst_count < 300);
+
+    std::vector<float> out_data(16 * 4, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out_data)};
+    if (brass::gpu::vulkan_available()) {
+        auto rep = k->compare_cpu_gpu(GridShape(16), args, 1e-5, 1e-5);
+        if (!rep.ok) std::cerr << "dyn_arrays parity: " << rep.message << "\n";
+        assert(rep.ok && rep.ran_gpu);
+    }
+}
+
 int main() {
     test_compute_spirv_and_ptx();
     test_vertex_stage_spirv();
@@ -940,6 +988,7 @@ int main() {
     test_module_resources();
     test_const_pruning();
     test_compute_shared_and_atomics();
+    test_dynamic_local_and_const_arrays();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

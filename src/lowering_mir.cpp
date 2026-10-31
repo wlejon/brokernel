@@ -114,7 +114,7 @@ void MirBodyLowerer::lower_branch(brass::Value* cond, const std::function<void()
 }
 // The names of the variables `s` assigns (a store's or a buffer's elements
 // are not variables).
-static void collect_assigned_names(const Stmt* s, std::set<std::string>& out) {
+void collect_assigned_names(const Stmt* s, std::set<std::string>& out) {
     if (!s) return;
     if (s->kind == Stmt::Kind::Assign) {
         const Expr* t = s->assign_target.get();
@@ -149,7 +149,9 @@ void MirBodyLowerer::lower_loop(int broke_var_id, int cont_var_id, int counter_v
         for (const Stmt* w : writers) collect_assigned_names(w, names);
         for (const auto& n : names) {
             int vid = lookup_var_id(n);
-            if (vid >= 0 && !shared_places.count(vid) && !block_places.count(vid)) carried.insert(vid);
+            if (vid >= 0 && !shared_places.count(vid) && !block_places.count(vid) && !local_places.count(vid)) {
+                carried.insert(vid);
+            }
         }
     }
     std::vector<int> live_ids;
@@ -247,6 +249,14 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
                     break;
                 }
             }
+            if ((s->resolved_var_type.is_array() || s->resolved_var_type.is_struct()) &&
+                dyn_indexed_vars.count(s->var_name)) {
+                ValueList init = (s->init_expr || !is_gpu) ? (s->init_expr ? lower_expr(s->init_expr.get())
+                                                                           : make_zero_leaves(s->resolved_var_type))
+                                                           : ValueList{};
+                alloc_local_place_var(s->var_name, s->resolved_var_type, init, s->kind == Stmt::Kind::Let);
+                break;
+            }
             ValueList init = s->init_expr ? lower_expr(s->init_expr.get())
                                           : make_zero_leaves(s->resolved_var_type);
             alloc_var(s->var_name, std::move(init));
@@ -254,8 +264,8 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
         }
         case Stmt::Kind::Assign: {
             ValueList rhs = lower_expr(s->assign_value.get());
-            // 0. A place in a storage buffer at a descriptor or in shared memory.
-            if (try_block_assign(s, rhs) || try_shared_assign(s, rhs)) return;
+            // 0. A place in a storage buffer at a descriptor, in shared memory, or in a local array slot.
+            if (try_block_assign(s, rhs) || try_shared_assign(s, rhs) || try_local_assign(s, rhs)) return;
             // 1. Store indexing assignment: `st[x, y] = val` or `st[x, y] += val`
             if (s->assign_target->kind == Expr::Kind::Index &&
                 s->assign_target->lhs->resolved_type.is_store()) {
@@ -278,121 +288,7 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
                 return;
             }
             // 2. Local variable (or nested field / vector swizzle / vector or array element of local variable)
-            std::function<void(const Expr*, const std::function<ValueList(const ValueList&)>&)> update_lvalue;
-            update_lvalue = [&](const Expr* target, const std::function<ValueList(const ValueList&)>& write_fn) {
-                if (!target) return;
-                if (target->kind == Expr::Kind::Ident) {
-                    int id = lookup_var_id(target->name);
-                    if (id >= 0) {
-                        var_values[id] = write_fn(var_values[id]);
-                    }
-                    return;
-                }
-                if (target->kind == Expr::Kind::Field && target->lhs) {
-                    const Type& base_t = target->lhs->resolved_type;
-                    if (base_t.is_scalar()) {
-                        update_lvalue(target->lhs.get(), write_fn);
-                        return;
-                    }
-                    if (base_t.is_vector()) {
-                        const std::string& swz = target->name;
-                        update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
-                            ValueList old_sub;
-                            old_sub.reserve(swz.size());
-                            for (char c : swz) {
-                                uint32_t idx = swizzle_index(c);
-                                old_sub.push_back(idx < cur.size() ? cur[idx] : cur[0]);
-                            }
-                            ValueList new_sub = write_fn(old_sub);
-                            ValueList next = cur;
-                            for (size_t k = 0; k < swz.size() && k < new_sub.size(); ++k) {
-                                uint32_t idx = swizzle_index(swz[k]);
-                                if (idx < next.size()) {
-                                    next[idx] = new_sub[k];
-                                }
-                            }
-                            return next;
-                        });
-                        return;
-                    }
-                    if (base_t.is_struct()) {
-                        const StructDef* sdef = mod.types.find_struct(base_t.struct_id);
-                        const StructField* sf = sdef ? sdef->find_field(target->name) : nullptr;
-                        if (!sf) return;
-                        update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
-                            ValueList old_sub;
-                            old_sub.reserve(sf->flat_leaf_count);
-                            for (uint32_t k = 0; k < sf->flat_leaf_count; ++k) {
-                                uint32_t idx = sf->flat_leaf_offset + k;
-                                old_sub.push_back(idx < cur.size() ? cur[idx] : cur[0]);
-                            }
-                            ValueList new_sub = write_fn(old_sub);
-                            ValueList next = cur;
-                            for (uint32_t k = 0; k < sf->flat_leaf_count && k < new_sub.size(); ++k) {
-                                uint32_t idx = sf->flat_leaf_offset + k;
-                                if (idx < next.size()) {
-                                    next[idx] = new_sub[k];
-                                }
-                            }
-                            return next;
-                        });
-                        return;
-                    }
-                    return;
-                }
-                if (target->kind == Expr::Kind::Index && target->lhs && !target->args.empty()) {
-                    const Type& base_t = target->lhs->resolved_type;
-                    if (base_t.is_scalar()) {
-                        update_lvalue(target->lhs.get(), write_fn);
-                        return;
-                    }
-                    ValueList idx_v = lower_expr(target->args[0].get());
-                    brass::Value* idx = idx_v.empty() ? b.build_iconst_i32(0) : idx_v[0];
-                    if (idx->type() == brass::Type::i64()) {
-                        idx = b.build_trunc_i32(idx);
-                    }
-                    Type elem_t = base_t.element_type();
-                    uint32_t elem_leaves = mod.types.flat_leaf_count(elem_t);
-                    uint32_t count = base_t.dimension;
-                    update_lvalue(target->lhs.get(), [&](const ValueList& cur) -> ValueList {
-                        if (cur.empty() || elem_leaves == 0 || count == 0) return cur;
-                        ValueList old_sub(elem_leaves, cur[0]);
-                        for (uint32_t k = 0; k < elem_leaves; ++k) {
-                            brass::Value* acc = k < cur.size() ? cur[k] : cur[0];
-                            for (uint32_t i = 1; i < count; ++i) {
-                                uint32_t off = i * elem_leaves + k;
-                                if (off < cur.size()) {
-                                    brass::Value* eq = b.build_eq(idx, b.build_iconst_i32(static_cast<int32_t>(i)));
-                                    acc = b.build_select(eq, cur[off], acc);
-                                }
-                            }
-                            old_sub[k] = acc;
-                        }
-                        ValueList new_sub = write_fn(old_sub);
-                        ValueList next = cur;
-                        for (uint32_t i = 0; i < count; ++i) {
-                            brass::Value* eq = b.build_eq(idx, b.build_iconst_i32(static_cast<int32_t>(i)));
-                            for (uint32_t k = 0; k < elem_leaves && k < new_sub.size(); ++k) {
-                                uint32_t off = i * elem_leaves + k;
-                                if (off < next.size()) {
-                                    next[off] = b.build_select(eq, new_sub[k], next[off]);
-                                }
-                            }
-                        }
-                        return next;
-                    });
-                    return;
-                }
-            };
-            ScalarKind sk = s->assign_target->resolved_type.scalar;
-            update_lvalue(s->assign_target.get(), [&](const ValueList& old_v) -> ValueList {
-                if (!s->compound_op.has_value()) return rhs;
-                ValueList res = old_v;
-                for (size_t k = 0; k < res.size() && k < rhs.size(); ++k) {
-                    res[k] = lower_scalar_binary(*s->compound_op, res[k], rhs[k], sk);
-                }
-                return res;
-            });
+            assign_local_lvalue(s, rhs);
             break;
         }
         case Stmt::Kind::If: {
@@ -495,6 +391,7 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     lowerer.b.scratch = f.scratch;
     lowerer.vplan = plan;
     lowerer.x_interior = x_interior;
+    lowerer.collect_dyn_indexed_vars(fn.body);
     lowerer.push_scope();
     lowerer.gw = f.gw;
     lowerer.gh = f.gh;
@@ -530,7 +427,12 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
                 }
             }
         }
-        lowerer.alloc_var(fn.params[i].name, pvals);
+        if ((fn.params[i].type.is_array() || fn.params[i].type.is_struct()) &&
+            lowerer.dyn_indexed_vars.count(fn.params[i].name)) {
+            lowerer.alloc_local_place_var(fn.params[i].name, fn.params[i].type, pvals);
+        } else {
+            lowerer.alloc_var(fn.params[i].name, pvals);
+        }
         const ParamRole role = fn.params[i].role;
         if (role == ParamRole::Store || role == ParamRole::Stencil) {
             lowerer.bind_store_param(i, f.params[i]);
@@ -714,6 +616,7 @@ LoweredKernelMir lower_kernel_to_mir(
         brass::BasicBlock* entry = b.append_block("entry");
         b.position_at_end(entry);
         MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/true);
+        lowerer.collect_dyn_indexed_vars(fn.body);
         lowerer.push_scope();
         lowerer.active_return_type = fn.return_type;
         lowerer.has_returned_var_id = lowerer.alloc_var("__has_returned", {b.build_iconst_i32(0)});
@@ -780,7 +683,11 @@ LoweredKernelMir lower_kernel_to_mir(
                 for (ScalarKind sk : kinds) {
                     leaves.push_back(b.add_param(to_mir_scalar_type(sk)));
                 }
-                lowerer.alloc_var(cp.name, std::move(leaves));
+                if ((cp.type.is_array() || cp.type.is_struct()) && lowerer.dyn_indexed_vars.count(cp.name)) {
+                    lowerer.alloc_local_place_var(cp.name, cp.type, leaves);
+                } else {
+                    lowerer.alloc_var(cp.name, std::move(leaves));
+                }
                 mir_idx += pinfo.mir_param_count;
             }
             out.param_infos.push_back(std::move(pinfo));
@@ -889,6 +796,7 @@ LoweredKernelMir lower_kernel_to_mir(
         brass::Value* coords_shape = b.add_param(brass::Type::ptr());
         brass::Value* out_ret = b.add_param(brass::Type::ptr());
         MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/false);
+        lowerer.collect_dyn_indexed_vars(fn.body);
         lowerer.push_scope();
         lowerer.active_return_type = fn.return_type;
         lowerer.has_returned_var_id = lowerer.alloc_var("__has_returned", {b.build_iconst_i32(0)});
@@ -941,7 +849,11 @@ LoweredKernelMir lower_kernel_to_mir(
                     leaves.push_back(b.build_load(to_mir_scalar_type(sk), args_pack, slot * 8));
                     slot += 1;
                 }
-                lowerer.alloc_var(cp.name, std::move(leaves));
+                if ((cp.type.is_array() || cp.type.is_struct()) && lowerer.dyn_indexed_vars.count(cp.name)) {
+                    lowerer.alloc_local_place_var(cp.name, cp.type, leaves);
+                } else {
+                    lowerer.alloc_var(cp.name, std::move(leaves));
+                }
             }
         }
         for (const auto& bb : out.block_bindings) {

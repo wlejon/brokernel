@@ -8,6 +8,8 @@
 // names the parameter, as a texture's does.
 
 #include "lowering_internal.h"
+#include <algorithm>
+#include <cstring>
 
 namespace brokernel::detail {
 

@@ -5,6 +5,7 @@
 #include "lowering_ops.h"
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <tuple>
@@ -19,6 +20,7 @@ using ValueList = std::vector<brass::Value*>;
 brass::Type to_mir_scalar_type(ScalarKind sk);
 uint32_t swizzle_index(char c);
 bool stmt_has_return(const Stmt* s);
+void collect_assigned_names(const Stmt* s, std::set<std::string>& out);
 
 // lowering_math.cpp: the transcendentals as MIR arithmetic, one algorithm for
 // the CPU and the GPU. nullptr when `name` is not one of them.
@@ -191,6 +193,32 @@ struct MirBodyLowerer {
     ValueList shared_atomic(const Expr* e, const SharedPlace& p, const std::string& op,
                             const std::vector<ValueList>& args);
 
+    // Function-local stack/Function-storage array places (lowering_block.cpp).
+    struct LocalPlace {
+        brass::Value* base = nullptr;
+        brass::Value* word_offset = nullptr;   // element offset (units of elem_bytes), i32
+        Type type;
+        std::vector<uint32_t> lanes;
+        uint32_t elem_bytes = 4;
+        uint32_t total_words = 1;
+    };
+    std::unordered_map<int, LocalPlace> local_places;
+    std::map<std::vector<uint64_t>, LocalPlace> const_array_slots;
+    std::set<std::string> dyn_indexed_vars;
+    void collect_dyn_indexed_vars(const std::vector<StmtPtr>& stmts);
+    brass::Value* alloc_entry_slot(uint32_t bytes, uint32_t align);
+    LocalPlace get_or_create_const_slot(const Type& t, const ValueList& leaves);
+    LocalPlace materialize_array_slot(const Type& t, const ValueList& leaves);
+    int alloc_local_place_var(const std::string& name, const Type& t, const ValueList& init_leaves,
+                              bool is_const_init = false);
+    bool is_local_path(const Expr* e, bool for_assign = false) const;
+    bool local_place(const Expr* e, LocalPlace& p);
+    ValueList local_load(const Expr* e, const LocalPlace& p);
+    void local_store(const Expr* e, const LocalPlace& p, const ValueList& value);
+    std::optional<ValueList> try_local_read(const Expr* e);
+    bool try_local_assign(const Stmt* s, ValueList rhs);
+    void assign_local_lvalue(const Stmt* s, const ValueList& rhs);
+
     // `store` accessed at a cell, covering `dim` axes: its pointer alone.
     ValueList at_cells(const ValueList& store, uint32_t dim);
     // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are
@@ -209,6 +237,7 @@ struct MirBodyLowerer {
             var_values.erase(id);
             block_places.erase(id);
             shared_places.erase(id);
+            local_places.erase(id);
         }
         scopes.pop_back();
     }
@@ -261,7 +290,8 @@ struct MirBodyLowerer {
                     const std::function<brass::Value*()>& cond_fn, const std::function<void()>& body_fn,
                     const std::function<void()>& step_fn);
     ValueList lower_inlined_call(const CheckedFunction& callee, const std::vector<ValueList>& arg_vals,
-                                 const std::vector<std::optional<BlockPlace>>& arg_places = {});
+                                 const std::vector<std::optional<BlockPlace>>& arg_places = {},
+                                 const std::vector<std::optional<LocalPlace>>& arg_local_places = {});
 };
 
 } // namespace brokernel::detail
