@@ -54,6 +54,9 @@ const char* roleName(ParamRole r) {
         case ParamRole::Stencil: return "stencil";
         case ParamRole::Image: return "image";
         case ParamRole::Sampler: return "sampler";
+        case ParamRole::StageInput: return "stage_input";
+        case ParamRole::Uniform: return "uniform";
+        case ParamRole::Buffer: return "buffer";
         default: return "other";
     }
 }
@@ -66,10 +69,10 @@ const char* accessName(AccessMode m) {
     }
 }
 
-// The parameters a caller passes: all but the grid and the GPU's image and
-// sampler bindings.
+// The parameters a caller passes: all but the grid, the GPU's descriptor
+// bindings and a stage's inputs.
 bool isPassed(const KernelParamInfo& p) {
-    return p.role != ParamRole::Grid && p.role != ParamRole::Image && p.role != ParamRole::Sampler;
+    return !is_bound_param(p.role);
 }
 
 bool isStore(const KernelParamInfo& p) {
