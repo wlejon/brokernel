@@ -112,16 +112,19 @@ static void test_fragment_stage_spirv() {
     const char* src = R"(
         import std::color;
 
-        @fragment fn atmosphere_fs(exposure: f32) {
+        @fragment fn atmosphere_fs(@binding(0, 0) albedo: sampler2d<vec4<f32>>,
+                                   @location(0) uv: vec2<f32>,
+                                   exposure: f32) {
             let fc: vec4<f32> = frag_coord();
-            let dx: f32 = dpdx(fc.x);
-            let dy: f32 = dpdy(fc.y);
             if fc.w < 0.0 {
                 discard_fragment();
             }
-            let hdr = vec3<f32>(fc.x * 0.001 + dx, fc.y * 0.001 + dy, 0.5) * exposure;
+            let tex: vec4<f32> = albedo.sample(uv);
+            let dx: f32 = dpdx(uv.x);
+            let dy: f32 = dpdy(uv.y);
+            let hdr = (tex.xyz + vec3<f32>(fc.x * 0.001 + dx, fc.y * 0.001 + dy, 0.5)) * exposure;
             let ldr = color::aces_tonemap<f32>(hdr);
-            set_frag_color(vec4<f32>(ldr.x, ldr.y, ldr.z, 1.0));
+            set_frag_color(vec4<f32>(ldr.x, ldr.y, ldr.z, tex.w));
         }
     )";
 
@@ -137,12 +140,21 @@ static void test_fragment_stage_spirv() {
     assert(k != nullptr);
     assert(k->stage == Stage::Fragment);
     assert(!k->spirv.words.empty());
-    assert(k->spirv_disassembly.find("OpEntryPoint Fragment") != std::string::npos);
-    assert(k->spirv_disassembly.find("out_loc0") != std::string::npos);
-    // Real derivatives and a real discard, not stand-ins.
-    assert(k->spirv_disassembly.find("OpDPdx") != std::string::npos);
-    assert(k->spirv_disassembly.find("OpDPdy") != std::string::npos);
-    assert(k->spirv_disassembly.find("OpDemoteToHelperInvocation") != std::string::npos);
+    const std::string& d = k->spirv_disassembly;
+    assert(d.find("OpEntryPoint Fragment") != std::string::npos);
+    assert(d.find("out_loc0") != std::string::npos);
+    // Real derivatives and a real demote, not stand-ins.
+    auto demote = d.find("OpDemoteToHelperInvocation");
+    auto sample = d.find("OpImageSampleImplicitLod");
+    auto dpdx_pos = d.find("OpDPdx");
+    auto dpdy_pos = d.find("OpDPdy");
+    assert(demote != std::string::npos);
+    assert(sample != std::string::npos && sample > demote);
+    assert(dpdx_pos != std::string::npos && dpdx_pos > demote);
+    assert(dpdy_pos != std::string::npos && dpdy_pos > demote);
+    // No branch around the implicit-LOD sample or derivatives after the discard merge, and no __has_returned phi.
+    assert(d.find("OpBranchConditional", demote) == std::string::npos);
+    assert(d.find("OpPhi") == std::string::npos);
     // A fragment stage has no CPU build.
     assert(!k->has_cpu_build() && !k->cpu_point_fn().is_valid() && !k->cpu_grid_fn().is_valid());
 }

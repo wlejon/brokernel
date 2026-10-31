@@ -983,11 +983,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 return {is_gpu ? b.build_call("spirv_front_facing", brass::Type::i32()) : b.build_iconst_i32(1)};
             }
             if (n == "discard_fragment") {
-                // Demote drops the fragment's outputs; the rest of the body is skipped like a return.
+                // Demote drops the fragment's outputs and keeps the invocation running in uniform control flow.
                 if (is_gpu) b.build_call("spirv_demote_to_helper", brass::Type::void_type());
-                if (has_returned_var_id >= 0) {
-                    var_values[has_returned_var_id] = {b.build_iconst_i32(1)};
-                }
                 return {};
             }
             // 6. Vector reductions: dot, length, distance, cross, normalize, reflect
