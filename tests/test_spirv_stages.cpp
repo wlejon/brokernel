@@ -490,6 +490,70 @@ static void test_separate_samplers() {
     }
 }
 
+// Module-level resources: a module declares the descriptors it reads
+// (`@binding(s, b) var name: T;`), and a function of it, or of a module
+// importing it, reads them by name, unqualified, through a symbol import,
+// or by path; a buffer's elements are written through one.
+static void test_module_resources() {
+    Compiler compiler;
+    compiler.register_module("scene", R"(
+        module scene;
+        pub struct Camera { view_proj: vec4<f32>, eye: vec3<f32>, frame: vec4<f32> }
+        pub struct Light { color: vec4<f32>, dir: vec4<f32> }
+        @binding(0, 0) pub var camera: uniform<Camera>;
+        @binding(1, 0) pub var lights: read_buffer<Light>;
+        @binding(1, 8) pub var linear: sampler;
+        @binding(1, 1) pub var sky: texture_cube<vec3<f32>>;
+        @binding(2, 5) pub var meter: buffer<vec4<f32>>;
+        pub fn sky_light(dir: vec3<f32>) -> vec3<f32> {
+            return sky.sample_lod(linear, dir, 0.0) * lights[0].color.rgb;
+        }
+    )");
+    const char* src = R"(
+        import scene;
+        from scene import camera;
+        @fragment fn shade(@location(0) dir: vec3<f32>) {
+            let l: vec3<f32> = scene::sky_light(normalize(dir)) + camera.eye * scene::camera.frame.x;
+            scene::meter[1] = vec4<f32>(l, 1.0);
+            set_frag_color(vec4<f32>(l, 1.0));
+        }
+        @kernel @grid(1) fn plain(out: write_store<f32, 1>, g: grid<1>) { out.write(1.0); }
+    )";
+    auto res = compiler.compile_source(src, "uses_scene.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    require_valid(res);
+    const CompiledKernel* fs = nullptr;
+    const CompiledKernel* cs = nullptr;
+    for (const auto& k : res.kernels) {
+        if (k.name == "shade") fs = &k;
+        if (k.name == "plain") cs = &k;
+    }
+    assert(fs && cs);
+    using brass::target::SpirvDescriptorKind;
+    // Only what the stage reads is bound; the kernel reading none keeps its CPU build.
+    assert(fs->spirv.descriptors.size() == 5);
+    for (const auto& b : fs->spirv.descriptors) {
+        if (b.set == 0) assert(b.kind == SpirvDescriptorKind::UniformBuffer);
+        if (b.set == 2) assert(b.kind == SpirvDescriptorKind::StorageBuffer && b.binding == 5);
+    }
+    assert(cs->spirv.descriptors.empty() && cs->has_cpu_build());
+    for (const auto& p : fs->params) assert(p.name == "dir");
+
+    // A module-level value that is no resource, one without a binding, a
+    // read-only buffer written and an unexported module's resource refused.
+    Compiler bad;
+    for (const char* src_bad : {
+             "@binding(0) var x: f32;",
+             "var c: uniform<vec4<f32>>;",
+             "@binding(0) var b: read_buffer<f32>;\n@fragment fn f() { b[0] = 1.0; }",
+         }) {
+        auto r = bad.compile_source(src_bad, "bad_resource.bk");
+        if (r.ok) std::cerr << "module resources: accepted\n" << src_bad << "\n";
+        assert(!r.ok);
+    }
+}
+
 static void test_builtin_type_diagnostics() {
     auto fails_with = [](const char* src, const char* needle) {
         auto res = compile_source(src, "bad_builtin.bk");
@@ -525,6 +589,7 @@ int main() {
     test_render_math();
     test_textures();
     test_separate_samplers();
+    test_module_resources();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

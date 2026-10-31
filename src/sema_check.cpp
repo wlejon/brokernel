@@ -247,6 +247,7 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     e->path.clear();
     e->name = inst_name;
     if (inst_f64) fn.uses_f64 = true;
+    if (inst->uses_descriptors) fn.uses_descriptors = true;   // a resource read in the callee
     if (inst_grid) ensure_grid_dim(std::max(1u, inst_grid_dim));
     // Coerce and validate arguments against instantiated parameter types, and propagate stencil offsets
     for (size_t i = 0; i < e->args.size() && i < inst_params.size(); ++i) {
@@ -342,6 +343,47 @@ static uint32_t resolve_image_format(const CheckedParam& cp, const Attribute* at
     }
 }
 
+// A module's resources, each the bound parameter it stands for: its role
+// from its type, which must be one bound at a descriptor, and its
+// @binding(set, binding), which it must have.
+void SemaContext::resolve_globals() {
+    GenericEnv empty_env;
+    for (const auto& mod_name : module_order) {
+        const ModuleAst* ast = modules[mod_name].ast;
+        if (!ast) continue;
+        for (const auto& d : ast->bindings) {
+            CheckedParam cp;
+            cp.span = d.span;
+            cp.name = d.name;
+            cp.type = resolve_type(d.type.get(), mod_name, empty_env);
+            cp.access = cp.type.access;
+            if (cp.type.is_image()) {
+                cp.role = ParamRole::Image;
+                cp.image_format = resolve_image_format(cp, d.find_attribute("format"), diags);
+            } else if (cp.type.is_sampler()) {
+                cp.role = ParamRole::Sampler;
+            } else if (cp.type.is_uniform()) {
+                cp.role = ParamRole::Uniform;
+            } else if (cp.type.is_buffer()) {
+                cp.role = ParamRole::Buffer;
+            } else {
+                diags.error(d.span, "module-level '" + d.name + "' is a resource at a descriptor (a texture, "
+                                    "sampler, image, uniform or buffer), not '" + cp.type.to_string() + "'");
+                continue;
+            }
+            const Attribute* at = d.find_attribute("binding");
+            if (!at || at->int_args.empty() || at->int_args.size() > 2) {
+                diags.error(d.span, "module-level '" + d.name + "' needs @binding(set, binding)");
+                continue;
+            }
+            cp.descriptor_set = at->int_args.size() == 2 ? static_cast<uint32_t>(at->int_args[0]) : 0;
+            cp.descriptor_binding = static_cast<uint32_t>(at->int_args.back());
+            out->global_index[mod_name + "::" + d.name] = out->globals.size();
+            out->globals.push_back(std::move(cp));
+        }
+    }
+}
+
 static void fold_const_into_expr(Expr* e, const ConstValue& cv) {
     if (!e) return;
     e->path.clear();
@@ -420,6 +462,11 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 mark_type_usage(cv->type);
                 return cv->type;
             }
+            if (int32_t g = ctx.find_global(fn.module_name, {}, e->name); g >= 0) {
+                e->global_index = g;
+                fn.uses_descriptors = true;
+                return e->resolved_type = ctx.out->globals[static_cast<size_t>(g)].type;
+            }
             ctx.diags.error(e->span, "undeclared identifier '" + e->name + "'");
             return Type::void_type();
         }
@@ -429,6 +476,11 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 fold_const_into_expr(e, *cv);
                 mark_type_usage(cv->type);
                 return cv->type;
+            }
+            if (int32_t g = ctx.find_global(fn.module_name, e->path, e->name); g >= 0) {
+                e->global_index = g;
+                fn.uses_descriptors = true;
+                return e->resolved_type = ctx.out->globals[static_cast<size_t>(g)].type;
             }
             ctx.diags.error(e->span, "undeclared constant or symbol '" + ModuleRegistry::format_module_path(e->path) + "'");
             return Type::void_type();
@@ -772,12 +824,22 @@ void FnCheckState::check_stmt(Stmt* s) {
             while (base && (base->kind == Expr::Kind::Field || base->kind == Expr::Kind::Index)) {
                 base = base->lhs.get();
             }
-            if (!base || base->kind != Expr::Kind::Ident) {
+            if (!base || (base->kind != Expr::Kind::Ident && base->kind != Expr::Kind::Path)) {
                 ctx.diags.error(s->span, "invalid assignment target");
                 if (s->assign_value) check_expr(s->assign_value.get());
                 return;
             }
-            LocalVar* lv = lookup_var(base->name);
+            LocalVar* lv = base->kind == Expr::Kind::Ident ? lookup_var(base->name) : nullptr;
+            // A module-level resource: a place in a buffer, as a buffer parameter's.
+            LocalVar global_lv;
+            if (!lv) {
+                int32_t g = ctx.find_global(fn.module_name, base->path, base->name);
+                if (g >= 0) {
+                    global_lv.name = base->name;
+                    global_lv.type = ctx.out->globals[static_cast<size_t>(g)].type;
+                    lv = &global_lv;
+                }
+            }
             if (!lv) {
                 ctx.diags.error(s->span, "cannot assign to '" + base->name + "'");
                 if (s->assign_value) check_expr(s->assign_value.get());

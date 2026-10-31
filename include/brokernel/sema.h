@@ -117,6 +117,10 @@ struct CheckedModule {
     std::string module_name;
     TypeRegistry types;
     std::unordered_map<std::string, ConstValue> constants;
+    // Module-level resources at descriptors (`@binding(s, b) var name: T;`),
+    // each as the bound parameter it stands for, keyed "module::name".
+    std::vector<CheckedParam> globals;
+    std::unordered_map<std::string, size_t> global_index;
     std::vector<CheckedFunction> functions; // Dependency-ordered (callees before callers, plus kernels)
 
     const CheckedFunction* find_function(std::string_view name) const noexcept;

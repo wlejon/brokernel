@@ -40,7 +40,7 @@ ValueList MirBodyLowerer::lower_texture_call(const Expr* e) {
         diags.error(e->span, "a texture must be a kernel parameter (with @binding) to be used");
         return make_zero_leaves(e->resolved_type);
     }
-    const CheckedParam& param = root_fn.params[found->second];
+    const CheckedParam& param = bound_param(found->second);
     auto img = image_ref(param);
     // A separate texture's filtering methods name their sampler first.
     size_t first = 0;
@@ -51,7 +51,7 @@ ValueList MirBodyLowerer::lower_texture_call(const Expr* e) {
             diags.error(e->args[0]->span, "a sampler must be a kernel parameter (with @binding) to be used");
             return make_zero_leaves(e->resolved_type);
         }
-        const CheckedParam& sparam = root_fn.params[sp->second];
+        const CheckedParam& sparam = bound_param(sp->second);
         img.sampler_set = static_cast<int32_t>(sparam.descriptor_set);
         img.sampler_binding = static_cast<int32_t>(sparam.descriptor_binding);
         first = 1;

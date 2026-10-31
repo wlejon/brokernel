@@ -97,6 +97,21 @@ struct MirBodyLowerer {
     void bind_store_param(size_t index, const ValueList& store) { store_param[store[0]] = index; }
     // A texture parameter's placeholder value -> its parameter index.
     std::unordered_map<const brass::Value*, size_t> texture_param;
+    // The bound parameter at an index of texture_param / block_param: the
+    // root function's parameters, then the module-level resources
+    // (CheckedModule::globals) after them.
+    const CheckedParam& bound_param(size_t index) const {
+        return index < root_fn.params.size() ? root_fn.params[index] : mod.globals[index - root_fn.params.size()];
+    }
+    // A module-level resource named by `e`: a placeholder recorded as a
+    // parameter's is, made at each use (it is a constant).
+    ValueList global_value(const Expr* e) {
+        const size_t index = root_fn.params.size() + static_cast<size_t>(e->global_index);
+        const CheckedParam& p = bound_param(index);
+        brass::Value* v = b.build_iconst_i32(static_cast<int32_t>((p.descriptor_set << 16) | p.descriptor_binding));
+        (p.type.is_block() ? block_param : texture_param)[v] = index;
+        return {v};
+    }
     // An image's or a sampler's method (lowering_texture.cpp).
     ValueList lower_texture_call(const Expr* e);
 

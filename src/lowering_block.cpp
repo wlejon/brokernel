@@ -68,11 +68,18 @@ uint32_t MirBodyLowerer::block_field_offset(const StructDef& sdef, const std::st
 bool MirBodyLowerer::block_place(const Expr* e, BlockPlace& p) {
     if (!e) return false;
     switch (e->kind) {
-        case Expr::Kind::Ident: {
+        case Expr::Kind::Ident:
+        case Expr::Kind::Path: {
             if (!e->resolved_type.is_block()) return false;
-            int id = lookup_var_id(e->name);
-            if (id < 0 || var_values[id].empty()) return false;
-            auto found = block_param.find(var_values[id][0]);
+            ValueList root;
+            if (e->global_index >= 0) {
+                root = global_value(e);
+            } else {
+                int id = e->kind == Expr::Kind::Ident ? lookup_var_id(e->name) : -1;
+                if (id < 0 || var_values[id].empty()) return false;
+                root = var_values[id];
+            }
+            auto found = block_param.find(root[0]);
             if (found == block_param.end()) return false;
             p.param = found->second;
             p.std140 = e->resolved_type.is_uniform();
@@ -164,16 +171,8 @@ void MirBodyLowerer::block_words(const Type& t, bool std140, brass::Value* base,
     }
 }
 
-namespace {
-
-const CheckedParam* block_param_of(const CheckedFunction& fn, size_t index) {
-    return index < fn.params.size() ? &fn.params[index] : nullptr;
-}
-
-} // namespace
-
 ValueList MirBodyLowerer::block_load(const Expr* e, const BlockPlace& p) {
-    const CheckedParam* param = block_param_of(root_fn, p.param);
+    const CheckedParam* param = &bound_param(p.param);
     std::vector<brass::Value*> words;
     std::vector<ScalarKind> kinds;
     if (!p.lanes.empty()) {
@@ -198,7 +197,7 @@ ValueList MirBodyLowerer::block_load(const Expr* e, const BlockPlace& p) {
 }
 
 void MirBodyLowerer::block_store(const Expr* e, const BlockPlace& p, const ValueList& value) {
-    const CheckedParam* param = block_param_of(root_fn, p.param);
+    const CheckedParam* param = &bound_param(p.param);
     if (!param->type.is_buffer() || param->type.access == AccessMode::Read) {
         diags.error(e->span, "'" + param->name + "' is read-only (" + param->type.to_string() + ")");
         return;

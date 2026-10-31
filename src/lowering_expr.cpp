@@ -488,11 +488,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         case Expr::Kind::BoolLit:
             return {e->bool_val ? b.true_value() : b.build_iconst_i32(0)};
         case Expr::Kind::Ident: {
+            if (e->global_index >= 0) return global_value(e);
             int id = lookup_var_id(e->name);
             if (id >= 0) return var_values[id];
             return make_zero_leaves(e->resolved_type);
         }
         case Expr::Kind::Path:
+            if (e->global_index >= 0) return global_value(e);
             return make_zero_leaves(e->resolved_type);
         case Expr::Kind::Unary: {
             ValueList sub = lower_expr(e->lhs.get());

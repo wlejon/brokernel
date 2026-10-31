@@ -63,6 +63,7 @@ ExprPtr clone_expr(const Expr* e) {
     c->literal_suffix = e->literal_suffix;
     c->name = e->name;
     c->path = e->path;
+    c->global_index = e->global_index;
     c->unary_op = e->unary_op;
     c->binary_op = e->binary_op;
     c->lhs = clone_expr(e->lhs.get());
@@ -184,6 +185,11 @@ bool SemaContext::load_and_index_module(
             if (!exists) {
                 for (const auto& c : imported->consts) {
                     if (c.name == sym) { exists = true; break; }
+                }
+            }
+            if (!exists) {
+                for (const auto& r : imported->bindings) {
+                    if (r.name == sym) { exists = true; break; }
                 }
             }
             if (!exists) {
@@ -391,6 +397,33 @@ std::optional<ConstValue> SemaContext::find_const(
     auto cit = out->constants.find(target_mod + "::" + path.back());
     if (cit != out->constants.end()) return cit->second;
     return std::nullopt;
+}
+
+int32_t SemaContext::find_global(const std::string& current_mod, const std::vector<std::string>& path,
+                                 const std::string& name) const {
+    auto at = [&](const std::string& mod, const std::string& sym) -> int32_t {
+        auto it = out->global_index.find(mod + "::" + sym);
+        return it == out->global_index.end() ? -1 : static_cast<int32_t>(it->second);
+    };
+    auto mod_it = modules.find(current_mod);
+    if (mod_it == modules.end()) return -1;
+    const auto& mscope = mod_it->second;
+    if (path.empty()) {
+        if (int32_t g = at(current_mod, name); g >= 0) return g;
+        auto sym_it = mscope.imported_symbols.find(name);
+        if (sym_it != mscope.imported_symbols.end()) {
+            if (int32_t g = at(sym_it->second.first, sym_it->second.second); g >= 0) return g;
+        }
+        for (const auto& wmod : mscope.wildcard_modules) {
+            if (int32_t g = at(wmod, name); g >= 0) return g;
+        }
+        return -1;
+    }
+    std::vector<std::string> mod_parts(path.begin(), path.end() - 1);
+    auto alias_it = mscope.module_aliases.find(ModuleRegistry::format_module_path(mod_parts));
+    if (alias_it == mscope.module_aliases.end() && mod_parts.size() == 1) alias_it = mscope.module_aliases.find(mod_parts[0]);
+    if (alias_it == mscope.module_aliases.end()) return -1;
+    return at(alias_it->second, path.back());
 }
 
 static ConstValue convert_const_scalar(const ConstValue& cv, ScalarKind sk) {
@@ -1198,6 +1231,7 @@ std::unique_ptr<CheckedModule> check_module(
             ctx.resolve_type(&te, mod_name, empty_env);
         }
     }
+    ctx.resolve_globals();
 
     // Type-check all non-generic functions in the root module (kernels first, plus non-generic functions)
     for (const auto& fn : root_ast.functions) {

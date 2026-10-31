@@ -126,6 +126,14 @@ general graphics:
     It reads or writes only the words the path names, at the offset its
     layout gives.
   - A kernel that takes a texture or a buffer runs on the GPU alone.
+- **A module may declare the resources it reads**, `@binding(set, binding)
+  pub var camera: uniform<Camera>;` (any texture, sampler, image or buffer
+  type). Any function of the module or of one importing it reads them by
+  name: unqualified, through `from scene import camera`, or as
+  `scene::camera`. A stage binds only the ones it reaches, and a kernel that
+  reaches one runs on the GPU alone. An engine's frame state (its camera,
+  lights, shared samplers) is written this way once, and every stage
+  composed with it reads that state without taking parameters for it.
 - **Type introspection for generics.** `is_f64<T>()` and `sizeof<T>()`
   fold to constants at check time, so a generic body can branch on its
   scalar; `bitcast<T>(x)` reinterprets a value's bits as a type of the same

@@ -217,6 +217,7 @@ struct Expr {
     // Identifier / Path
     std::string name;
     std::vector<std::string> path; // For Path (`a::b`)
+    int32_t global_index = -1;     // An Ident or Path naming a module-level resource: its CheckedModule::globals index
 
     // Operators
     UnaryOp unary_op = UnaryOp::Neg;
@@ -353,6 +354,24 @@ struct FnDecl {
     }
 };
 
+// A module-level resource at a descriptor, `@binding(set, binding) var name: T;`
+// (T a texture, sampler, image, uniform<T> or buffer<T>), which any function
+// of the module or one importing it reads by name.
+struct BindingDecl {
+    SourceSpan span;
+    bool is_pub = true;
+    std::vector<Attribute> attributes;
+    std::string name;
+    TypeExprPtr type;
+
+    const Attribute* find_attribute(std::string_view attr_name) const noexcept {
+        for (const auto& a : attributes) {
+            if (a.name == attr_name) return &a;
+        }
+        return nullptr;
+    }
+};
+
 struct ImportDecl {
     SourceSpan span;
     std::vector<std::string> module_path; // e.g. {"std", "noise"} or {"noise"}
@@ -368,6 +387,7 @@ struct ModuleAst {
     std::string file_path;
     std::vector<ImportDecl> imports;
     std::vector<ConstDecl> consts;
+    std::vector<BindingDecl> bindings;
     std::vector<StructDecl> structs;
     std::vector<FnDecl> functions;
 };

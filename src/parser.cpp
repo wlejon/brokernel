@@ -44,6 +44,16 @@ public:
                 mod->consts.push_back(parse_const(is_pub));
             } else if (check(TokenKind::KwFn)) {
                 mod->functions.push_back(parse_fn(is_pub, std::move(attrs)));
+            } else if (check(TokenKind::KwVar)) {
+                BindingDecl d;
+                d.is_pub = is_pub;
+                d.attributes = std::move(attrs);
+                d.span = advance().span;
+                d.name = consume(TokenKind::Ident, "resource name").text;
+                consume(TokenKind::Colon, "':' and the resource's type");
+                d.type = parse_type();
+                d.span = SourceSpan::merge(d.span, consume(TokenKind::Semi, "';' after a resource").span);
+                mod->bindings.push_back(std::move(d));
             } else if (check(TokenKind::Semi)) {
                 advance();
             } else {

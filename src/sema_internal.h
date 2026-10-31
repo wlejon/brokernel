@@ -55,6 +55,12 @@ struct SemaContext {
                                          const std::string& name,
                                          const GenericEnv& genv,
                                          const std::vector<std::unordered_map<std::string, LocalVar>>& scopes) const;
+    // A module-level resource named from `current_mod`: its index in
+    // out->globals, or -1.
+    int32_t find_global(const std::string& current_mod, const std::vector<std::string>& path,
+                        const std::string& name) const;
+    // Every loaded module's resources into out->globals (sema_check.cpp).
+    void resolve_globals();
     Type resolve_type(const TypeExpr* texpr, const std::string& current_mod, const GenericEnv& genv);
     std::optional<ConstValue> eval_const_expr(
         const Expr* e,
