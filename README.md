@@ -96,6 +96,12 @@ general graphics:
     each `<T>` for an f32 or u32 texel or a vector of either (`vec4<f32>` when
     left out). The shadow forms `sampler2d_shadow`, `sampler2d_array_shadow`
     and `sampler_cube_shadow` compare to an f32.
+  - A texture sampled through a separate `sampler` takes the same shapes
+    named `texture*` (`texture2d<T>`, `texture_cube<T>`,
+    `texture2d_array_shadow`, ...). Its filtering methods take the sampler
+    first (`albedo.sample(linear, uv)`, `shadow.compare(cmp, uv, ref)`);
+    `fetch`, `size` and `levels` take none. One sampler serves any number of
+    textures.
   - A sampler's methods:
     - `sample(uv)` at the fragment's implicit LOD, `sample_lod(uv, lod)` and
       `sample_grad(uv, dx, dy)`. Each has an `_offset` form taking constant

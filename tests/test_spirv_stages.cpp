@@ -440,6 +440,56 @@ static void test_textures() {
     }
 }
 
+// Textures sampled through one separate sampler (passed to a helper beside
+// its texture), a shadow texture through a comparison sampler, and a separate
+// texture fetched and sized with none.
+static void test_separate_samplers() {
+    const char* src = R"(
+        fn tap(t: texture2d<vec4<f32>>, s: sampler, uv: vec2<f32>) -> vec4<f32> {
+            return t.sample(s, uv) + t.sample_lod_offset(s, uv, 1.0, vec2<i32>(-1, 0));
+        }
+        @fragment fn shade(@binding(1, 8) linear: sampler,
+                           @binding(1, 16) cmp: sampler,
+                           @binding(1, 1) albedo: texture2d<vec4<f32>>,
+                           @binding(1, 2) sky: texture_cube<vec3<f32>>,
+                           @binding(1, 3) shadow: texture2d_array_shadow,
+                           @binding(1, 4) lut: texture3d<f32>) {
+            let fc: vec4<f32> = frag_coord();
+            let uv: vec2<f32> = fc.xy * 0.01;
+            let s: vec3<f32> = sky.sample_lod(linear, vec3<f32>(uv, 1.0), 0.0);
+            let lit: f32 = shadow.compare(cmp, vec3<f32>(uv, 0.0), 0.5);
+            let l: f32 = lut.sample(linear, vec3<f32>(uv, 0.5));
+            let size: vec2<i32> = albedo.size(0);
+            let texel: vec4<f32> = albedo.fetch(vec2<i32>(size.x - 1, 0), albedo.levels() - 1);
+            set_frag_color(tap(albedo, linear, uv) + texel + vec4<f32>(s * lit, l));
+        }
+    )";
+    auto res = compile_source(src, "separate.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    require_valid(res);
+    const auto& desc = res.kernels[0].spirv.descriptors;
+    assert(desc.size() == 6);
+    using brass::target::SpirvDescriptorKind;
+    for (const auto& b : desc) {
+        assert(b.set == 1);
+        bool sampler = b.binding == 8 || b.binding == 16;
+        assert(b.kind == (sampler ? SpirvDescriptorKind::Sampler : SpirvDescriptorKind::SampledImage));
+    }
+
+    // A separate texture sampled with no sampler or through a texture, and a
+    // bare sampler sampled, are refused.
+    for (const char* bad : {
+             "@fragment fn f(@binding(0) t: texture2d<vec4<f32>>) { set_frag_color(t.sample(vec2<f32>(0.0, 0.0))); }",
+             "@fragment fn f(@binding(0) t: texture2d<vec4<f32>>, @binding(1) u: texture2d<vec4<f32>>) { set_frag_color(t.sample(u, vec2<f32>(0.0, 0.0))); }",
+             "@fragment fn f(@binding(0) s: sampler) { set_frag_color(s.sample(vec2<f32>(0.0, 0.0))); }",
+         }) {
+        auto r = compile_source(bad, "bad_separate.bk");
+        if (r.ok) std::cerr << "separate samplers: accepted\n" << bad << "\n";
+        assert(!r.ok);
+    }
+}
+
 static void test_builtin_type_diagnostics() {
     auto fails_with = [](const char* src, const char* needle) {
         auto res = compile_source(src, "bad_builtin.bk");
@@ -474,6 +524,7 @@ int main() {
     test_buffers();
     test_render_math();
     test_textures();
+    test_separate_samplers();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

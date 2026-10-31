@@ -24,6 +24,7 @@ brass::codegen::KernelBuilder::ImageRef image_ref(const CheckedParam& p) {
     r.depth = t.image_shadow();
     r.scalar = t.scalar == ScalarKind::U32 ? brass::target::SpirvImageScalar::U32 : brass::target::SpirvImageScalar::F32;
     r.format = t.is_image() ? p.image_format : 0;
+    if (t.image_separate()) r.sampler_set = r.sampler_binding = -2;   // read with no sampler, until given one
     return r;
 }
 
@@ -40,9 +41,23 @@ ValueList MirBodyLowerer::lower_texture_call(const Expr* e) {
         return make_zero_leaves(e->resolved_type);
     }
     const CheckedParam& param = root_fn.params[found->second];
-    const auto img = image_ref(param);
+    auto img = image_ref(param);
+    // A separate texture's filtering methods name their sampler first.
+    size_t first = 0;
+    if (rt.image_separate() && m != "size" && m != "levels" && m != "fetch") {
+        ValueList s = lower_expr(e->args[0].get());
+        auto sp = s.empty() ? texture_param.end() : texture_param.find(s[0]);
+        if (sp == texture_param.end()) {
+            diags.error(e->args[0]->span, "a sampler must be a kernel parameter (with @binding) to be used");
+            return make_zero_leaves(e->resolved_type);
+        }
+        const CheckedParam& sparam = root_fn.params[sp->second];
+        img.sampler_set = static_cast<int32_t>(sparam.descriptor_set);
+        img.sampler_binding = static_cast<int32_t>(sparam.descriptor_binding);
+        first = 1;
+    }
 
-    auto arg = [&](size_t i) { return lower_expr(e->args[i].get()); };
+    auto arg = [&](size_t i) { return lower_expr(e->args[first + i].get()); };
     auto scalar = [&](size_t i) { return arg(i)[0]; };
     // The first `lanes` lanes of a four-lane result.
     auto lanes_of = [&](brass::Value* v, uint32_t lanes) {

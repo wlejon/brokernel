@@ -1057,9 +1057,14 @@ Type SemaContext::resolve_type(
         return Type::block(TypeKind::Buffer, elem, n == "buffer" ? AccessMode::ReadWrite : AccessMode::Read);
     }
 
-    if (n.rfind("sampler", 0) == 0) {
+    // A sampler on its own, which a texture<...> is sampled through.
+    if (n == "sampler") return Type::sampler(Type::f32(), 0, Type::kSamplerOnly);
+    // texture*: the same shapes as sampler*, sampled through a separate sampler.
+    bool separate = n.rfind("texture", 0) == 0;
+    std::string sn = separate ? "sampler" + n.substr(7) : n;
+    if (sn.rfind("sampler", 0) == 0) {
+        uint8_t sep = separate ? Type::kImageSeparate : 0;
         static const struct { const char* name; uint32_t dim; uint8_t flags; } kSamplers[] = {
-            {"sampler", 2, 0},
             {"sampler1d", 1, 0},
             {"sampler2d", 2, 0},
             {"sampler3d", 3, 0},
@@ -1071,12 +1076,12 @@ Type SemaContext::resolve_type(
             {"sampler_cube_shadow", 3, Type::kImageShadow | Type::kImageCube},
         };
         for (const auto& s : kSamplers) {
-            if (n != s.name) continue;
+            if (sn != s.name) continue;
             if (s.flags & Type::kImageShadow) {
                 if (!texpr->args.empty()) diags.error(texpr->span, "'" + n + "' takes no texel type: it compares to an f32");
-                return Type::sampler(Type::f32(), s.dim, s.flags);
+                return Type::sampler(Type::f32(), s.dim, s.flags | sep);
             }
-            return Type::sampler(texel_arg(), s.dim, s.flags);
+            return Type::sampler(texel_arg(), s.dim, s.flags | sep);
         }
     }
 

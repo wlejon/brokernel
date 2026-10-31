@@ -90,7 +90,8 @@ std::string Type::to_string() const {
         }
         case TypeKind::Image:
         case TypeKind::Sampler:
-            oss << (kind == TypeKind::Image ? "image" : "sampler");
+            if (sampler_only()) return "sampler";
+            oss << (kind == TypeKind::Image ? "image" : image_separate() ? "texture" : "sampler");
             if (image_cube()) oss << "_cube";
             else oss << dimension << "d";
             if (image_arrayed()) oss << "_array";

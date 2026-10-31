@@ -869,14 +869,25 @@ Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
         e->resolved_type = t;
         return t;
     };
+    // A texture's filtering methods take the sampler they go through first.
+    const bool through = recv_t.image_separate() && m != "size" && m != "levels" && m != "fetch";
     // `m(params...)`: each argument checked against its parameter.
     auto takes = [&](std::initializer_list<Type> params, const char* shape) {
-        if (e->args.size() != params.size()) {
-            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + shape + ")");
+        if (e->args.size() != params.size() + (through ? 1 : 0)) {
+            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + (through ? "sampler, " : "") +
+                                         shape + ")");
             for (auto& a : e->args) check_expr(a.get());
             return;
         }
         size_t i = 0;
+        if (through) {
+            Expr* s = e->args[i++].get();
+            Type st = check_expr(s);
+            if (!st.is_sampler() || !st.sampler_only()) {
+                ctx.diags.error(s->span, recv_t.to_string() + "." + m + " samples through a 'sampler', got '" +
+                                             st.to_string() + "'");
+            }
+        }
         for (const Type& t : params) {
             Expr* a = e->args[i++].get();
             check_expr(a, t);
