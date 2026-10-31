@@ -886,6 +886,14 @@ CompileResult Compiler::compile_source(
 
     res.module_name = checked->module_name;
     res.types = checked->types;
+    for (const auto& [key, index] : checked->global_index) {
+        const CheckedParam& g = checked->globals[index];
+        res.resources.push_back({g.name, key.substr(0, key.size() - g.name.size() - 2), g.descriptor_set,
+                                 g.descriptor_binding, g.type, g.image_format});
+    }
+    std::sort(res.resources.begin(), res.resources.end(), [](const ResourceInfo& a, const ResourceInfo& b) {
+        return a.set != b.set ? a.set < b.set : a.binding < b.binding;
+    });
 
     // Determine which functions in root module should be compiled as entry points
     bool any_explicit_kernel = false;

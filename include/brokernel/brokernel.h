@@ -450,11 +450,25 @@ private:
 };
 
 /// Result of compiling a .bk source unit.
+/// A module-level resource (`@binding(set, binding) var name: T;`) of the
+/// compiled module or one it imports. A uniform's fields are laid out by
+/// `types.block_layout` / `block_field_offset` (std140), a buffer's
+/// elements std430.
+struct ResourceInfo {
+    std::string name;
+    std::string module;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    Type type;
+    uint32_t image_format = 0;   // a storage image's SPIR-V ImageFormat
+};
+
 struct CompileResult {
     bool ok = false;
     std::string module_name;
     DiagnosticBag diagnostics;
     TypeRegistry types;
+    std::vector<ResourceInfo> resources;   // by set, then binding
     std::vector<CompiledKernel> kernels;
 
     const CompiledKernel* find_kernel(std::string_view name) const noexcept;

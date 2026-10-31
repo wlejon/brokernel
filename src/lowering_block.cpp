@@ -17,51 +17,6 @@ uint32_t round_up(uint32_t v, uint32_t a) { return a ? (v + a - 1) / a * a : v; 
 
 } // namespace
 
-// The std140 or std430 size and alignment of a type in a block.
-MirBodyLowerer::BlockLayout MirBodyLowerer::block_layout(const Type& t, bool std140) const {
-    if (t.is_scalar()) return {4, 4};
-    if (t.is_vector()) {
-        if (t.dimension == 2) return {8, 8};
-        return {t.dimension * 4, 16};
-    }
-    if (t.is_array()) {
-        uint32_t stride = block_stride(t.element_type(), std140);
-        BlockLayout e = block_layout(t.element_type(), std140);
-        return {stride * t.dimension, std140 ? std::max(e.align, 16u) : e.align};
-    }
-    if (t.is_struct()) {
-        const StructDef* sdef = mod.types.find_struct(t.struct_id);
-        uint32_t offset = 0, align = 4;
-        if (sdef) {
-            for (const auto& f : sdef->fields) {
-                BlockLayout l = block_layout(f.type, std140);
-                offset = round_up(offset, l.align) + l.size;
-                align = std::max(align, l.align);
-            }
-        }
-        if (std140) align = std::max(align, 16u);
-        return {round_up(offset, align), align};
-    }
-    return {4, 4};
-}
-
-// The distance between an array's elements.
-uint32_t MirBodyLowerer::block_stride(const Type& elem, bool std140) const {
-    BlockLayout l = block_layout(elem, std140);
-    return round_up(l.size, std140 ? std::max(l.align, 16u) : l.align);
-}
-
-uint32_t MirBodyLowerer::block_field_offset(const StructDef& sdef, const std::string& field, bool std140) const {
-    uint32_t offset = 0;
-    for (const auto& f : sdef.fields) {
-        BlockLayout l = block_layout(f.type, std140);
-        offset = round_up(offset, l.align);
-        if (f.name == field) return offset;
-        offset += l.size;
-    }
-    return offset;
-}
-
 // `e` as a place in a block: which parameter, the byte offset, the type
 // there and, after a swizzle, the lanes it picks. False when `e` is not a
 // path from a block parameter.

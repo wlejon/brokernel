@@ -118,9 +118,7 @@ struct MirBodyLowerer {
     // Buffers at descriptors (lowering_block.cpp). A block parameter's
     // placeholder value -> its parameter index.
     std::unordered_map<const brass::Value*, size_t> block_param;
-    struct BlockLayout {
-        uint32_t size = 0, align = 0;
-    };
+    using BlockLayout = TypeRegistry::BlockLayout;
     struct BlockPlace {
         size_t param = 0;
         bool std140 = false;
@@ -128,9 +126,11 @@ struct MirBodyLowerer {
         Type type;
         std::vector<uint32_t> lanes;      // a swizzle's
     };
-    BlockLayout block_layout(const Type& t, bool std140) const;
-    uint32_t block_stride(const Type& elem, bool std140) const;
-    uint32_t block_field_offset(const StructDef& sdef, const std::string& field, bool std140) const;
+    BlockLayout block_layout(const Type& t, bool std140) const { return mod.types.block_layout(t, std140); }
+    uint32_t block_stride(const Type& elem, bool std140) const { return mod.types.block_stride(elem, std140); }
+    uint32_t block_field_offset(const StructDef& sdef, const std::string& field, bool std140) const {
+        return mod.types.block_field_offset(sdef, field, std140);
+    }
     uint32_t uniform_bytes(const CheckedParam& param) const;
     bool block_place(const Expr* e, BlockPlace& p);
     bool is_block_path(const Expr* e) const;

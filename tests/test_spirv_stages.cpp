@@ -539,6 +539,14 @@ static void test_module_resources() {
     }
     assert(cs->spirv.descriptors.empty() && cs->has_cpu_build());
     for (const auto& p : fs->params) assert(p.name == "dir");
+    // Every resource reflected, with a uniform struct's std140 offsets.
+    assert(res.resources.size() == 5);
+    assert(res.resources[0].name == "camera" && res.resources[0].module == "scene");
+    const StructDef* cam = res.types.find_struct(res.resources[0].type.struct_id);
+    assert(cam);
+    assert(res.types.block_field_offset(*cam, "eye", true) == 16);
+    assert(res.types.block_field_offset(*cam, "frame", true) == 32);
+    assert(res.types.block_layout(res.resources[0].type.element_type(), true).size == 48);
 
     // A module-level value that is no resource, one without a binding, a
     // read-only buffer written and an unexported module's resource refused.

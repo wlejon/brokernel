@@ -282,6 +282,17 @@ public:
     uint32_t flat_leaf_count(const Type& t) const;
     uint32_t byte_size(const Type& t) const;
 
+    /// A type's size and alignment in a buffer at a descriptor: std140 (a
+    /// uniform<T>) or std430 (a buffer<T>'s element).
+    struct BlockLayout {
+        uint32_t size = 0, align = 0;
+    };
+    BlockLayout block_layout(const Type& t, bool std140) const;
+    /// The distance between an array's elements of type `elem`.
+    uint32_t block_stride(const Type& elem, bool std140) const;
+    /// A struct field's byte offset (UINT32_MAX when it has no such field).
+    uint32_t block_field_offset(const StructDef& sdef, std::string_view field, bool std140) const;
+
 private:
     std::vector<StructDef> structs_;
 };
