@@ -66,7 +66,7 @@ ConstValue convert_const_value(const ConstValue& cv, const Type& target, const T
     if (leaves.empty()) return cv;
     uint32_t needed = types.flat_leaf_count(target);
     if (leaves.size() == 1 && needed > 1) {
-        leaves.assign(needed, leaves[0]);
+        leaves.resize(needed, ConstValue(leaves[0]));
     } else {
         while (leaves.size() < needed) leaves.push_back(leaves.back());
     }
@@ -101,6 +101,10 @@ static std::optional<ConstValue> apply_const_unary(UnaryOp op, const ConstValue&
 }
 
 static std::optional<ConstValue> apply_const_binary(BinaryOp op, const ConstValue& l, const ConstValue& r) {
+    if (op == BinaryOp::Mul && !l.type.is_scalar() && !r.type.is_scalar() &&
+        (l.type.is_matrix() || r.type.is_matrix())) {
+        return std::nullopt;
+    }
     if (!l.elements.empty() || !r.elements.empty()) {
         if (!l.elements.empty() && !r.elements.empty()) {
             if (l.elements.size() != r.elements.size()) return std::nullopt;
@@ -411,11 +415,28 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
                                 break;
                             }
                         }
-                        target = Type::array_of(Type::vec(sk, dim), dim);
+                        target = Type::mat(sk, dim, dim);
                     } else {
                         TypeExpr te{e->span, n, {}};
                         target = resolve_type(&te, current_mod, genv);
                     }
+                }
+                if (target.is_matrix() && arg_vals.size() == 1 && arg_vals[0].type.is_matrix()) {
+                    const ConstValue& src = arg_vals[0];
+                    Type st = Type::scalar_type(target.scalar);
+                    std::vector<ConstValue> leaves;
+                    leaves.reserve(target.dimension * target.elem_lanes);
+                    for (uint32_t c = 0; c < target.dimension; ++c) {
+                        for (uint32_t r = 0; r < target.elem_lanes; ++r) {
+                            if (c < src.elements.size() && r < src.elements[c].elements.size()) {
+                                leaves.push_back(src.elements[c].elements[r]);
+                            } else {
+                                leaves.push_back(ConstValue{st, (c == r) ? 1 : 0, (c == r) ? 1.0 : 0.0, c == r});
+                            }
+                        }
+                    }
+                    size_t idx = 0;
+                    return unflatten_const_value(target, leaves, idx);
                 }
                 std::vector<ConstValue> leaves;
                 for (const auto& av : arg_vals) {
@@ -425,7 +446,7 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
                 if (leaves.empty()) {
                     leaves.assign(needed, ConstValue{});
                 } else if (leaves.size() == 1 && needed > 1) {
-                    leaves.assign(needed, leaves[0]);
+                    leaves.resize(needed, ConstValue(leaves[0]));
                 } else {
                     while (leaves.size() < needed) leaves.push_back(leaves.back());
                 }
@@ -477,7 +498,13 @@ void fold_const_into_expr(Expr* e, const ConstValue& cv) {
     }
     if (cv.type.is_vector() || cv.type.is_array()) {
         e->kind = Expr::Kind::Call;
-        e->name = cv.type.is_vector() ? ("vec" + std::to_string(cv.type.dimension)) : "array";
+        if (cv.type.is_vector()) {
+            e->name = "vec" + std::to_string(cv.type.dimension);
+        } else if (cv.type.is_matrix() && cv.type.dimension == cv.type.elem_lanes) {
+            e->name = "mat" + std::to_string(cv.type.dimension);
+        } else {
+            e->name = "array";
+        }
         e->args.reserve(cv.elements.size());
         for (const auto& el : cv.elements) {
             auto arg = std::make_unique<Expr>();

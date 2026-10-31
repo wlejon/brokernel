@@ -375,10 +375,15 @@ static void test_buffers() {
 // CPU-exact polynomials under NoContraction unless it is marked @fast.
 static void test_render_math() {
     const char* src = R"(
-        @fragment fn shade(k: f32) {
+        struct Cam { view: mat4f, proj: mat4f, nrm: mat3f, eye: vec4f }
+        @fragment fn shade(@binding(0, 0) cam: uniform<Cam>, k: f32) {
             let fc: vec4<f32> = frag_coord();
             let a: f32 = sin(fc.x * k) + exp(fc.y * k) + pow(fc.x, k) + atan2(fc.y, fc.x) + tan(k);
-            set_frag_color(vec4<f32>(a, a * k + 1.0, 0.0, 1.0));
+            let vp: mat4f = cam.proj * cam.view;
+            let clip: vec4f = vp * (fc + cam.eye);
+            let rot: mat3f = mat3f(cam.view) * cam.nrm;
+            let n: vec3f = (rot * fc.xyz) + (fc.xyz * transpose(rot));
+            set_frag_color(clip + vec4<f32>(n + vec3f(a), a * k + 1.0));
         }
         @kernel @grid(1) fn exact(out: write_store<f32, 1>, k: f32) {
             out.write(sin(k) * k + 1.0);
@@ -401,43 +406,33 @@ static void test_render_math() {
     const auto* exact = find("exact");
     const auto* quick = find("quick");
     assert(fs && exact && quick);
-    // Whether the disassembly calls GLSL.std.450 instruction `n`
-    // ("%r = OpExtInst %type %set n ...").
+    assert(fs->spirv.descriptors.size() == 1 && fs->spirv.descriptors[0].bytes == 192);
+    const std::string& d = fs->spirv_disassembly;
+    assert(d.find("OpTypeMatrix") != std::string::npos);
+    assert(d.find("OpMatrixTimesVector") != std::string::npos);
+    assert(d.find("OpVectorTimesMatrix") != std::string::npos);
+    assert(d.find("OpMatrixTimesMatrix") != std::string::npos);
     auto has_ext = [](const std::string& dis, int n) {
         std::istringstream lines(dis);
-        std::string line;
-        while (std::getline(lines, line)) {
+        for (std::string line; std::getline(lines, line);) {
             std::istringstream w(line);
             std::string r, eq, op, type, set, num;
             if (w >> r >> eq >> op >> type >> set >> num && op == "OpExtInst" && num == std::to_string(n)) return true;
         }
         return false;
     };
-    const std::string& d = fs->spirv_disassembly;
-    // Sin 13, Exp 27, Pow 26, Atan2 25, Tan 15.
-    for (int op : {13, 27, 26, 25, 15}) {
-        if (!has_ext(d, op)) {
-            std::cerr << "render math: no GLSL.std.450 " << op << " in\n" << d << "\n";
-            assert(false);
-        }
-    }
-    // Whether any result is decorated NoContraction (42): "OpDecorate %r 42".
+    for (int op : {13, 27, 26, 25, 15}) assert(has_ext(d, op));
     auto exact_math = [](const std::string& dis) {
         std::istringstream lines(dis);
-        std::string line;
-        while (std::getline(lines, line)) {
+        for (std::string line; std::getline(lines, line);) {
             std::istringstream w(line);
             std::string op, id, dec, more;
             if (w >> op >> id >> dec && !(w >> more) && op == "OpDecorate" && dec == "42") return true;
         }
         return false;
     };
-    assert(!exact_math(d));
-    assert(exact_math(exact->spirv_disassembly));
-    assert(!has_ext(exact->spirv_disassembly, 13));
-    assert(!exact_math(quick->spirv_disassembly) && has_ext(quick->spirv_disassembly, 13));
-    // A @fast kernel's CPU build keeps the exact polynomials.
-    assert(quick->has_cpu_build());
+    assert(!exact_math(d) && exact_math(exact->spirv_disassembly) && !has_ext(exact->spirv_disassembly, 13));
+    assert(!exact_math(quick->spirv_disassembly) && has_ext(quick->spirv_disassembly, 13) && quick->has_cpu_build());
 }
 
 // Samplers of every shape and storage images, through a helper function, to

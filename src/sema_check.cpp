@@ -516,12 +516,29 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                     return check_expr(e, Type::bool_type());
                 }
             }
-            Type rt = check_expr(e->rhs.get(), expected);
-            // Harmonize unsuffixed literals or scalar-vector broadcasts
-            if (lt != rt) {
-                if (!coerce_expr_to_type(e->rhs.get(), lt)) {
-                    coerce_expr_to_type(e->lhs.get(), rt);
+            Type rt = check_expr(e->rhs.get(), (e->binary_op == BinaryOp::Mul && (lt.is_matrix() || lt.is_vector())) ? std::nullopt : expected);
+            if (e->binary_op == BinaryOp::Mul && !lt.is_scalar() && !rt.is_scalar() && (lt.is_matrix() || rt.is_matrix())) {
+                Type res = lt;
+                bool ok = (lt.scalar == rt.scalar);
+                if (lt.is_matrix() && rt.is_vector()) {
+                    ok = ok && (lt.dimension == rt.dimension);
+                    res = Type::vec(lt.scalar, lt.elem_lanes);
+                } else if (lt.is_vector() && rt.is_matrix()) {
+                    ok = ok && (lt.dimension == rt.elem_lanes);
+                    res = Type::vec(rt.scalar, rt.dimension);
+                } else if (lt.is_matrix() && rt.is_matrix()) {
+                    ok = ok && (lt.dimension == rt.elem_lanes);
+                    res = Type::mat(lt.scalar, rt.dimension, lt.elem_lanes);
+                } else {
+                    ok = false;
                 }
+                if (!ok) ctx.diags.error(e->span, "matrix product dimension/scalar mismatch: '" + lt.to_string() + "' * '" + rt.to_string() + "'");
+                mark_type_usage(res);
+                e->resolved_type = res;
+                return res;
+            }
+            if (lt != rt) {
+                if (!coerce_expr_to_type(e->rhs.get(), lt)) coerce_expr_to_type(e->lhs.get(), rt);
                 lt = e->lhs->resolved_type;
                 rt = e->rhs->resolved_type;
             }
@@ -529,22 +546,14 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 if ((lt.is_f64() && rt.is_f32()) || (lt.is_f32() && rt.is_f64())) {
                     ctx.diags.error(e->span, "cannot mix 'f64' and 'f32' without an explicit cast");
                 } else {
-                    ctx.diags.error(e->span, "binary operator type mismatch: '" + lt.to_string() +
-                                             "' vs '" + rt.to_string() + "'");
+                    ctx.diags.error(e->span, "binary operator type mismatch: '" + lt.to_string() + "' vs '" + rt.to_string() + "'");
                 }
             }
             mark_type_usage(lt);
             switch (e->binary_op) {
-                case BinaryOp::Eq:
-                case BinaryOp::Ne:
-                case BinaryOp::Lt:
-                case BinaryOp::Le:
-                case BinaryOp::Gt:
-                case BinaryOp::Ge:
-                case BinaryOp::LogAnd:
-                case BinaryOp::LogOr:
-                    e->resolved_type = Type::bool_type();
-                    return Type::bool_type();
+                case BinaryOp::Eq: case BinaryOp::Ne: case BinaryOp::Lt: case BinaryOp::Le:
+                case BinaryOp::Gt: case BinaryOp::Ge: case BinaryOp::LogAnd: case BinaryOp::LogOr:
+                    return e->resolved_type = Type::bool_type();
                 default:
                     e->resolved_type = lt;
                     if (!lt.is_scalar()) {
@@ -939,22 +948,18 @@ const CheckedFunction* SemaContext::instantiate_function(
             cfn.uses_textures = true;
         for (const auto& pattr : pdecl.attributes) {
             if (pattr.name == "binding") {
-                if (pattr.int_args.size() == 1) {
-                    cp.descriptor_binding = static_cast<uint32_t>(pattr.int_args[0]);
-                } else if (pattr.int_args.size() >= 2) {
+                if (pattr.int_args.size() == 1) cp.descriptor_binding = static_cast<uint32_t>(pattr.int_args[0]);
+                else if (pattr.int_args.size() >= 2) {
                     cp.descriptor_set = static_cast<uint32_t>(pattr.int_args[0]);
                     cp.descriptor_binding = static_cast<uint32_t>(pattr.int_args[1]);
                 }
             }
         }
         if (const Attribute* loc = pdecl.find_attribute("location")) {
-            if (cfn.stage != Stage::Vertex && cfn.stage != Stage::Fragment)
-                diags.error(loc->span, "@location is a vertex or fragment stage's input");
-            if (loc->int_args.size() != 1 || loc->int_args[0] < 0)
-                diags.error(loc->span, "@location takes one location, e.g. @location(0)");
+            if (cfn.stage != Stage::Vertex && cfn.stage != Stage::Fragment) diags.error(loc->span, "@location is a vertex or fragment stage's input");
+            if (loc->int_args.size() != 1 || loc->int_args[0] < 0) diags.error(loc->span, "@location takes one location, e.g. @location(0)");
             if (!(cp.type.is_scalar() || cp.type.is_vector()) ||
-                (cp.type.scalar != ScalarKind::F32 && cp.type.scalar != ScalarKind::I32 &&
-                 cp.type.scalar != ScalarKind::U32))
+                (cp.type.scalar != ScalarKind::F32 && cp.type.scalar != ScalarKind::I32 && cp.type.scalar != ScalarKind::U32))
                 diags.error(cp.span, "a stage input is f32, i32 or u32, or a vector of one");
             cp.role = ParamRole::StageInput;
             cp.location = loc->int_args.empty() ? 0 : static_cast<uint32_t>(loc->int_args[0]);

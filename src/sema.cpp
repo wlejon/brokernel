@@ -507,12 +507,12 @@ Type SemaContext::resolve_type(
         return Type::vec(elem.scalar, static_cast<uint32_t>(*dim_opt));
     }
 
-    if (n == "mat2f") return Type::array_of(Type::vec(ScalarKind::F32, 2), 2);
-    if (n == "mat3f") return Type::array_of(Type::vec(ScalarKind::F32, 3), 3);
-    if (n == "mat4f") return Type::array_of(Type::vec(ScalarKind::F32, 4), 4);
-    if (n == "mat2d") return Type::array_of(Type::vec(ScalarKind::F64, 2), 2);
-    if (n == "mat3d") return Type::array_of(Type::vec(ScalarKind::F64, 3), 3);
-    if (n == "mat4d") return Type::array_of(Type::vec(ScalarKind::F64, 4), 4);
+    if (n == "mat2f") return Type::mat(ScalarKind::F32, 2, 2);
+    if (n == "mat3f") return Type::mat(ScalarKind::F32, 3, 3);
+    if (n == "mat4f") return Type::mat(ScalarKind::F32, 4, 4);
+    if (n == "mat2d") return Type::mat(ScalarKind::F64, 2, 2);
+    if (n == "mat3d") return Type::mat(ScalarKind::F64, 3, 3);
+    if (n == "mat4d") return Type::mat(ScalarKind::F64, 4, 4);
 
     if (n == "mat2" || n == "mat3" || n == "mat4") {
         uint32_t dim = static_cast<uint32_t>(n.back() - '0');
@@ -521,17 +521,17 @@ Type SemaContext::resolve_type(
             Type elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
             if (!elem.is_scalar()) {
                 diags.error(texpr->span, "matrix element type must be a scalar");
-                return Type::array_of(Type::vec(ScalarKind::F32, dim), dim);
+                return Type::mat(ScalarKind::F32, dim, dim);
             }
             sk = elem.scalar;
         }
-        return Type::array_of(Type::vec(sk, dim), dim);
+        return Type::mat(sk, dim, dim);
     }
 
     if (n == "mat") {
         if ((texpr->args.size() != 2 && texpr->args.size() != 3) || !texpr->args[0].type_arg) {
             diags.error(texpr->span, "'mat<T, C, R>' requires a scalar type T and dimensions");
-            return Type::array_of(Type::vec(ScalarKind::F32, 3), 3);
+            return Type::mat(ScalarKind::F32, 3, 3);
         }
         Type elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
         auto cols_opt = resolve_generic_int_arg(texpr->args[1], current_mod, genv, *this);
@@ -540,10 +540,9 @@ Type SemaContext::resolve_type(
                             : cols_opt;
         if (!cols_opt || *cols_opt < 2 || *cols_opt > 4 || !rows_opt || *rows_opt < 2 || *rows_opt > 4) {
             diags.error(texpr->span, "matrix dimensions must be compile-time integers in 2..4");
-            return Type::array_of(Type::vec(elem.scalar, 3), 3);
+            return Type::mat(elem.scalar, 3, 3);
         }
-        return Type::array_of(Type::vec(elem.scalar, static_cast<uint32_t>(*rows_opt)),
-                              static_cast<uint32_t>(*cols_opt));
+        return Type::mat(elem.scalar, static_cast<uint32_t>(*cols_opt), static_cast<uint32_t>(*rows_opt));
     }
 
     // 4. Fixed array: `array<T, N>`

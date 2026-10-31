@@ -4,23 +4,13 @@
 namespace brokernel::detail {
 brass::Type to_mir_scalar_type(ScalarKind sk) {
     switch (sk) {
-        case ScalarKind::Bool:
-        case ScalarKind::I32:
-        case ScalarKind::U32:
-            return brass::Type::i32();
-        case ScalarKind::I64:
-        case ScalarKind::U64:
-            return brass::Type::i64();
-        case ScalarKind::F32:
-            return brass::Type::f32();
-        case ScalarKind::F64:
-            return brass::Type::f64();
-        default:
-            return brass::Type::i32();
+        case ScalarKind::I64: case ScalarKind::U64: return brass::Type::i64();
+        case ScalarKind::F32: return brass::Type::f32();
+        case ScalarKind::F64: return brass::Type::f64();
+        default: return brass::Type::i32();
     }
 }
 uint32_t swizzle_index(char c) {
-    if (c == 'x' || c == 'r' || c == 's') return 0;
     if (c == 'y' || c == 'g' || c == 't') return 1;
     if (c == 'z' || c == 'b' || c == 'p') return 2;
     if (c == 'w' || c == 'a' || c == 'q') return 3;
@@ -29,25 +19,14 @@ uint32_t swizzle_index(char c) {
 bool stmt_has_return(const Stmt* s) {
     if (!s) return false;
     switch (s->kind) {
-        case Stmt::Kind::Return:
-        case Stmt::Kind::Break:
-        case Stmt::Kind::Continue:
+        case Stmt::Kind::Return: case Stmt::Kind::Break: case Stmt::Kind::Continue:
             return true;
-        case Stmt::Kind::Block:
-        case Stmt::Kind::While:
-        case Stmt::Kind::ForRange:
-        case Stmt::Kind::ForC:
-            for (const auto& b : s->body) {
-                if (stmt_has_return(b.get())) return true;
-            }
+        case Stmt::Kind::Block: case Stmt::Kind::While: case Stmt::Kind::ForRange: case Stmt::Kind::ForC:
+            for (const auto& b : s->body) if (stmt_has_return(b.get())) return true;
             return false;
         case Stmt::Kind::If:
-            for (const auto& b : s->body) {
-                if (stmt_has_return(b.get())) return true;
-            }
-            for (const auto& eb : s->else_body) {
-                if (stmt_has_return(eb.get())) return true;
-            }
+            for (const auto& b : s->body) if (stmt_has_return(b.get())) return true;
+            for (const auto& eb : s->else_body) if (stmt_has_return(eb.get())) return true;
             return false;
         default:
             return false;
@@ -233,10 +212,73 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             ValueList lv = lower_expr(e->lhs.get());
             ValueList rv = lower_expr(e->rhs.get());
+            const Type& lt = e->lhs->resolved_type;
+            const Type& rt = e->rhs->resolved_type;
+            if (e->binary_op == BinaryOp::Mul && !lt.is_scalar() && !rt.is_scalar() && (lt.is_matrix() || rt.is_matrix())) {
+                bool is_fp = (lt.scalar == ScalarKind::F32 || lt.scalar == ScalarKind::F64);
+                auto mac = [&](brass::Value* a, brass::Value* x, brass::Value* acc) {
+                    return is_fp ? b.build_fma(a, x, acc) : b.build_add(acc, b.build_mul(a, x));
+                };
+                ValueList out;
+                if (lt.is_matrix() && rt.is_vector()) {
+                    uint32_t cols = lt.dimension, rows = lt.elem_lanes;
+                    if (is_gpu && lt.scalar == ScalarKind::F32) {
+                        std::vector<brass::Value*> ops = {b.build_iconst_i32(cols), b.build_iconst_i32(rows)};
+                        ops.insert(ops.end(), lv.begin(), lv.end());
+                        ops.insert(ops.end(), rv.begin(), rv.end());
+                        brass::Value* prod = b.build_call("spirv_matrix_times_vector", brass::Type::f32x4(), ops);
+                        for (uint32_t r = 0; r < rows; ++r) out.push_back(b.builder().build_vextract_lane(prod, static_cast<uint8_t>(r)));
+                        return out;
+                    }
+                    for (uint32_t r = 0; r < rows; ++r) {
+                        brass::Value* acc = b.build_mul(lv[r], rv[0]);
+                        for (uint32_t c = 1; c < cols; ++c) acc = mac(lv[c * rows + r], rv[c], acc);
+                        out.push_back(acc);
+                    }
+                    return out;
+                }
+                if (lt.is_vector() && rt.is_matrix()) {
+                    uint32_t cols = rt.dimension, rows = rt.elem_lanes;
+                    if (is_gpu && rt.scalar == ScalarKind::F32) {
+                        std::vector<brass::Value*> ops = {b.build_iconst_i32(cols), b.build_iconst_i32(rows)};
+                        ops.insert(ops.end(), lv.begin(), lv.end());
+                        ops.insert(ops.end(), rv.begin(), rv.end());
+                        brass::Value* prod = b.build_call("spirv_vector_times_matrix", brass::Type::f32x4(), ops);
+                        for (uint32_t c = 0; c < cols; ++c) out.push_back(b.builder().build_vextract_lane(prod, static_cast<uint8_t>(c)));
+                        return out;
+                    }
+                    for (uint32_t c = 0; c < cols; ++c) {
+                        brass::Value* acc = b.build_mul(lv[0], rv[c * rows]);
+                        for (uint32_t r = 1; r < rows; ++r) acc = mac(lv[r], rv[c * rows + r], acc);
+                        out.push_back(acc);
+                    }
+                    return out;
+                }
+                uint32_t ca = lt.dimension, ra = lt.elem_lanes, cb = rt.dimension;
+                if (is_gpu && lt.scalar == ScalarKind::F32) {
+                    for (uint32_t c = 0; c < cb; ++c) {
+                        std::vector<brass::Value*> ops = {
+                            b.build_iconst_i32(ca), b.build_iconst_i32(ra), b.build_iconst_i32(cb), b.build_iconst_i32(c)};
+                        ops.insert(ops.end(), lv.begin(), lv.end());
+                        ops.insert(ops.end(), rv.begin(), rv.end());
+                        brass::Value* col = b.build_call("spirv_matrix_times_matrix", brass::Type::f32x4(), ops);
+                        for (uint32_t r = 0; r < ra; ++r) out.push_back(b.builder().build_vextract_lane(col, static_cast<uint8_t>(r)));
+                    }
+                    return out;
+                }
+                for (uint32_t c = 0; c < cb; ++c) {
+                    for (uint32_t r = 0; r < ra; ++r) {
+                        brass::Value* acc = b.build_mul(lv[r], rv[c * ca]);
+                        for (uint32_t k = 1; k < ca; ++k) acc = mac(lv[k * ra + r], rv[c * ca + k], acc);
+                        out.push_back(acc);
+                    }
+                }
+                return out;
+            }
             size_t n = std::max(lv.size(), rv.size());
             ValueList out;
             out.reserve(n);
-            ScalarKind sk = e->lhs->resolved_type.scalar;
+            ScalarKind sk = lt.scalar;
             for (size_t i = 0; i < n; ++i) {
                 brass::Value* l = lv[i < lv.size() ? i : 0];
                 brass::Value* r = rv[i < rv.size() ? i : 0];
@@ -619,30 +661,36 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ScalarKind to_sk = e->resolved_type.scalar;
                 ValueList out;
                 for (brass::Value* v : sv) {
-                    if (from_sk == ScalarKind::F32 && (to_sk == ScalarKind::I32 || to_sk == ScalarKind::U32)) {
-                        out.push_back(b.build_bitcast_i32_f32(v));
-                    } else if ((from_sk == ScalarKind::I32 || from_sk == ScalarKind::U32) && to_sk == ScalarKind::F32) {
-                        out.push_back(b.build_bitcast_f32_i32(v));
-                    } else if (from_sk == ScalarKind::F64 && (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64)) {
-                        out.push_back(b.build_bitcast_i64_f64(v));
-                    } else if ((from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) && to_sk == ScalarKind::F64) {
-                        out.push_back(b.build_bitcast_f64_i64(v));
-                    } else {
-                        out.push_back(v);
-                    }
+                    if (from_sk == ScalarKind::F32 && (to_sk == ScalarKind::I32 || to_sk == ScalarKind::U32)) out.push_back(b.build_bitcast_i32_f32(v));
+                    else if ((from_sk == ScalarKind::I32 || from_sk == ScalarKind::U32) && to_sk == ScalarKind::F32) out.push_back(b.build_bitcast_f32_i32(v));
+                    else if (from_sk == ScalarKind::F64 && (to_sk == ScalarKind::I64 || to_sk == ScalarKind::U64)) out.push_back(b.build_bitcast_i64_f64(v));
+                    else if ((from_sk == ScalarKind::I64 || from_sk == ScalarKind::U64) && to_sk == ScalarKind::F64) out.push_back(b.build_bitcast_f64_i64(v));
+                    else out.push_back(v);
                 }
                 return out;
             }
             // 4. Vector / Matrix / Array / Struct constructors
-            if (n == "vec2" || n == "vec3" || n == "vec4" ||
-                n == "vec2f" || n == "vec3f" || n == "vec4f" ||
-                n == "vec2d" || n == "vec3d" || n == "vec4d" ||
-                n == "vec2i" || n == "vec3i" || n == "vec4i" ||
-                n == "vec2u" || n == "vec3u" || n == "vec4u" ||
-                n == "mat2" || n == "mat3" || n == "mat4" ||
-                n == "mat2f" || n == "mat3f" || n == "mat4f" ||
-                n == "mat2d" || n == "mat3d" || n == "mat4d" ||
+            if (n == "vec2" || n == "vec3" || n == "vec4" || n == "vec2f" || n == "vec3f" || n == "vec4f" ||
+                n == "vec2d" || n == "vec3d" || n == "vec4d" || n == "vec2i" || n == "vec3i" || n == "vec4i" ||
+                n == "vec2u" || n == "vec3u" || n == "vec4u" || n == "mat2" || n == "mat3" || n == "mat4" ||
+                n == "mat2f" || n == "mat3f" || n == "mat4f" || n == "mat2d" || n == "mat3d" || n == "mat4d" ||
                 n == "vec" || n == "mat" || n == "array" || e->resolved_type.is_struct()) {
+                if (e->resolved_type.is_matrix() && e->args.size() == 1 && e->args[0]->resolved_type.is_matrix()) {
+                    const Type& st = e->args[0]->resolved_type;
+                    const Type& dt = e->resolved_type;
+                    ValueList sv = lower_expr(e->args[0].get());
+                    uint32_t sc = st.dimension, sr = st.elem_lanes, dc = dt.dimension, dr = dt.elem_lanes;
+                    ValueList out;
+                    out.reserve(dc * dr);
+                    for (uint32_t c = 0; c < dc; ++c) {
+                        for (uint32_t r = 0; r < dr; ++r) {
+                            out.push_back((c < sc && r < sr)
+                                              ? lower_scalar_cast(sv[c * sr + r], st.scalar, dt.scalar)
+                                              : lower_scalar_cast(b.build_iconst_i32(c == r ? 1 : 0), ScalarKind::I32, dt.scalar));
+                        }
+                    }
+                    return out;
+                }
                 uint32_t target_leaves = mod.types.flat_leaf_count(e->resolved_type);
                 std::vector<ScalarKind> target_sks = mod.types.flatten_scalars(e->resolved_type);
                 ValueList flat;
@@ -653,17 +701,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                         brass::Value* v = av[i];
                         if (!e->resolved_type.is_struct() && i < arg_sks.size() && !target_sks.empty()) {
                             ScalarKind to_sk = target_sks[std::min(flat.size(), target_sks.size() - 1)];
-                            if (arg_sks[i] != to_sk) {
-                                v = lower_scalar_cast(v, arg_sks[i], to_sk);
-                            }
+                            if (arg_sks[i] != to_sk) v = lower_scalar_cast(v, arg_sks[i], to_sk);
                         }
                         flat.push_back(v);
                     }
                 }
                 if (flat.empty()) return make_zero_leaves(e->resolved_type);
-                if (flat.size() == 1 && target_leaves > 1) {
-                    return ValueList(target_leaves, flat[0]);
-                }
+                if (flat.size() == 1 && target_leaves > 1) return ValueList(target_leaves, flat[0]);
                 while (flat.size() < target_leaves) flat.push_back(flat.back());
                 flat.resize(target_leaves);
                 return flat;
@@ -798,45 +842,44 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             if (n == "frag_coord") {
                 if (is_gpu) {
-                    return {
-                        b.build_call("spirv_frag_coord_x", brass::Type::f32()),
-                        b.build_call("spirv_frag_coord_y", brass::Type::f32()),
-                        b.build_call("spirv_frag_coord_z", brass::Type::f32()),
-                        b.build_call("spirv_frag_coord_w", brass::Type::f32()),
-                    };
+                    return {b.build_call("spirv_frag_coord_x", brass::Type::f32()), b.build_call("spirv_frag_coord_y", brass::Type::f32()),
+                            b.build_call("spirv_frag_coord_z", brass::Type::f32()), b.build_call("spirv_frag_coord_w", brass::Type::f32())};
                 }
                 return {b.build_sitofp_f32_i32(gx), b.build_sitofp_f32_i32(gy), b.build_fconst_f32(0.0f), b.build_fconst_f32(1.0f)};
             }
-            if (n == "front_facing") {
-                return {is_gpu ? b.build_call("spirv_front_facing", brass::Type::i32()) : b.build_iconst_i32(1)};
-            }
+            if (n == "front_facing") return {is_gpu ? b.build_call("spirv_front_facing", brass::Type::i32()) : b.build_iconst_i32(1)};
             if (n == "discard_fragment") {
                 // Demote drops the fragment's outputs and keeps the invocation running in uniform control flow.
                 if (is_gpu) b.build_call("spirv_demote_to_helper", brass::Type::void_type());
                 return {};
             }
-            // 6. Vector reductions: dot, length, distance, cross, normalize, reflect
-            if (n == "dot") {
-                ValueList a = lower_expr(e->args[0].get());
-                ValueList c = lower_expr(e->args[1].get());
-                brass::Value* sum = b.build_mul(a[0], c[0]);
-                for (size_t i = 1; i < a.size() && i < c.size(); ++i) {
-                    sum = b.build_add(sum, b.build_mul(a[i], c[i]));
+            // 6. Vector & matrix operations: transpose, dot, length, distance, cross, normalize, reflect
+            if (n == "transpose") {
+                const Type& mt = e->args[0]->resolved_type;
+                ValueList mv = lower_expr(e->args[0].get());
+                uint32_t cols = mt.dimension, rows = mt.elem_lanes;
+                ValueList out;
+                out.reserve(cols * rows);
+                for (uint32_t r = 0; r < rows; ++r) {
+                    for (uint32_t c = 0; c < cols; ++c) out.push_back(mv[c * rows + r]);
                 }
+                return out;
+            }
+            if (n == "dot") {
+                ValueList a = lower_expr(e->args[0].get()), c = lower_expr(e->args[1].get());
+                brass::Value* sum = b.build_mul(a[0], c[0]);
+                for (size_t i = 1; i < a.size() && i < c.size(); ++i) sum = b.build_add(sum, b.build_mul(a[i], c[i]));
                 return {sum};
             }
             if (n == "length") {
                 ValueList a = lower_expr(e->args[0].get());
                 if (a.size() == 1) return {lower_scalar_math_1("abs", a[0], e->resolved_type.scalar)};
                 brass::Value* sum = b.build_mul(a[0], a[0]);
-                for (size_t i = 1; i < a.size(); ++i) {
-                    sum = b.build_add(sum, b.build_mul(a[i], a[i]));
-                }
+                for (size_t i = 1; i < a.size(); ++i) sum = b.build_add(sum, b.build_mul(a[i], a[i]));
                 return {b.build_sqrt(sum)};
             }
             if (n == "distance") {
-                ValueList a = lower_expr(e->args[0].get());
-                ValueList c = lower_expr(e->args[1].get());
+                ValueList a = lower_expr(e->args[0].get()), c = lower_expr(e->args[1].get());
                 brass::Value* d0 = b.build_sub(a[0], c[0]);
                 if (a.size() == 1) return {lower_scalar_math_1("abs", d0, e->resolved_type.scalar)};
                 brass::Value* sum = b.build_mul(d0, d0);
@@ -849,9 +892,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (n == "normalize") {
                 ValueList a = lower_expr(e->args[0].get());
                 brass::Value* sum = b.build_mul(a[0], a[0]);
-                for (size_t i = 1; i < a.size(); ++i) {
-                    sum = b.build_add(sum, b.build_mul(a[i], a[i]));
-                }
+                for (size_t i = 1; i < a.size(); ++i) sum = b.build_add(sum, b.build_mul(a[i], a[i]));
                 brass::Value* len = b.build_sqrt(sum);
                 ValueList out;
                 out.reserve(a.size());
@@ -859,24 +900,18 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 return out;
             }
             if (n == "cross") {
-                ValueList a = lower_expr(e->args[0].get());
-                ValueList c = lower_expr(e->args[1].get());
-                return {
-                    b.build_sub(b.build_mul(a[1], c[2]), b.build_mul(a[2], c[1])),
-                    b.build_sub(b.build_mul(a[2], c[0]), b.build_mul(a[0], c[2])),
-                    b.build_sub(b.build_mul(a[0], c[1]), b.build_mul(a[1], c[0])),
-                };
+                ValueList a = lower_expr(e->args[0].get()), c = lower_expr(e->args[1].get());
+                return {b.build_sub(b.build_mul(a[1], c[2]), b.build_mul(a[2], c[1])),
+                        b.build_sub(b.build_mul(a[2], c[0]), b.build_mul(a[0], c[2])),
+                        b.build_sub(b.build_mul(a[0], c[1]), b.build_mul(a[1], c[0]))};
             }
             if (n == "reflect") {
-                ValueList iv = lower_expr(e->args[0].get());
-                ValueList nv = lower_expr(e->args[1].get());
+                ValueList iv = lower_expr(e->args[0].get()), nv = lower_expr(e->args[1].get());
                 brass::Value* dt = b.build_mul(iv[0], nv[0]);
                 for (size_t i = 1; i < iv.size(); ++i) dt = b.build_add(dt, b.build_mul(iv[i], nv[i]));
                 brass::Value* two_dt = b.build_add(dt, dt);
                 ValueList out;
-                for (size_t i = 0; i < iv.size(); ++i) {
-                    out.push_back(b.build_sub(iv[i], b.build_mul(two_dt, nv[i])));
-                }
+                for (size_t i = 0; i < iv.size(); ++i) out.push_back(b.build_sub(iv[i], b.build_mul(two_dt, nv[i])));
                 return out;
             }
             if (n == "faceforward") {
@@ -939,22 +974,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 return out;
             }
             if (e->args.size() == 2) {
-                ValueList a = lower_expr(e->args[0].get());
-                ValueList c = lower_expr(e->args[1].get());
-                ValueList out;
-                for (size_t i = 0; i < a.size() && i < c.size(); ++i) {
-                    out.push_back(lower_scalar_math_2(n, a[i], c[i], sk));
-                }
+                ValueList a = lower_expr(e->args[0].get()), c = lower_expr(e->args[1].get()), out;
+                for (size_t i = 0; i < a.size() && i < c.size(); ++i) out.push_back(lower_scalar_math_2(n, a[i], c[i], sk));
                 return out;
             }
             if (e->args.size() == 3) {
-                ValueList x = lower_expr(e->args[0].get());
-                ValueList y = lower_expr(e->args[1].get());
-                ValueList z = lower_expr(e->args[2].get());
-                ValueList out;
-                for (size_t i = 0; i < x.size() && i < y.size() && i < z.size(); ++i) {
-                    out.push_back(lower_scalar_math_3(n, x[i], y[i], z[i], sk));
-                }
+                ValueList x = lower_expr(e->args[0].get()), y = lower_expr(e->args[1].get()), z = lower_expr(e->args[2].get()), out;
+                for (size_t i = 0; i < x.size() && i < y.size() && i < z.size(); ++i) out.push_back(lower_scalar_math_3(n, x[i], y[i], z[i], sk));
                 return out;
             }
             return make_zero_leaves(e->resolved_type);

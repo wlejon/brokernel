@@ -421,7 +421,7 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
             if (expected && expected->is_array() && expected->dimension == dim) {
                 sk = expected->scalar;
             }
-            target = Type::array_of(Type::vec(sk, dim), dim);
+            target = Type::mat(sk, dim, dim);
         } else {
             TypeExpr te{e->span, n, {}};
             target = ctx.resolve_type(&te, fn.module_name, genv);
@@ -763,6 +763,21 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = t;
         return t;
     }
+    if (n == "transpose") {
+        if (e->args.size() != 1) {
+            ctx.diags.error(e->span, "'transpose' expects 1 matrix argument");
+            return Type::mat(ScalarKind::F32, 3, 3);
+        }
+        Type mt = check_expr(e->args[0].get());
+        if (!mt.is_array() || !mt.element_type().is_vector()) {
+            ctx.diags.error(e->span, "'transpose' requires a matrix argument, got '" + mt.to_string() + "'");
+            return mt;
+        }
+        Type res = Type::mat(mt.scalar, mt.elem_lanes, mt.dimension);
+        mark_type_usage(res);
+        e->resolved_type = res;
+        return res;
+    }
     if (n == "isnan" || n == "isinf" || n == "subgroup_all" || n == "subgroup_any") {
         if (e->args.size() != 1) {
             ctx.diags.error(e->span, "'" + n + "' expects 1 argument");
@@ -860,8 +875,8 @@ bool coerce_expr_to_type(Expr* e, const Type& target_type) {
         retype_literal(e, target_type);
         return true;
     }
-    // Scalar broadcast to vector of matching scalar type (or unsuffixed literal to vector)
-    if (target_type.is_vector()) {
+    // Scalar broadcast to vector or matrix of matching scalar type (or unsuffixed literal)
+    if (target_type.is_vector() || target_type.is_matrix()) {
         Type elem_target = Type::scalar_type(target_type.scalar);
         if (e->resolved_type == elem_target || coerce_expr_to_type(e, elem_target)) {
             auto wrapped = std::make_unique<Expr>();

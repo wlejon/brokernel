@@ -919,6 +919,48 @@ static void test_vector_and_matrix_constants_parity() {
     }
 }
 
+static void test_matrix_linear_algebra_parity() {
+    const char* src = R"(
+        @kernel @grid(1)
+        fn eval_mat_ops(g: grid<1>, out: write_store<vec4<f32>, 1>) {
+            let t: f32 = f32(g.x()) * 0.25 + 0.5;
+            let a4: mat4f = mat4f(
+                vec4f(1.0,  0.5, -0.25, 0.0),
+                vec4f(0.0,  2.0,  0.75, 0.0),
+                vec4f(0.25, -1.0, 1.5,  0.0),
+                vec4f(2.0, -3.0,  4.0,  1.0)
+            );
+            let b4: mat4f = mat4f(
+                vec4f(0.5,  0.0,  1.0,  0.0),
+                vec4f(1.25, 1.0, -0.5,  0.0),
+                vec4f(0.0,  0.5,  2.0,  0.0),
+                vec4f(-1.0, 2.0,  0.5,  1.0)
+            );
+            let v4: vec4f = vec4f(t, t * 1.5 - 1.0, -t * 0.5 + 2.0, 1.0);
+            let c4: mat4f = a4 * b4;
+            let p4: vec4f = c4 * v4;
+
+            let a3: mat3f = mat3f(a4);
+            let b3: mat3f = mat3f(b4) * 0.5;
+            let v3: vec3f = v4.xyz;
+            let p3: vec3f = (a3 * b3) * v3 + (v3 * transpose(a3));
+            out.write(p4 + vec4f(p3, c4[3].z));
+        }
+    )";
+    auto res = compile_source(src, "mat_ops_parity.bk");
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const CompiledKernel* k = res.find_kernel("eval_mat_ops");
+    assert(k != nullptr);
+
+    constexpr uint32_t W = 32;
+    std::vector<float> out(W * 4, 0.0f);
+    std::vector<KernelArg> args = {KernelArg::store(out)};
+    auto rep = k->compare_cpu_gpu(GridShape(W), args, 1e-5, 1e-5);
+    if (!rep.ok) std::cerr << "mat_ops parity failed: " << rep.message << "\n";
+    assert(rep.ok && rep.ran_gpu);
+}
+
 int main() {
     if (!brass::gpu::vulkan_available()) {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
@@ -936,6 +978,7 @@ int main() {
     test_atomics_parity();
     test_lowering_quirks_parity();
     test_vector_and_matrix_constants_parity();
+    test_matrix_linear_algebra_parity();
     std::cout << "test_cpu_gpu_parity: ALL PASSED\n";
     return 0;
 }

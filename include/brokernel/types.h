@@ -61,7 +61,7 @@ struct Type {
     // kImageSeparate: a texture sampled through a separate `sampler` (a
     // Sampler type with it); kSamplerOnly: that sampler.
     static constexpr uint8_t kImageArrayed = 1, kImageShadow = 2, kImageCube = 4, kImageSeparate = 8,
-                             kSamplerOnly = 16;
+                             kSamplerOnly = 16, kMatrix = 32;
     uint8_t image_flags = 0;
 
     static Type void_type() noexcept { return Type{}; }
@@ -100,6 +100,13 @@ struct Type {
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
         if (elem.is_array()) t.nested_elem = std::make_shared<Type>(elem);
+        return t;
+    }
+
+    static Type mat(ScalarKind s, uint32_t cols, uint32_t rows = 0) {
+        if (rows == 0) rows = cols;
+        Type t = array_of(vec(s, rows), cols);
+        t.image_flags |= kMatrix;
         return t;
     }
 
@@ -199,6 +206,9 @@ struct Type {
     bool is_scalar() const noexcept { return kind == TypeKind::Scalar; }
     bool is_vector() const noexcept { return kind == TypeKind::Vector; }
     bool is_array() const noexcept { return kind == TypeKind::Array; }
+    bool is_matrix() const noexcept {
+        return kind == TypeKind::Array && (image_flags & kMatrix) != 0 && elem_kind == TypeKind::Vector;
+    }
     bool is_struct() const noexcept { return kind == TypeKind::Struct; }
     bool is_grid() const noexcept { return kind == TypeKind::Grid; }
     bool is_stencil() const noexcept { return kind == TypeKind::Stencil; }
