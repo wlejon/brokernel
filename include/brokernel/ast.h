@@ -73,7 +73,6 @@ enum class TokenKind : uint8_t {
     Tilde,       // ~
     Bang,        // !
     Shl,         // <<
-    Shr,         // >>
 
     AmpAmp,      // &&
     PipePipe,    // ||
@@ -315,6 +314,13 @@ struct ParamDecl {
     std::string name;
     TypeExprPtr type;
     ExprPtr default_value;
+
+    const Attribute* find_attribute(std::string_view attr_name) const noexcept {
+        for (const auto& a : attributes) {
+            if (a.name == attr_name) return &a;
+        }
+        return nullptr;
+    }
 };
 
 struct FnDecl {

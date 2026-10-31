@@ -52,6 +52,10 @@ struct Type {
     // For composite stores/stencils/arrays whose element is a vector or struct:
     TypeKind elem_kind = TypeKind::Scalar;
     uint32_t elem_lanes = 1;
+    // Images and samplers: an array of layers, a depth texture read by
+    // comparison, a cube.
+    static constexpr uint8_t kImageArrayed = 1, kImageShadow = 2, kImageCube = 4;
+    uint8_t image_flags = 0;
 
     static Type void_type() noexcept { return Type{}; }
     static Type scalar_type(ScalarKind s) noexcept {
@@ -133,7 +137,7 @@ struct Type {
         return t;
     }
 
-    static Type image(const Type& elem, uint32_t dim, AccessMode mode = AccessMode::ReadWrite) {
+    static Type image(const Type& elem, uint32_t dim, AccessMode mode = AccessMode::ReadWrite, uint8_t flags = 0) {
         Type t;
         t.kind = TypeKind::Image;
         t.scalar = elem.scalar;
@@ -141,10 +145,13 @@ struct Type {
         t.access = mode;
         t.elem_kind = elem.kind;
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
+        t.image_flags = flags;
         return t;
     }
 
-    static Type sampler(const Type& elem, uint32_t dim) {
+    // A sampled texture of `dim` dimensions (a cube's are its 3 direction
+    // components), `flags` kImage*: its texel `elem`, or f32 for a shadow.
+    static Type sampler(const Type& elem, uint32_t dim, uint8_t flags = 0) {
         Type t;
         t.kind = TypeKind::Sampler;
         t.scalar = elem.scalar;
@@ -152,8 +159,16 @@ struct Type {
         t.access = AccessMode::Read;
         t.elem_kind = elem.kind;
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
+        t.image_flags = flags;
         return t;
     }
+
+    bool image_arrayed() const noexcept { return (image_flags & kImageArrayed) != 0; }
+    bool image_shadow() const noexcept { return (image_flags & kImageShadow) != 0; }
+    bool image_cube() const noexcept { return (image_flags & kImageCube) != 0; }
+    // An image's or a sampler's coordinate components: its dimensions and,
+    // for an array, the layer.
+    uint32_t image_coords() const noexcept { return dimension + (image_arrayed() ? 1 : 0); }
 
     bool is_void() const noexcept { return kind == TypeKind::Void; }
     bool is_scalar() const noexcept { return kind == TypeKind::Scalar; }

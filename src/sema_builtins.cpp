@@ -168,27 +168,8 @@ Type FnCheckState::check_method_call(Expr* e) {
         ctx.diags.error(e->span, "unknown store method '" + m + "'");
         return Type::void_type();
     }
-    if (recv_t.is_image()) {
-        Type elem = recv_t.element_type();
-        for (auto& a : e->args) check_expr(a.get());
-        if (m == "load") {
-            if (!can_Read(recv_t.access)) ctx.diags.error(e->span, "cannot load from write-only image");
-            e->resolved_type = elem;
-            return elem;
-        }
-        if (m == "store") {
-            if (!can_Write(recv_t.access)) ctx.diags.error(e->span, "cannot store to read-only image");
-            e->resolved_type = Type::void_type();
-            return Type::void_type();
-        }
-    }
-    if (recv_t.is_sampler()) {
-        Type elem = recv_t.element_type();
-        for (auto& a : e->args) check_expr(a.get());
-        if (m == "sample" || m == "sample_lod") {
-            e->resolved_type = elem;
-            return elem;
-        }
+    if (recv_t.is_image() || recv_t.is_sampler()) {
+        return check_texture_method(e, recv_t);
     }
     ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
     return Type::void_type();
@@ -858,5 +839,127 @@ bool FnCheckState::validate_stencil_access(
         fn.stencil_halo[a] = std::max(fn.stencil_halo[a], param.halo[a]);
     }
     return true;
+}
+
+// A sampler's methods filter (sample*, at the fragment's implicit LOD, an
+// explicit lod, or gradients; the _offset forms add constant texels each
+// dimension), compare to a reference (a shadow sampler), fetch a texel,
+// gather four, and give the size and the mip count; an image loads and
+// stores texels. Coordinates are f32 for filtering and i32 for texels, a
+// layer after a texture array's dimensions.
+Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
+    const std::string& m = e->name;
+    const bool image = recv_t.is_image();
+    const bool cube = recv_t.image_cube();
+    const bool shadow = recv_t.image_shadow();
+    const Type elem = recv_t.element_type();
+    const uint32_t n = recv_t.image_coords();
+    const Type fcoord = Type::vec(ScalarKind::F32, n);
+    const Type icoord = Type::vec(ScalarKind::I32, n);
+    const Type space = Type::vec(ScalarKind::F32, recv_t.dimension);   // a gradient
+    const Type offset = Type::vec(ScalarKind::I32, recv_t.dimension);
+    const Type size = Type::vec(ScalarKind::I32, (cube ? 2 : recv_t.dimension) + (recv_t.image_arrayed() ? 1 : 0));
+
+    auto done = [&](const Type& t) {
+        e->resolved_type = t;
+        return t;
+    };
+    // `m(params...)`: each argument checked against its parameter.
+    auto takes = [&](std::initializer_list<Type> params, const char* shape) {
+        if (e->args.size() != params.size()) {
+            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + shape + ")");
+            for (auto& a : e->args) check_expr(a.get());
+            return;
+        }
+        size_t i = 0;
+        for (const Type& t : params) {
+            Expr* a = e->args[i++].get();
+            check_expr(a, t);
+            check_assignable(a, t, ctx.diags, a->span);
+        }
+    };
+    auto no_cube = [&] {
+        if (cube) ctx.diags.error(e->span, recv_t.to_string() + "." + m + ": a cube has no texel offsets or fetches");
+    };
+
+    if (image) {
+        if (m == "load") {
+            if (!can_Read(recv_t.access)) ctx.diags.error(e->span, "cannot load from write-only image");
+            takes({icoord}, "coordinates");
+            return done(elem);
+        }
+        if (m == "store") {
+            if (!can_Write(recv_t.access)) ctx.diags.error(e->span, "cannot store to read-only image");
+            takes({icoord, elem}, "coordinates, texel");
+            return done(Type::void_type());
+        }
+        if (m == "size") {
+            takes({}, "");
+            return done(Type::vec(ScalarKind::I32, n));
+        }
+    } else {
+        if (m == "size") {
+            takes({Type::i32()}, "lod");
+            return done(size);
+        }
+        if (m == "levels") {
+            takes({}, "");
+            return done(Type::i32());
+        }
+        if (shadow) {
+            if (m == "compare") {
+                takes({fcoord, Type::f32()}, "coordinates, reference");
+                return done(Type::f32());
+            }
+            if (m == "compare_lod") {
+                takes({fcoord, Type::f32(), Type::f32()}, "coordinates, reference, lod");
+                return done(Type::f32());
+            }
+            if (m == "gather") {
+                takes({fcoord, Type::f32()}, "coordinates, reference");
+                return done(Type::vec(ScalarKind::F32, 4));
+            }
+        } else {
+            if (m == "sample") {
+                takes({fcoord}, "coordinates");
+                return done(elem);
+            }
+            if (m == "sample_offset") {
+                no_cube();
+                takes({fcoord, offset}, "coordinates, offset");
+                return done(elem);
+            }
+            if (m == "sample_lod") {
+                takes({fcoord, Type::f32()}, "coordinates, lod");
+                return done(elem);
+            }
+            if (m == "sample_lod_offset") {
+                no_cube();
+                takes({fcoord, Type::f32(), offset}, "coordinates, lod, offset");
+                return done(elem);
+            }
+            if (m == "sample_grad") {
+                takes({fcoord, space, space}, "coordinates, dx, dy");
+                return done(elem);
+            }
+            if (m == "sample_grad_offset") {
+                no_cube();
+                takes({fcoord, space, space, offset}, "coordinates, dx, dy, offset");
+                return done(elem);
+            }
+            if (m == "fetch") {
+                no_cube();
+                takes({icoord, Type::i32()}, "texel coordinates, lod");
+                return done(elem);
+            }
+            if (m == "gather") {
+                takes({fcoord, Type::i32()}, "coordinates, component");
+                return done(Type::vec(elem.scalar, 4));
+            }
+        }
+    }
+    for (auto& a : e->args) check_expr(a.get());
+    ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
+    return done(Type::void_type());
 }
 } // namespace brokernel::detail

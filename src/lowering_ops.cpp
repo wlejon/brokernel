@@ -392,6 +392,13 @@ Value* Ops::build_umod(Value* a, Value* c) {
 }
 Value* Ops::build_neg(Value* v) {
     v = real(v);
+    // A negated integer literal is a constant (a texel offset must be one).
+    if (const brass::Instruction* def = v->is_instruction() ? v->defining_instruction() : nullptr) {
+        if (def->opcode() == Opcode::iconst_i32)
+            return b_.build_iconst_i32(static_cast<int32_t>(0u - static_cast<uint32_t>(def->imm_i32())));
+        if (def->opcode() == Opcode::iconst_i64)
+            return b_.build_iconst_i64(static_cast<int64_t>(0ull - static_cast<uint64_t>(def->imm_i64())));
+    }
     if (!is_varying(v)) return b_.build_neg(v);
     return b_.build_vneg(v);
 }

@@ -113,5 +113,6 @@ struct FnCheckState {
     Type check_builtin_call(Expr* e, std::optional<Type> expected);
     Type check_user_call(Expr* e, const FnDecl& callee_decl, const std::string& callee_mod);
     Type check_method_call(Expr* e);
+    Type check_texture_method(Expr* e, const Type& recv_t);   // an image's or a sampler's method
 };
 } // namespace brokernel::detail

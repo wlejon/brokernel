@@ -81,6 +81,27 @@ general graphics:
   `grid_linear_index()`, `grid_total_cells()`) are i64, stores take i32 or
   i64 coordinates, and the CPU's grid loop indexes in i64, so a grid may
   pass 2^31 cells.
+- **Textures are parameters at a descriptor**, `@binding(set, binding)`:
+  - Samplers (a combined image and sampler) are `sampler1d`, `sampler2d`,
+    `sampler3d`, `sampler_cube`, `sampler2d_array` and `sampler_cube_array`,
+    each `<T>` for an f32 or u32 texel or a vector of either (`vec4<f32>` when
+    left out). The shadow forms `sampler2d_shadow`, `sampler2d_array_shadow`
+    and `sampler_cube_shadow` compare to an f32.
+  - A sampler's methods:
+    - `sample(uv)` at the fragment's implicit LOD, `sample_lod(uv, lod)` and
+      `sample_grad(uv, dx, dy)`. Each has an `_offset` form taking constant
+      texels, except on a cube.
+    - `fetch(texel, lod)`, `gather(uv, component)`, `size(lod)` and `levels()`.
+    - On a shadow sampler, `compare(uv, ref)`, `compare_lod(uv, ref, lod)`
+      and `gather(uv, ref)`.
+  - Coordinates are f32 to filter and i32 for texels; a texture array's layer
+    comes after its dimensions.
+  - Storage images are `image1d`, `image2d`, `image3d` and `image2d_array`,
+    with `load`, `store` and `size`. Their format is `@format(rgba16f)` (and
+    the rest of Vulkan's storage formats), or else the one that holds `T`
+    whole.
+  - A texture passed to a helper function still names its descriptor.
+    `CompiledKernel::spirv.descriptors` lists each texture's shape.
 - **Type introspection for generics.** `is_f64<T>()` and `sizeof<T>()`
   fold to constants at check time, so a generic body can branch on its
   scalar; `bitcast<T>(x)` reinterprets a value's bits as a type of the same
@@ -109,7 +130,7 @@ general graphics:
   and workgroup of one:
   - The subgroup operations are the identity there.
   - Vertex and fragment stages have no CPU build. Neither do kernels that
-    cooperate through barriers or shared memory.
+    cooperate through barriers or shared memory, or that take a texture.
   - Derivatives, `front_facing` and `discard_fragment` (a demote to helper)
     are fragment-only.
   - A kernel's native code is compiled the first time something runs it on

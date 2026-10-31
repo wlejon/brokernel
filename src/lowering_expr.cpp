@@ -690,6 +690,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 }
             }
             if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
+            if (rt.is_image() || rt.is_sampler()) return lower_texture_call(e);
             if (rt.is_store()) {
                 ValueList base = lower_expr(e->lhs.get());
                 uint32_t dim = rt.dimension;

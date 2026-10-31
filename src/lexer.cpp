@@ -286,7 +286,8 @@ std::vector<Token> lex_source(const SourceMap& src, DiagnosticBag& diags) {
         if (c == '<' && peek(1) == '=') { push_tok(TokenKind::Le, 2); continue; }
         if (c == '>' && peek(1) == '=') { push_tok(TokenKind::Ge, 2); continue; }
         if (c == '<' && peek(1) == '<') { push_tok(TokenKind::Shl, 2); continue; }
-        if (c == '>' && peek(1) == '>') { push_tok(TokenKind::Shr, 2); continue; }
+        // `>>` is two `>`: it closes two type argument lists (`sampler2d<vec4<f32>>`),
+        // and the expression parser reads two adjacent ones as a shift.
         if (c == '+' && peek(1) == '=') { push_tok(TokenKind::PlusEq, 2); continue; }
         if (c == '-' && peek(1) == '=') { push_tok(TokenKind::MinusEq, 2); continue; }
         if (c == '*' && peek(1) == '=') { push_tok(TokenKind::StarEq, 2); continue; }

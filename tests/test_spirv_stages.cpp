@@ -182,6 +182,91 @@ static void test_render_math() {
     assert(quick->has_cpu_build());
 }
 
+// Samplers of every shape and storage images, through a helper function, to
+// their descriptors and image instructions.
+static void test_textures() {
+    const char* src = R"(
+        fn lit(albedo: sampler2d<vec4<f32>>, uv: vec2<f32>) -> vec4<f32> {
+            return albedo.sample(uv) + albedo.sample_offset(uv, vec2<i32>(1, -1));
+        }
+        @fragment fn shade(@binding(0, 0) albedo: sampler2d<vec4<f32>>,
+                           @binding(0, 1) sky: sampler_cube<vec3<f32>>,
+                           @binding(0, 2) shadows: sampler2d_array_shadow,
+                           @binding(1, 0) mask: sampler2d<u32>,
+                           k: f32) {
+            let fc: vec4<f32> = frag_coord();
+            let uv: vec2<f32> = fc.xy * k;
+            let c: vec4<f32> = lit(albedo, uv) + albedo.sample_lod(uv, 2.0) +
+                               albedo.sample_grad(uv, vec2<f32>(k, 0.0), vec2<f32>(0.0, k)) +
+                               albedo.fetch(vec2<i32>(3, 4), 0) + albedo.gather(uv, 1);
+            let s: vec3<f32> = sky.sample(vec3<f32>(uv, 1.0));
+            let lit_by: f32 = shadows.compare(vec3<f32>(uv, 2.0), k) + shadows.compare_lod(vec3<f32>(uv, 1.0), k, 0.0);
+            let size: vec2<i32> = albedo.size(0);
+            let m: u32 = mask.fetch(vec2<i32>(size.x - 1, 0), albedo.levels() - 1);
+            set_frag_color(c + vec4<f32>(s * lit_by, f32(m)));
+        }
+        @kernel @grid(2) fn blur(@binding(0, 0) @format(rgba16f) dst: image2d<vec4<f32>>,
+                                 @binding(0, 1) src: sampler2d<vec4<f32>>, g: grid<2>) {
+            let uv: vec2<f32> = g.uv();
+            dst.store(vec2<i32>(g.x(), g.y()), src.sample_lod(uv, 0.0) * 0.5 + dst.load(vec2<i32>(g.x(), g.y())) * 0.5);
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "textures.bk", opts);
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    const CompiledKernel* fs = nullptr;
+    const CompiledKernel* cs = nullptr;
+    for (const auto& k : res.kernels) {
+        if (k.name == "shade") fs = &k;
+        if (k.name == "blur") cs = &k;
+    }
+    assert(fs && cs);
+    const std::string& d = fs->spirv_disassembly;
+    for (const char* op : {"OpImageSampleImplicitLod", "OpImageSampleExplicitLod", "OpImageFetch", "OpImageGather",
+                           "OpImageSampleDrefImplicitLod", "OpImageSampleDrefExplicitLod", "OpImageQuerySizeLod",
+                           "OpImageQueryLevels"}) {
+        if (d.find(op) == std::string::npos) {
+            std::cerr << "textures: no " << op << " in\n" << d << "\n";
+            assert(false);
+        }
+    }
+    using brass::target::SpirvImageDim;
+    const auto& desc = fs->spirv.descriptors;
+    assert(desc.size() == 4);
+    auto at = [&](uint32_t set, uint32_t binding) -> const brass::target::SpirvDescriptorBinding& {
+        for (const auto& b : desc) if (b.set == set && b.binding == binding) return b;
+        assert(false);
+        return desc[0];
+    };
+    assert(at(0, 0).dim == SpirvImageDim::D2 && !at(0, 0).arrayed);
+    assert(at(0, 1).dim == SpirvImageDim::Cube);
+    assert(at(0, 2).depth && at(0, 2).arrayed);
+    assert(at(1, 0).scalar == brass::target::SpirvImageScalar::U32);
+    // A kernel reading textures runs on the GPU alone.
+    assert(!cs->has_cpu_build());
+    assert(cs->spirv.descriptors.size() == 2);
+    for (const auto& b : cs->spirv.descriptors) {
+        if (b.binding == 0) {
+            assert(b.kind == brass::target::SpirvDescriptorKind::StorageImage);
+            assert(b.format == 2);   // Rgba16f
+        }
+    }
+
+    // A texel no format holds, a format of the wrong kind, and a shadow
+    // sampler's filtering are refused.
+    for (const char* bad : {
+             "@kernel @grid(2) fn k(@binding(0) im: image2d<vec3<f32>>, g: grid<2>) { }",
+             "@kernel @grid(2) fn k(@binding(0) @format(rgba8ui) im: image2d<vec4<f32>>, g: grid<2>) { }",
+             "@fragment fn f(@binding(0) s: sampler2d_shadow) { set_frag_color(vec4<f32>(s.sample(vec2<f32>(0.0, 0.0)), 0.0, 0.0, 1.0)); }",
+         }) {
+        auto r = compile_source(bad, "bad_texture.bk");
+        if (r.ok) std::cerr << "textures: accepted\n" << bad << "\n";
+        assert(!r.ok);
+    }
+}
+
 static void test_builtin_type_diagnostics() {
     auto fails_with = [](const char* src, const char* needle) {
         auto res = compile_source(src, "bad_builtin.bk");
@@ -213,6 +298,7 @@ int main() {
     test_vertex_stage_spirv();
     test_fragment_stage_spirv();
     test_render_math();
+    test_textures();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

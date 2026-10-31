@@ -1011,16 +1011,26 @@ Type SemaContext::resolve_type(
         return Type::store(elem, dim, mode);
     }
 
-    // 8. Images & Samplers
-    if (n == "image" || n == "image1d" || n == "image2d" || n == "image3d" ||
-        n == "read_image2d" || n == "write_image2d") {
-        AccessMode mode = AccessMode::ReadWrite;
-        if (n.rfind("read_", 0) == 0) mode = AccessMode::Read;
-        else if (n.rfind("write_", 0) == 0) mode = AccessMode::Write;
+    // 8. Images & Samplers. A texel is f32 or u32, or a vector of either
+    // (vec4<f32> when not given); a shadow sampler's is its comparison, f32.
+    auto texel_arg = [&]() {
         Type elem = Type::vec(ScalarKind::F32, 4);
         if (!texpr->args.empty() && texpr->args[0].type_arg) {
             elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
         }
+        if (!(elem.is_scalar() || elem.is_vector()) ||
+            (elem.scalar != ScalarKind::F32 && elem.scalar != ScalarKind::U32)) {
+            diags.error(texpr->span, "'" + n + "' texel must be f32, u32 or a vector of either");
+            elem = Type::vec(ScalarKind::F32, 4);
+        }
+        return elem;
+    };
+    if (n == "image" || n == "image1d" || n == "image2d" || n == "image3d" || n == "image2d_array" ||
+        n == "read_image2d" || n == "write_image2d") {
+        AccessMode mode = AccessMode::ReadWrite;
+        if (n.rfind("read_", 0) == 0) mode = AccessMode::Read;
+        else if (n.rfind("write_", 0) == 0) mode = AccessMode::Write;
+        Type elem = texel_arg();
         uint32_t dim = 2;
         if (n.find("1d") != std::string::npos) dim = 1;
         else if (n.find("3d") != std::string::npos) dim = 3;
@@ -1028,18 +1038,30 @@ Type SemaContext::resolve_type(
             auto d_opt = resolve_generic_int_arg(texpr->args[1], current_mod, genv, *this);
             if (d_opt && *d_opt >= 1 && *d_opt <= 3) dim = static_cast<uint32_t>(*d_opt);
         }
-        return Type::image(elem, dim, mode);
+        return Type::image(elem, dim, mode, n == "image2d_array" ? Type::kImageArrayed : 0);
     }
 
-    if (n == "sampler" || n == "sampler1d" || n == "sampler2d" || n == "sampler3d") {
-        Type elem = Type::vec(ScalarKind::F32, 4);
-        if (!texpr->args.empty() && texpr->args[0].type_arg) {
-            elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
+    if (n.rfind("sampler", 0) == 0) {
+        static const struct { const char* name; uint32_t dim; uint8_t flags; } kSamplers[] = {
+            {"sampler", 2, 0},
+            {"sampler1d", 1, 0},
+            {"sampler2d", 2, 0},
+            {"sampler3d", 3, 0},
+            {"sampler_cube", 3, Type::kImageCube},
+            {"sampler2d_array", 2, Type::kImageArrayed},
+            {"sampler_cube_array", 3, Type::kImageCube | Type::kImageArrayed},
+            {"sampler2d_shadow", 2, Type::kImageShadow},
+            {"sampler2d_array_shadow", 2, Type::kImageShadow | Type::kImageArrayed},
+            {"sampler_cube_shadow", 3, Type::kImageShadow | Type::kImageCube},
+        };
+        for (const auto& s : kSamplers) {
+            if (n != s.name) continue;
+            if (s.flags & Type::kImageShadow) {
+                if (!texpr->args.empty()) diags.error(texpr->span, "'" + n + "' takes no texel type: it compares to an f32");
+                return Type::sampler(Type::f32(), s.dim, s.flags);
+            }
+            return Type::sampler(texel_arg(), s.dim, s.flags);
         }
-        uint32_t dim = 2;
-        if (n == "sampler1d") dim = 1;
-        else if (n == "sampler3d") dim = 3;
-        return Type::sampler(elem, dim);
     }
 
     // 9. User-defined or imported Struct (possibly generic)

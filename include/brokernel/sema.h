@@ -55,6 +55,7 @@ struct CheckedParam {
     AccessMode access = AccessMode::Read;
     uint32_t descriptor_set = 0;
     uint32_t descriptor_binding = 0;
+    uint32_t image_format = 0;         // An image: its SPIR-V ImageFormat, from @format or its texel
     int32_t declared_radius = -1;      // >= 0 when explicitly declared in stencil<T, D, R>
     int32_t inferred_radius = 0;       // Max |offset| seen by the compiler across all axes
     int32_t halo[3] = {0, 0, 0};       // Max |offset| per axis (x, y, z)
@@ -88,6 +89,7 @@ struct CheckedFunction {
     bool uses_f64 = false;
     bool uses_grid_coords = false;
     bool uses_barriers_or_shared = false;
+    bool uses_textures = false;        // an image or sampler parameter: GPU only, no CPU build
     // Render math on the GPU (a vertex or fragment stage, or a kernel marked
     // @fast): the driver may fuse and reorder float arithmetic, and the
     // transcendentals of f32 are the device's own (GLSL.std.450), not the

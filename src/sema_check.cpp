@@ -302,6 +302,46 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     mark_type_usage(inst_ret);
     return inst_ret;
 }
+// A storage image's format (SPIR-V ImageFormat): `@format(name)` on its
+// parameter, else the one its texel stores whole. 0 after a diagnostic.
+static uint32_t resolve_image_format(const CheckedParam& cp, const Attribute* attr, DiagnosticBag& diags) {
+    static const struct { const char* name; uint32_t code; bool uint; } kFormats[] = {
+        {"rgba32f", 1, false}, {"rgba16f", 2, false},  {"r32f", 3, false},     {"rgba8", 4, false},
+        {"rgba8_snorm", 5, false}, {"rg32f", 6, false}, {"rg16f", 7, false},   {"r11g11b10f", 8, false},
+        {"r16f", 9, false},    {"rgba16", 10, false},   {"rgb10a2", 11, false}, {"rg16", 12, false},
+        {"rg8", 13, false},    {"r16", 14, false},      {"r8", 15, false},     {"rgba32ui", 30, true},
+        {"rgba16ui", 31, true}, {"rgba8ui", 32, true},  {"r32ui", 33, true},   {"rg32ui", 35, true},
+        {"rg16ui", 36, true},  {"rg8ui", 37, true},     {"r16ui", 38, true},   {"r8ui", 39, true},
+    };
+    bool uint = cp.type.scalar == ScalarKind::U32;
+    if (attr) {
+        if (attr->str_args.size() != 1) {
+            diags.error(attr->span, "@format takes one format name, e.g. @format(rgba16f)");
+            return 0;
+        }
+        for (const auto& f : kFormats) {
+            if (attr->str_args[0] != f.name) continue;
+            if (f.uint != uint) {
+                diags.error(attr->span, std::string("@format(") + f.name + ") does not hold " +
+                                            cp.type.element_type().to_string() + " texels");
+                return 0;
+            }
+            return f.code;
+        }
+        diags.error(attr->span, "unknown image format '" + attr->str_args[0] + "'");
+        return 0;
+    }
+    switch (cp.type.elem_lanes) {
+        case 1: return uint ? 33 : 3;
+        case 2: return uint ? 35 : 6;
+        case 4: return uint ? 30 : 1;
+        default:
+            diags.error(cp.span, "no image format holds " + cp.type.element_type().to_string() +
+                                     " texels: give one with @format");
+            return 0;
+    }
+}
+
 static void fold_const_into_expr(Expr* e, const ConstValue& cv) {
     if (!e) return;
     e->path.clear();
@@ -1001,9 +1041,11 @@ const CheckedFunction* SemaContext::instantiate_function(
             cfn.grid_dim = std::max(cfn.grid_dim, cp.type.dimension);
         } else if (cp.type.is_image()) {
             cp.role = ParamRole::Image;
+            cp.image_format = resolve_image_format(cp, pdecl.find_attribute("format"), diags);
         } else if (cp.type.is_sampler()) {
             cp.role = ParamRole::Sampler;
         }
+        if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) cfn.uses_textures = true;
         for (const auto& pattr : pdecl.attributes) {
             if (pattr.name == "binding") {
                 if (pattr.int_args.size() == 1) {

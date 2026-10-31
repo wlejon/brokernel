@@ -298,16 +298,11 @@ private:
             t->name += "::" + consume(TokenKind::Ident, "type name").text;
         }
         if (match(TokenKind::Lt)) {
-            while (!check(TokenKind::Gt) && !check(TokenKind::Shr) && !is_at_end()) {
+            while (!check(TokenKind::Gt) && !is_at_end()) {
                 t->args.push_back(parse_generic_arg());
                 if (!match(TokenKind::Comma)) break;
             }
-            // Handle nested `>>` token when closing `vec<vec<f32, 2>, 2>` if needed
-            if (check(TokenKind::Gt)) {
-                advance();
-            } else {
-                consume(TokenKind::Gt, "'>' after type arguments");
-            }
+            consume(TokenKind::Gt, "'>' after type arguments");
         }
         t->span = SourceSpan::merge(t->span, previous().span);
         return t;
@@ -640,7 +635,6 @@ private:
             case TokenKind::Gt:       *out_op = BinaryOp::Gt;     return 7;
             case TokenKind::Ge:       *out_op = BinaryOp::Ge;     return 7;
             case TokenKind::Shl:      *out_op = BinaryOp::Shl;    return 8;
-            case TokenKind::Shr:      *out_op = BinaryOp::Shr;    return 8;
             case TokenKind::Plus:     *out_op = BinaryOp::Add;    return 9;
             case TokenKind::Minus:    *out_op = BinaryOp::Sub;    return 9;
             case TokenKind::Star:     *out_op = BinaryOp::Mul;    return 10;
@@ -654,8 +648,16 @@ private:
         while (true) {
             BinaryOp op{};
             int prec = binary_prec(peek().kind, &op);
+            // Two adjacent `>` (the lexer splits `>>` for type arguments) shift.
+            bool shr = check(TokenKind::Gt) && check(TokenKind::Gt, 1) &&
+                       peek(1).span.start.offset == peek().span.start.offset + 1;
+            if (shr) {
+                op = BinaryOp::Shr;
+                prec = 8;
+            }
             if (prec < min_prec) break;
             advance();
+            if (shr) advance();
             ExprPtr right = parse_binary(prec + 1);
             auto bin = std::make_unique<Expr>();
             bin->kind = Expr::Kind::Binary;

@@ -703,7 +703,11 @@ LoweredKernelMir lower_kernel_to_mir(
                 mir_idx += 2;
             } else if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) {
                 pinfo.mir_param_count = 0;
-                lowerer.alloc_var(cp.name, {b.build_iconst_i32(static_cast<int32_t>(cp.descriptor_binding))});
+                pinfo.image_format = cp.image_format;
+                brass::Value* placeholder =
+                    b.build_iconst_i32(static_cast<int32_t>((cp.descriptor_set << 16) | cp.descriptor_binding));
+                lowerer.texture_param[placeholder] = out.param_infos.size();
+                lowerer.alloc_var(cp.name, {placeholder});
             } else {
                 auto kinds = mod.types.flatten_scalars(cp.type);
                 pinfo.mir_param_count = static_cast<uint32_t>(kinds.size());
@@ -809,9 +813,10 @@ LoweredKernelMir lower_kernel_to_mir(
     //
     // The CPU runs compute kernels cell by cell, a subgroup and workgroup of
     // one. Vertex and fragment stages (rasterizer inputs, derivatives,
-    // discard) and kernels that cooperate through barriers or shared memory
-    // have no meaning there, so they get no CPU build.
-    if (fn.stage != Stage::Compute || fn.uses_barriers_or_shared) return out;
+    // discard), kernels that cooperate through barriers or shared memory
+    // and kernels that read textures have no meaning there, so they get no
+    // CPU build.
+    if (fn.stage != Stage::Compute || fn.uses_barriers_or_shared || fn.uses_textures) return out;
     out.cpu_point_function = out.cpu_module->create_function(
         fn.name + "_cpu_point", brass::Type::void_type(),
         {brass::Type::ptr(), brass::Type::ptr(), brass::Type::ptr()});

@@ -94,6 +94,10 @@ struct MirBodyLowerer {
     std::unordered_set<const brass::Value*> linear_indices;        // values of g.linear_index()
     // A store parameter's leaves, its pointer recorded.
     void bind_store_param(size_t index, const ValueList& store) { store_param[store[0]] = index; }
+    // A texture parameter's placeholder value -> its parameter index.
+    std::unordered_map<const brass::Value*, size_t> texture_param;
+    // An image's or a sampler's method (lowering_texture.cpp).
+    ValueList lower_texture_call(const Expr* e);
     // `store` accessed at a cell, covering `dim` axes: its pointer alone.
     ValueList at_cells(const ValueList& store, uint32_t dim);
     // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are

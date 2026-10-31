@@ -42,6 +42,7 @@ struct KernelParamInfo {
     uint32_t push_constant_size = 0;   // Byte size in Vulkan push-constant block
     uint32_t descriptor_set = 0;       // For Image / Sampler
     uint32_t descriptor_binding = 0;   // For Image / Sampler
+    uint32_t image_format = 0;         // For Image: the SPIR-V ImageFormat
 };
 
 struct LoweredKernelMir {

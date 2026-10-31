@@ -87,10 +87,13 @@ std::string Type::to_string() const {
             return oss.str();
         }
         case TypeKind::Image:
-            oss << "image" << dimension << "d<" << element_type().to_string() << ">";
-            return oss.str();
         case TypeKind::Sampler:
-            oss << "sampler" << dimension << "d<" << element_type().to_string() << ">";
+            oss << (kind == TypeKind::Image ? "image" : "sampler");
+            if (image_cube()) oss << "_cube";
+            else oss << dimension << "d";
+            if (image_arrayed()) oss << "_array";
+            if (image_shadow()) return oss.str() + "_shadow";
+            oss << "<" << element_type().to_string() << ">";
             return oss.str();
     }
     return "unknown";
@@ -125,7 +128,7 @@ bool Type::operator==(const Type& o) const noexcept {
         case TypeKind::Image:
         case TypeKind::Sampler:
             return scalar == o.scalar && dimension == o.dimension &&
-                   elem_kind == o.elem_kind && elem_lanes == o.elem_lanes;
+                   elem_kind == o.elem_kind && elem_lanes == o.elem_lanes && image_flags == o.image_flags;
     }
     return false;
 }
