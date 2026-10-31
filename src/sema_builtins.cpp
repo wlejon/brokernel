@@ -407,25 +407,19 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         return Type::i32();
     }
     if (n == "workgroup_barrier" || n == "storage_barrier" || n == "barrier") {
-        if (fn.stage != Stage::Compute) {
-            ctx.diags.error(e->span, "'" + n + "()' is only valid in compute kernels");
-        }
+        require_stage(Stage::Compute, n + "()", e->span);
         fn.uses_barriers_or_shared = true;
         e->resolved_type = Type::void_type();
         return Type::void_type();
     }
     // Vertex stage intrinsics
     if (n == "vertex_index" || n == "instance_index") {
-        if (fn.stage != Stage::Vertex) {
-            ctx.diags.error(e->span, "'" + n + "()' is only valid in @vertex shaders");
-        }
+        require_stage(Stage::Vertex, n + "()", e->span);
         e->resolved_type = Type::i32();
         return Type::i32();
     }
     if (n == "set_vertex_position") {
-        if (fn.stage != Stage::Vertex) {
-            ctx.diags.error(e->span, "'set_vertex_position' is only valid in @vertex shaders");
-        }
+        require_stage(Stage::Vertex, "set_vertex_position", e->span);
         if (e->args.size() != 1) {
             ctx.diags.error(e->span, "'set_vertex_position' expects a vec4<f32> argument");
         } else {
@@ -440,10 +434,7 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
     // location and f32, i32 or u32 lanes, 1 to 4.
     if (n == "set_vertex_output" || n == "set_frag_output") {
         Stage want = n == "set_vertex_output" ? Stage::Vertex : Stage::Fragment;
-        if (fn.stage != want) {
-            ctx.diags.error(e->span, "'" + n + "' is only valid in @" +
-                                         (want == Stage::Vertex ? "vertex" : "fragment") + " shaders");
-        }
+        require_stage(want, n, e->span);
         if (e->args.size() == 2) {
             check_expr(e->args[0].get(), Type::i32());
             auto loc = ctx.eval_const_int(e->args[0].get(), fn.module_name, genv, scopes);
@@ -461,7 +452,7 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         return Type::void_type();
     }
     if (n == "set_frag_depth") {
-        if (fn.stage != Stage::Fragment) ctx.diags.error(e->span, "'set_frag_depth' is only valid in @fragment shaders");
+        require_stage(Stage::Fragment, "set_frag_depth", e->span);
         if (e->args.size() == 1) {
             check_expr(e->args[0].get(), Type::f32());
             check_assignable(e->args[0].get(), Type::f32(), ctx.diags, e->args[0]->span);
@@ -473,24 +464,18 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
     }
     // Fragment stage intrinsics
     if (n == "frag_coord") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'frag_coord()' is only valid in @fragment shaders");
-        }
+        require_stage(Stage::Fragment, "frag_coord()", e->span);
         Type v4 = Type::vec(ScalarKind::F32, 4);
         e->resolved_type = v4;
         return v4;
     }
     if (n == "front_facing") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'front_facing()' is only valid in @fragment shaders");
-        }
+        require_stage(Stage::Fragment, "front_facing()", e->span);
         e->resolved_type = Type::bool_type();
         return Type::bool_type();
     }
     if (n == "set_frag_color") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'set_frag_color' is only valid in @fragment shaders");
-        }
+        require_stage(Stage::Fragment, "set_frag_color", e->span);
         if (e->args.size() == 1) {
             Type v4 = Type::vec(ScalarKind::F32, 4);
             check_expr(e->args[0].get(), v4);
@@ -502,16 +487,12 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         return Type::void_type();
     }
     if (n == "discard_fragment") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'discard_fragment()' is only valid in @fragment shaders");
-        }
+        require_stage(Stage::Fragment, "discard_fragment()", e->span);
         e->resolved_type = Type::void_type();
         return Type::void_type();
     }
     if (n == "dpdx" || n == "dpdy" || n == "fwidth") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'" + n + "()' is only valid in @fragment shaders");
-        }
+        require_stage(Stage::Fragment, n + "()", e->span);
         if (e->args.size() != 1) {
             ctx.diags.error(e->span, "'" + n + "' expects 1 argument");
             return Type::f32();
@@ -616,6 +597,12 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         if (e->args.size() != 3) {
             ctx.diags.error(e->span, "'select(cond, a, b)' expects 3 arguments");
             return Type::f32();
+        }
+        if (auto ccv = ctx.eval_const_expr(e->args[0].get(), fn.module_name, genv, scopes);
+            ccv && ccv->type.is_bool()) {
+            ExprPtr chosen = ccv->bool_val ? std::move(e->args[1]) : std::move(e->args[2]);
+            *e = std::move(*chosen);
+            return check_expr(e, expected);
         }
         Type ct = check_expr(e->args[0].get(), Type::bool_type());
         if (!ct.is_bool()) {

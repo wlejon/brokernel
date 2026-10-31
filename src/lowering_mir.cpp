@@ -38,6 +38,15 @@ void MirBodyLowerer::lower_stmt_list(const std::vector<StmtPtr>& stmts) {
 }
 void MirBodyLowerer::lower_branch(brass::Value* cond, const std::function<void()>& then_arm,
                                   const std::function<void()>& else_arm) {
+    if (const brass::Instruction* def = cond->is_instruction() ? cond->defining_instruction() : nullptr;
+        def && def->opcode() == brass::Opcode::iconst_i32) {
+        if (def->imm_i32() != 0) {
+            then_arm();
+        } else if (else_arm) {
+            else_arm();
+        }
+        return;
+    }
     auto vars_before = var_values;
     auto live_ids = sorted_live_var_ids();
     if (Ops::is_varying(cond)) {

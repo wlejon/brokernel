@@ -557,9 +557,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::Select: {
             ValueList cv = lower_expr(e->cond.get());
+            brass::Value* cond = cv.empty() ? b.build_iconst_i32(0) : cv[0];
+            if (const brass::Instruction* def = cond->is_instruction() ? cond->defining_instruction() : nullptr;
+                def && def->opcode() == brass::Opcode::iconst_i32) {
+                return lower_expr(def->imm_i32() != 0 ? e->lhs.get() : e->rhs.get());
+            }
             ValueList lv = lower_expr(e->lhs.get());
             ValueList rv = lower_expr(e->rhs.get());
-            brass::Value* cond = cv.empty() ? b.build_iconst_i32(0) : cv[0];
             ValueList out;
             out.reserve(lv.size());
             for (size_t i = 0; i < lv.size() && i < rv.size(); ++i) {
@@ -1105,6 +1109,10 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             if (n == "select") {
                 ValueList cv = lower_expr(e->args[0].get());
+                if (const brass::Instruction* def = cv[0]->is_instruction() ? cv[0]->defining_instruction() : nullptr;
+                    def && def->opcode() == brass::Opcode::iconst_i32) {
+                    return lower_expr(def->imm_i32() != 0 ? e->args[1].get() : e->args[2].get());
+                }
                 ValueList av = lower_expr(e->args[1].get());
                 ValueList bv = lower_expr(e->args[2].get());
                 ValueList out;

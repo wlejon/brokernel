@@ -235,7 +235,7 @@ private:
     brass::Value* compare(Cmp c, bool is_unsigned, brass::Value* a, brass::Value* d);
     brass::Value* scalar_compare(Cmp c, bool is_unsigned, brass::Value* a, brass::Value* d);
     // A uniform bool (0 / 1) in the mask encoding (0 / -1).
-    brass::Value* bool_to_mask(brass::Value* v) { return b_.build_neg(v); }
+    brass::Value* bool_to_mask(brass::Value* v) { return build_neg(v); }
     brass::Value* narrow_mask(brass::Value* m);   // 64-bit lane mask -> i32 lanes
     void check_lanes(brass::Type t) const;         // throws NeedNarrowLanes
     // The vector op `op` on both operands widened, or nullptr when neither is varying.

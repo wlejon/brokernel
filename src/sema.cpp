@@ -620,6 +620,26 @@ static std::optional<ConstValue> apply_const_binary(BinaryOp op, const ConstValu
             res.bool_val = l.bool_val || r.bool_val;
             res.int_val = res.bool_val ? 1 : 0;
             return res;
+        case BinaryOp::BitAnd:
+            res.int_val = l.int_val & r.int_val;
+            res.bool_val = (res.int_val != 0);
+            return res;
+        case BinaryOp::BitOr:
+            res.int_val = l.int_val | r.int_val;
+            res.bool_val = (res.int_val != 0);
+            return res;
+        case BinaryOp::BitXor:
+            res.int_val = l.int_val ^ r.int_val;
+            res.bool_val = (res.int_val != 0);
+            return res;
+        case BinaryOp::Shl:
+            res.int_val = l.int_val << (r.int_val & 63);
+            res.bool_val = (res.int_val != 0);
+            return res;
+        case BinaryOp::Shr:
+            res.int_val = l.int_val >> (r.int_val & 63);
+            res.bool_val = (res.int_val != 0);
+            return res;
         default:
             return std::nullopt;
     }
@@ -637,6 +657,7 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
             cv.type = (e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::i32();
             cv.int_val = e->int_val;
             cv.float_val = static_cast<double>(e->int_val);
+            cv.bool_val = (e->int_val != 0);
             return cv;
         }
         case Expr::Kind::FloatLit: {
@@ -644,6 +665,7 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
             cv.type = (e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::f32();
             cv.float_val = e->float_val;
             cv.int_val = static_cast<int64_t>(e->float_val);
+            cv.bool_val = (e->float_val != 0.0);
             return cv;
         }
         case Expr::Kind::BoolLit: {
@@ -664,9 +686,18 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
         }
         case Expr::Kind::Binary: {
             auto l = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
+            if (l && l->type.is_bool()) {
+                if (e->binary_op == BinaryOp::LogAnd && !l->bool_val) return l;
+                if (e->binary_op == BinaryOp::LogOr && l->bool_val) return l;
+            }
             auto r = eval_const_expr(e->rhs.get(), current_mod, genv, scopes);
             if (!l || !r) return std::nullopt;
             return apply_const_binary(e->binary_op, *l, *r);
+        }
+        case Expr::Kind::Select: {
+            auto c = eval_const_expr(e->cond.get(), current_mod, genv, scopes);
+            if (!c || !c->type.is_bool()) return std::nullopt;
+            return eval_const_expr(c->bool_val ? e->lhs.get() : e->rhs.get(), current_mod, genv, scopes);
         }
         case Expr::Kind::Field: {
             auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
@@ -716,6 +747,18 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
         }
         case Expr::Kind::Call: {
             const std::string& n = e->name;
+            if (n == "select" && e->args.size() == 3) {
+                auto c = eval_const_expr(e->args[0].get(), current_mod, genv, scopes);
+                if (!c || !c->type.is_bool()) return std::nullopt;
+                return eval_const_expr(c->bool_val ? e->args[1].get() : e->args[2].get(), current_mod, genv, scopes);
+            }
+            if ((n == "bool" || n == "i32" || n == "u32" || n == "i64" || n == "u64" || n == "f32" || n == "f64") &&
+                e->generic_args.empty() && e->args.size() == 1) {
+                auto sub = eval_const_expr(e->args[0].get(), current_mod, genv, scopes);
+                if (!sub) return std::nullopt;
+                TypeExpr te{e->span, n, {}};
+                return convert_const_value(*sub, resolve_type(&te, current_mod, genv), out->types);
+            }
             if ((n == "is_f64" || n == "sizeof") && e->generic_args.size() == 1 && e->args.empty()) {
                 Type t = Type::f32();
                 const auto& ga = e->generic_args[0];
@@ -836,7 +879,7 @@ static std::optional<int64_t> resolve_generic_int_arg(
         auto git = genv.const_params.find(arg.ident_or_const_name);
         if (git != genv.const_params.end()) return git->second.int_val;
         auto cv = ctx.find_const(current_mod, {}, arg.ident_or_const_name, genv, {});
-        if (cv && cv->type.is_integer()) return cv->int_val;
+        if (cv && (cv->type.is_integer() || cv->type.is_bool())) return cv->int_val;
     }
     return std::nullopt;
 }

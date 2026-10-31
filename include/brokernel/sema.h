@@ -93,6 +93,7 @@ struct CheckedFunction {
     std::string module_name;
     bool is_entry_kernel = false;
     Stage stage = Stage::Compute;
+    std::optional<Stage> required_stage;
     uint32_t grid_dim = 0;             // 0 = point/raw kernel, 1..3 = 1D/2D/3D grid kernel
     uint32_t local_size[3] = {64, 1, 1};
     bool has_explicit_local_size = false;

@@ -316,6 +316,11 @@ Value* Ops::build_add(Value* a, Value* c) {
     a = real(a);
     c = real(c);
     if (Value* r = vec_bin(Opcode::vadd, a, c)) return r;
+    if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+        return a->type() == Type::i64()
+                   ? b_.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(*ka) + static_cast<uint64_t>(*kc)))
+                   : b_.build_iconst_i32(static_cast<int32_t>(static_cast<uint32_t>(*ka) + static_cast<uint32_t>(*kc)));
+    }
     return b_.build_add(a, c);
 }
 Value* Ops::build_sub(Value* a, Value* c) {
@@ -323,13 +328,25 @@ Value* Ops::build_sub(Value* a, Value* c) {
     a = real(a);
     c = real(c);
     if (Value* r = vec_bin(Opcode::vsub, a, c)) return r;
+    if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+        return a->type() == Type::i64()
+                   ? b_.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(*ka) - static_cast<uint64_t>(*kc)))
+                   : b_.build_iconst_i32(static_cast<int32_t>(static_cast<uint32_t>(*ka) - static_cast<uint32_t>(*kc)));
+    }
     return b_.build_sub(a, c);
 }
 Value* Ops::build_mul(Value* a, Value* c) {
     if (Value* r = affine_bin(Opcode::vmul, a, c)) return r;
     a = real(a);
     c = real(c);
-    if (!is_varying(a) && !is_varying(c)) return b_.build_mul(a, c);
+    if (!is_varying(a) && !is_varying(c)) {
+        if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+            return a->type() == Type::i64()
+                       ? b_.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(*ka) * static_cast<uint64_t>(*kc)))
+                       : b_.build_iconst_i32(static_cast<int32_t>(static_cast<uint32_t>(*ka) * static_cast<uint32_t>(*kc)));
+        }
+        return b_.build_mul(a, c);
+    }
     const Type t = merge_type(a, c);
     if (t.element_type() == Type::i64()) {   // no 64-bit lane multiply in AVX2
         return per_lane(Type::i64(), {a, c}, [&](std::vector<Value*>& s) { return b_.build_mul(s[0], s[1]); });
@@ -404,25 +421,43 @@ Value* Ops::build_neg(Value* v) {
 }
 Value* Ops::build_not(Value* v) {
     v = real(v);
-    if (!is_varying(v)) return b_.build_not(v);
+    if (!is_varying(v)) {
+        if (auto kv = int_constant(v)) {
+            return v->type() == Type::i64() ? b_.build_iconst_i64(~*kv)
+                                            : b_.build_iconst_i32(~static_cast<int32_t>(*kv));
+        }
+        return b_.build_not(v);
+    }
     return b_.build_vnot(v);
 }
 Value* Ops::build_and(Value* a, Value* c) {
     a = real(a);
     c = real(c);
     if (Value* r = vec_bin(Opcode::vand, a, c)) return r;
+    if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+        return a->type() == Type::i64() ? b_.build_iconst_i64(*ka & *kc)
+                                        : b_.build_iconst_i32(static_cast<int32_t>(*ka) & static_cast<int32_t>(*kc));
+    }
     return b_.build_and(a, c);
 }
 Value* Ops::build_or(Value* a, Value* c) {
     a = real(a);
     c = real(c);
     if (Value* r = vec_bin(Opcode::vor, a, c)) return r;
+    if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+        return a->type() == Type::i64() ? b_.build_iconst_i64(*ka | *kc)
+                                        : b_.build_iconst_i32(static_cast<int32_t>(*ka) | static_cast<int32_t>(*kc));
+    }
     return b_.build_or(a, c);
 }
 Value* Ops::build_xor(Value* a, Value* c) {
     a = real(a);
     c = real(c);
     if (Value* r = vec_bin(Opcode::vxor, a, c)) return r;
+    if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+        return a->type() == Type::i64() ? b_.build_iconst_i64(*ka ^ *kc)
+                                        : b_.build_iconst_i32(static_cast<int32_t>(*ka) ^ static_cast<int32_t>(*kc));
+    }
     return b_.build_xor(a, c);
 }
 
@@ -431,21 +466,42 @@ Value* Ops::build_xor(Value* a, Value* c) {
 Value* Ops::build_shl(Value* a, Value* c) {
     a = real(a);
     c = real(c);
-    if (!is_varying(a) && !is_varying(c)) return b_.build_shl(a, c);
+    if (!is_varying(a) && !is_varying(c)) {
+        if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+            return a->type() == Type::i64()
+                       ? b_.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(*ka) << (*kc & 63)))
+                       : b_.build_iconst_i32(static_cast<int32_t>(static_cast<uint32_t>(*ka) << (*kc & 31)));
+        }
+        return b_.build_shl(a, c);
+    }
     const bool wide = merge_type(a, c).element_type() == Type::i64();
     return vec_bin(Opcode::vshl, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
 }
 Value* Ops::build_lshr(Value* a, Value* c) {
     a = real(a);
     c = real(c);
-    if (!is_varying(a) && !is_varying(c)) return b_.build_lshr(a, c);
+    if (!is_varying(a) && !is_varying(c)) {
+        if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+            return a->type() == Type::i64()
+                       ? b_.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(*ka) >> (*kc & 63)))
+                       : b_.build_iconst_i32(static_cast<int32_t>(static_cast<uint32_t>(*ka) >> (*kc & 31)));
+        }
+        return b_.build_lshr(a, c);
+    }
     const bool wide = merge_type(a, c).element_type() == Type::i64();
     return vec_bin(Opcode::vlshr, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
 }
 Value* Ops::build_ashr(Value* a, Value* c) {
     a = real(a);
     c = real(c);
-    if (!is_varying(a) && !is_varying(c)) return b_.build_ashr(a, c);
+    if (!is_varying(a) && !is_varying(c)) {
+        if (auto ka = int_constant(a), kc = int_constant(c); ka && kc) {
+            return a->type() == Type::i64()
+                       ? b_.build_iconst_i64(*ka >> (*kc & 63))
+                       : b_.build_iconst_i32(static_cast<int32_t>(*ka) >> (*kc & 31));
+        }
+        return b_.build_ashr(a, c);
+    }
     const bool wide = merge_type(a, c).element_type() == Type::i64();
     return vec_bin(Opcode::vashr, a, build_and(c, wide ? b_.build_iconst_i64(63) : b_.build_iconst_i32(31)));
 }
@@ -492,6 +548,33 @@ Value* Ops::build_fmax(Value* a, Value* c) {
 // --- Compares -------------------------------------------------------------------
 
 Value* Ops::scalar_compare(Cmp c, bool u, Value* a, Value* d) {
+    if (auto ka = int_constant(a), kd = int_constant(d); ka && kd) {
+        bool res = false;
+        if (a->type() == Type::i64()) {
+            const int64_t sa = *ka, sd = *kd;
+            const auto ua = static_cast<uint64_t>(sa), ud = static_cast<uint64_t>(sd);
+            switch (c) {
+                case Cmp::eq: res = (sa == sd); break;
+                case Cmp::ne: res = (sa != sd); break;
+                case Cmp::lt: res = u ? (ua < ud) : (sa < sd); break;
+                case Cmp::le: res = u ? (ua <= ud) : (sa <= sd); break;
+                case Cmp::gt: res = u ? (ua > ud) : (sa > sd); break;
+                default:      res = u ? (ua >= ud) : (sa >= sd); break;
+            }
+        } else {
+            const auto sa = static_cast<int32_t>(*ka), sd = static_cast<int32_t>(*kd);
+            const auto ua = static_cast<uint32_t>(sa), ud = static_cast<uint32_t>(sd);
+            switch (c) {
+                case Cmp::eq: res = (sa == sd); break;
+                case Cmp::ne: res = (sa != sd); break;
+                case Cmp::lt: res = u ? (ua < ud) : (sa < sd); break;
+                case Cmp::le: res = u ? (ua <= ud) : (sa <= sd); break;
+                case Cmp::gt: res = u ? (ua > ud) : (sa > sd); break;
+                default:      res = u ? (ua >= ud) : (sa >= sd); break;
+            }
+        }
+        return b_.build_iconst_i32(res ? 1 : 0);
+    }
     switch (c) {
         case Cmp::eq: return b_.build_eq(a, d);
         case Cmp::ne: return b_.build_ne(a, d);
@@ -535,6 +618,17 @@ Value* Ops::build_ugt(Value* a, Value* c) { return compare(Cmp::gt, true, a, c);
 Value* Ops::build_uge(Value* a, Value* c) { return compare(Cmp::ge, true, a, c); }
 
 Value* Ops::build_select(Value* c, Value* t, Value* f) {
+    if (!is_varying(c)) {
+        if (auto kc = int_constant(c)) {
+            if (is_index_marker(t) && is_index_marker(f) && markers_.at(t) == markers_.at(f)) {
+                return *kc != 0 ? t : f;
+            }
+            t = real(t);
+            f = real(f);
+            const Type mt = merge_type(t, f);
+            return coerce(*kc != 0 ? t : f, mt);
+        }
+    }
     // A uniform choice of two indices of one stride is an index of that stride.
     if (!is_varying(c) && is_index_marker(t) && is_index_marker(f) && markers_.at(t) == markers_.at(f)) {
         const Marker m = markers_.at(t);

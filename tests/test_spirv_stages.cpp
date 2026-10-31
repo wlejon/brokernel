@@ -680,6 +680,74 @@ static void test_stage_misuse_diagnostics() {
     assert(res.error_message().find("@fragment") != std::string::npos);
 }
 
+static void test_const_pruning() {
+    const char* src = R"(
+        struct Camera { tint: vec4<f32> }
+        @binding(0, 0) var camera: uniform<Camera>;
+        @binding(0, 1) var indirect_buf: read_buffer<vec4<f32>>;
+        @binding(0, 2) var extra_buf: read_buffer<vec4<f32>>;
+
+        fn mesh_impl<const INDIRECT: i32, const WRITE_DEPTH: i32>(uv: vec2<f32>, extra_flag: bool) {
+            set_frag_output(0, camera.tint);
+            if ((INDIRECT & 1) != 0) {
+                set_frag_output(1, indirect_buf[0]);
+            }
+            if (extra_flag) {
+                set_frag_output(2, extra_buf[0]);
+            }
+            if (WRITE_DEPTH != 0) {
+                set_frag_depth(uv.x);
+            }
+        }
+
+        @fragment fn mesh_main(@location(0) uv: vec2<f32>) {
+            mesh_impl<0, 0>(uv, false);
+        }
+
+        @fragment fn mesh_indirect_main(@location(0) uv: vec2<f32>) {
+            mesh_impl<1, 1>(uv, true);
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "const_pruning.bk", opts);
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    require_valid(res);
+
+    const CompiledKernel* direct = res.find_kernel("mesh_main");
+    const CompiledKernel* indirect = res.find_kernel("mesh_indirect_main");
+    assert(direct && indirect);
+
+    auto has_depth_replacing = [](const std::string& dis) {
+        std::istringstream lines(dis);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream w(line);
+            std::string o, id, v, more;
+            if (w >> o >> id >> v && !(w >> more) && o == "OpExecutionMode" && v == "12") return true;
+        }
+        return false;
+    };
+
+    // mesh_main reaches only binding (0, 0), writes only @location(0), and does not replace FragDepth.
+    assert(direct->spirv.descriptors.size() == 1);
+    assert(direct->spirv.descriptors[0].set == 0 && direct->spirv.descriptors[0].binding == 0);
+    assert(direct->spirv_disassembly.find("out_loc0") != std::string::npos);
+    assert(direct->spirv_disassembly.find("out_loc1") == std::string::npos);
+    assert(direct->spirv_disassembly.find("out_loc2") == std::string::npos);
+    assert(direct->spirv_disassembly.find("gl_FragDepth") == std::string::npos);
+    assert(!has_depth_replacing(direct->spirv_disassembly));
+
+    // mesh_indirect_main reaches bindings (0, 0), (0, 1), and (0, 2), writes @location(0..2), and has DepthReplacing (12).
+    assert(indirect->spirv.descriptors.size() == 3);
+    assert(indirect->spirv_disassembly.find("out_loc0") != std::string::npos);
+    assert(indirect->spirv_disassembly.find("out_loc1") != std::string::npos);
+    assert(indirect->spirv_disassembly.find("out_loc2") != std::string::npos);
+    assert(indirect->spirv_disassembly.find("gl_FragDepth") != std::string::npos);
+    assert(has_depth_replacing(indirect->spirv_disassembly));
+}
+
 int main() {
     test_compute_spirv_and_ptx();
     test_vertex_stage_spirv();
@@ -690,6 +758,7 @@ int main() {
     test_textures();
     test_separate_samplers();
     test_module_resources();
+    test_const_pruning();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

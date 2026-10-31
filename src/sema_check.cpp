@@ -165,6 +165,14 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
             ctx.diags.error(e->span, "too many generic arguments for function '" + callee_decl.name + "'");
             return Type::void_type();
         }
+        auto make_const_param_val = [](const GenericParamDecl& gp, int64_t v) -> ConstValue {
+            Type ct = Type::i32();
+            if (gp.constraint_or_type) {
+                if (gp.constraint_or_type->name == "bool") ct = Type::bool_type();
+                else if (gp.constraint_or_type->name == "u32" || gp.constraint_or_type->name == "uint") ct = Type::u32();
+            }
+            return ConstValue{ct, v, static_cast<double>(v), v != 0};
+        };
         // 1. Bind explicit generic arguments
         for (size_t i = 0; i < e->generic_args.size(); ++i) {
             const auto& gp = callee_decl.generic_params[i];
@@ -173,13 +181,13 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
                 std::optional<int64_t> val = ga.int_arg;
                 if (!val && !ga.ident_or_const_name.empty()) {
                     auto cv = ctx.find_const(fn.module_name, {}, ga.ident_or_const_name, genv, scopes);
-                    if (cv && cv->type.is_integer()) val = cv->int_val;
+                    if (cv && (cv->type.is_integer() || cv->type.is_bool())) val = cv->int_val;
                 }
                 if (!val) {
                     ctx.diags.error(ga.span, "expected compile-time integer for const generic parameter '" + gp.name + "'");
                     val = 1;
                 }
-                call_env.const_params[gp.name] = ConstValue{Type::i32(), *val, static_cast<double>(*val), false};
+                call_env.const_params[gp.name] = make_const_param_val(gp, *val);
             } else {
                 Type targ = Type::f32();
                 if (ga.type_arg) {
@@ -216,10 +224,10 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
             if (gp.is_const) {
                 if (call_env.const_params.find(gp.name) == call_env.const_params.end()) {
                     if (gp.default_int.has_value()) {
-                        call_env.const_params[gp.name] = ConstValue{Type::i32(), *gp.default_int, 0.0, false};
+                        call_env.const_params[gp.name] = make_const_param_val(gp, *gp.default_int);
                     } else {
                         ctx.diags.error(e->span, "could not infer const generic parameter '" + gp.name + "' for '" + callee_decl.name + "'");
-                        call_env.const_params[gp.name] = ConstValue{Type::i32(), 1, 0.0, false};
+                        call_env.const_params[gp.name] = make_const_param_val(gp, 1);
                     }
                 }
             } else {
@@ -248,6 +256,8 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     e->name = inst_name;
     if (inst_f64) fn.uses_f64 = true;
     if (inst->uses_descriptors) fn.uses_descriptors = true;   // a resource read in the callee
+    if (inst->uses_barriers_or_shared) fn.uses_barriers_or_shared = true;
+    if (inst->required_stage) require_stage(*inst->required_stage, callee_decl.name, e->span);
     if (inst_grid) ensure_grid_dim(std::max(1u, inst_grid_dim));
     // Coerce and validate arguments against instantiated parameter types, and propagate stencil offsets
     for (size_t i = 0; i < e->args.size() && i < inst_params.size(); ++i) {
@@ -452,6 +462,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return e->resolved_type;
         case Expr::Kind::Ident: {
             if (LocalVar* lv = lookup_var(e->name)) {
+                if (lv->is_const) {
+                    fold_const_into_expr(e, lv->const_val);
+                }
                 e->resolved_type = lv->type;
                 mark_type_usage(lv->type);
                 return lv->type;
@@ -511,6 +524,19 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         }
         case Expr::Kind::Binary: {
             Type lt = check_expr(e->lhs.get(), expected);
+            if (e->binary_op == BinaryOp::LogAnd || e->binary_op == BinaryOp::LogOr) {
+                if (auto lcv = ctx.eval_const_expr(e->lhs.get(), fn.module_name, genv, scopes);
+                    lcv && lcv->type.is_bool()) {
+                    if ((e->binary_op == BinaryOp::LogAnd && !lcv->bool_val) ||
+                        (e->binary_op == BinaryOp::LogOr && lcv->bool_val)) {
+                        fold_const_into_expr(e, *lcv);
+                        return Type::bool_type();
+                    }
+                    ExprPtr rhs = std::move(e->rhs);
+                    *e = std::move(*rhs);
+                    return check_expr(e, Type::bool_type());
+                }
+            }
             Type rt = check_expr(e->rhs.get(), expected);
             // Harmonize unsuffixed literals or scalar-vector broadcasts
             if (lt != rt) {
@@ -552,6 +578,12 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
         }
         case Expr::Kind::Select: {
+            if (auto ccv = ctx.eval_const_expr(e->cond.get(), fn.module_name, genv, scopes);
+                ccv && ccv->type.is_bool()) {
+                ExprPtr chosen = ccv->bool_val ? std::move(e->lhs) : std::move(e->rhs);
+                *e = std::move(*chosen);
+                return check_expr(e, expected);
+            }
             Type ct = check_expr(e->cond.get(), Type::bool_type());
             if (!ct.is_bool()) {
                 ctx.diags.error(e->cond->span, "ternary condition must be 'bool'");
@@ -1074,9 +1106,16 @@ const CheckedFunction* SemaContext::instantiate_function(
     cfn.module_name = decl_mod;
     cfn.is_entry_kernel = as_entry_kernel || decl.is_entry_kernel();
     // Stage & attributes
-    if (decl.has_attribute("vertex")) cfn.stage = Stage::Vertex;
-    else if (decl.has_attribute("fragment")) cfn.stage = Stage::Fragment;
-    else cfn.stage = Stage::Compute;
+    if (decl.has_attribute("vertex")) {
+        cfn.stage = Stage::Vertex;
+        cfn.required_stage = Stage::Vertex;
+    } else if (decl.has_attribute("fragment")) {
+        cfn.stage = Stage::Fragment;
+        cfn.required_stage = Stage::Fragment;
+    } else {
+        cfn.stage = Stage::Compute;
+        if (cfn.is_entry_kernel) cfn.required_stage = Stage::Compute;
+    }
     cfn.fast_math = cfn.stage != Stage::Compute || decl.has_attribute("fast");
     if (const Attribute* grid_attr = decl.find_attribute("grid")) {
         if (!grid_attr->int_args.empty()) {

@@ -112,6 +112,28 @@ struct FnCheckState {
         fn.uses_grid_coords = true;
         if (fn.grid_dim < min_dim) fn.grid_dim = min_dim;
     }
+    void require_stage(Stage want, std::string_view what, const SourceSpan& span) {
+        auto stage_label = [](Stage s) -> const char* {
+            switch (s) {
+            case Stage::Vertex: return "@vertex shaders";
+            case Stage::Fragment: return "@fragment shaders";
+            default: return "compute kernels";
+            }
+        };
+        if (fn.is_entry_kernel) {
+            if (fn.stage != want) {
+                ctx.diags.error(span, "'" + std::string(what) + "' is only valid in " + stage_label(want));
+            }
+            return;
+        }
+        if (fn.required_stage && *fn.required_stage != want) {
+            ctx.diags.error(span, "'" + std::string(what) + "' is only valid in " + stage_label(want));
+            return;
+        }
+        fn.required_stage = want;
+        fn.stage = want;
+        if (want != Stage::Compute) fn.fast_math = true;
+    }
     Type check_expr(Expr* e, std::optional<Type> expected = std::nullopt);
     void check_stmt(Stmt* s);
     void check_block_stmts(std::vector<StmtPtr>& stmts);

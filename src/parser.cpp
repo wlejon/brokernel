@@ -240,10 +240,11 @@ private:
             gp.name = consume(TokenKind::Ident, "generic parameter name").text;
             if (match(TokenKind::Colon)) {
                 gp.constraint_or_type = parse_type();
-                // `D: i32` or `D: u32` without `const` keyword is also treated as a const integer generic parameter
+                // `D: i32`, `D: u32`, or `D: bool` without `const` keyword is also treated as a const generic parameter
                 if (gp.constraint_or_type &&
                     (gp.constraint_or_type->name == "i32" || gp.constraint_or_type->name == "u32" ||
-                     gp.constraint_or_type->name == "int" || gp.constraint_or_type->name == "uint")) {
+                     gp.constraint_or_type->name == "int" || gp.constraint_or_type->name == "uint" ||
+                     gp.constraint_or_type->name == "bool")) {
                     gp.is_const = true;
                 }
             }
@@ -252,6 +253,10 @@ private:
                 if (check(TokenKind::IntLit)) {
                     int64_t v = advance().int_val;
                     gp.default_int = neg ? -v : v;
+                } else if (match(TokenKind::KwTrue)) {
+                    gp.default_int = 1;
+                } else if (match(TokenKind::KwFalse)) {
+                    gp.default_int = 0;
                 } else {
                     gp.default_type = parse_type();
                 }
@@ -276,6 +281,16 @@ private:
         }
         if (check(TokenKind::IntLit)) {
             arg.int_arg = advance().int_val;
+            arg.span = previous().span;
+            return arg;
+        }
+        if (match(TokenKind::KwTrue)) {
+            arg.int_arg = 1;
+            arg.span = previous().span;
+            return arg;
+        }
+        if (match(TokenKind::KwFalse)) {
+            arg.int_arg = 0;
             arg.span = previous().span;
             return arg;
         }
@@ -724,6 +739,10 @@ private:
                 ga.int_arg = -advance().int_val;
             } else if (check(TokenKind::IntLit)) {
                 ga.int_arg = advance().int_val;
+            } else if (match(TokenKind::KwTrue)) {
+                ga.int_arg = 1;
+            } else if (match(TokenKind::KwFalse)) {
+                ga.int_arg = 0;
             } else if (check(TokenKind::Ident)) {
                 std::string tname = advance().text;
                 while (match(TokenKind::ColonColon)) {
