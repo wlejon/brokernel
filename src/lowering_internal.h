@@ -135,6 +135,9 @@ struct MirBodyLowerer {
     brass::Value* lower_scalar_cast(brass::Value* v, ScalarKind from_sk, ScalarKind to_sk);
     brass::Value* lower_scalar_binary(BinaryOp op, brass::Value* l, brass::Value* r, ScalarKind sk);
     brass::Value* lower_scalar_math_1(const std::string& name, brass::Value* x, ScalarKind sk);
+    // An f32 transcendental as the device's own instruction (render math),
+    // null for any other name.
+    brass::Value* lower_native_math_1(const std::string& name, brass::Value* x);
     brass::Value* lower_scalar_math_2(const std::string& name, brass::Value* a, brass::Value* c, ScalarKind sk);
     brass::Value* lower_scalar_math_3(const std::string& name, brass::Value* x, brass::Value* y, brass::Value* z, ScalarKind sk);
 

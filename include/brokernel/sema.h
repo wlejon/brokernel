@@ -88,6 +88,11 @@ struct CheckedFunction {
     bool uses_f64 = false;
     bool uses_grid_coords = false;
     bool uses_barriers_or_shared = false;
+    // Render math on the GPU (a vertex or fragment stage, or a kernel marked
+    // @fast): the driver may fuse and reorder float arithmetic, and the
+    // transcendentals of f32 are the device's own (GLSL.std.450), not the
+    // CPU-exact polynomials. A @fast kernel's CPU build is unchanged.
+    bool fast_math = false;
     int32_t max_stencil_radius = 0;
     int32_t stencil_halo[3] = {0, 0, 0};
     std::vector<StmtPtr> body;         // Deep-cloned, type-annotated & const-specialized body

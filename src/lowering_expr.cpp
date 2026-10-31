@@ -298,6 +298,17 @@ brass::Value* MirBodyLowerer::lower_scalar_binary(BinaryOp op, brass::Value* l, 
         }
         return l;
     }
+brass::Value* MirBodyLowerer::lower_native_math_1(const std::string& name, brass::Value* x) {
+    static const char* const kNative[][2] = {
+        {"sin", "sinf"}, {"cos", "cosf"}, {"tan", "tanf"}, {"asin", "asinf"}, {"acos", "acosf"},
+        {"atan", "atanf"}, {"sinh", "sinhf"}, {"cosh", "coshf"}, {"tanh", "tanhf"},
+        {"exp", "expf"}, {"exp2", "ex2f"}, {"log", "logf"}, {"log2", "lg2f"},
+    };
+    for (const auto& n : kNative) {
+        if (name == n[0]) return b.build_call(n[1], brass::Type::f32(), {x});
+    }
+    return nullptr;
+}
 brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass::Value* x, ScalarKind sk) {
         bool is_fp = (sk == ScalarKind::F32 || sk == ScalarKind::F64);
         brass::Value* zero = (sk == ScalarKind::F64) ? b.build_fconst_f64(0.0)
@@ -336,6 +347,9 @@ brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass
             brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kDegToRad) : b.build_fconst_f32(static_cast<float>(kDegToRad));
             return b.build_mul(x, c);
         }
+        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) {
+            if (brass::Value* t = lower_native_math_1(name, x)) return t;
+        }
         if (brass::Value* t = lower_transcendental_1(b, name, x, sk)) return t;
         if (name == "dpdx" || name == "dpdy" || name == "fwidth") {
             // Fragment-only (sema), and fragments have no CPU build.
@@ -365,6 +379,9 @@ brass::Value* MirBodyLowerer::lower_scalar_math_2(const std::string& name, brass
         if (name == "max") {
             if (is_fp) return b.build_fmax(a, c);
             return b.build_select(is_unsigned ? b.build_ugt(a, c) : b.build_sgt(a, c), a, c);
+        }
+        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32 && (name == "pow" || name == "atan2")) {
+            return b.build_call(name == "pow" ? "powf" : "atan2f", brass::Type::f32(), {a, c});
         }
         if (brass::Value* t = lower_transcendental_2(b, name, a, c, sk)) return t;
         if (name == "step") {

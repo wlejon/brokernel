@@ -5,6 +5,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 using namespace brokernel;
@@ -112,6 +113,75 @@ static void test_fragment_stage_spirv() {
     assert(!k->has_cpu_build() && !k->cpu_point_fn().is_valid() && !k->cpu_grid_fn().is_valid());
 }
 
+// Render math: a fragment stage's f32 transcendentals are the device's own
+// instructions and its arithmetic may fuse; a compute kernel's are the
+// CPU-exact polynomials under NoContraction unless it is marked @fast.
+static void test_render_math() {
+    const char* src = R"(
+        @fragment fn shade(k: f32) {
+            let fc: vec4<f32> = frag_coord();
+            let a: f32 = sin(fc.x * k) + exp(fc.y * k) + pow(fc.x, k) + atan2(fc.y, fc.x) + tan(k);
+            set_frag_color(vec4<f32>(a, a * k + 1.0, 0.0, 1.0));
+        }
+        @kernel @grid(1) fn exact(out: write_store<f32, 1>, k: f32) {
+            out.write(sin(k) * k + 1.0);
+        }
+        @kernel @grid(1) @fast fn quick(out: write_store<f32, 1>, k: f32) {
+            out.write(sin(k) * k + 1.0);
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "render_math.bk", opts);
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    auto find = [&](const char* name) -> const CompiledKernel* {
+        for (const auto& k : res.kernels) if (k.name == name) return &k;
+        return nullptr;
+    };
+    const auto* fs = find("shade");
+    const auto* exact = find("exact");
+    const auto* quick = find("quick");
+    assert(fs && exact && quick);
+    // Whether the disassembly calls GLSL.std.450 instruction `n`
+    // ("%r = OpExtInst %type %set n ...").
+    auto has_ext = [](const std::string& dis, int n) {
+        std::istringstream lines(dis);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream w(line);
+            std::string r, eq, op, type, set, num;
+            if (w >> r >> eq >> op >> type >> set >> num && op == "OpExtInst" && num == std::to_string(n)) return true;
+        }
+        return false;
+    };
+    const std::string& d = fs->spirv_disassembly;
+    // Sin 13, Exp 27, Pow 26, Atan2 25, Tan 15.
+    for (int op : {13, 27, 26, 25, 15}) {
+        if (!has_ext(d, op)) {
+            std::cerr << "render math: no GLSL.std.450 " << op << " in\n" << d << "\n";
+            assert(false);
+        }
+    }
+    // Whether any result is decorated NoContraction (42): "OpDecorate %r 42".
+    auto exact_math = [](const std::string& dis) {
+        std::istringstream lines(dis);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream w(line);
+            std::string op, id, dec, more;
+            if (w >> op >> id >> dec && !(w >> more) && op == "OpDecorate" && dec == "42") return true;
+        }
+        return false;
+    };
+    assert(!exact_math(d));
+    assert(exact_math(exact->spirv_disassembly));
+    assert(!has_ext(exact->spirv_disassembly, 13));
+    assert(!exact_math(quick->spirv_disassembly) && has_ext(quick->spirv_disassembly, 13));
+    // A @fast kernel's CPU build keeps the exact polynomials.
+    assert(quick->has_cpu_build());
+}
+
 static void test_builtin_type_diagnostics() {
     auto fails_with = [](const char* src, const char* needle) {
         auto res = compile_source(src, "bad_builtin.bk");
@@ -142,6 +212,7 @@ int main() {
     test_compute_spirv_and_ptx();
     test_vertex_stage_spirv();
     test_fragment_stage_spirv();
+    test_render_math();
     test_builtin_type_diagnostics();
     test_stage_misuse_diagnostics();
     std::cout << "test_spirv_stages: ALL PASSED\n";

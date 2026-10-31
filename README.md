@@ -58,6 +58,11 @@ general graphics:
     transcendentals for.
   - f64 is within a few ulp of libm, and f32 uses Cephes' single-precision
     polynomials.
+  - Render math is the exception: a vertex or fragment stage, and a
+    kernel marked `@fast`, is emitted without `precise_float`, so the driver
+    may fuse and reorder, and its f32 transcendentals are the device's own
+    GLSL.std.450 instructions. A `@fast` kernel's CPU build keeps the exact
+    polynomials, so its two builds agree only to the device's precision.
   - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
     fails, with `ran_gpu` false, when there is no Vulkan device.
 - **A store access never leaves its store.** A kernel's store takes its

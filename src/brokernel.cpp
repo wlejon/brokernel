@@ -952,7 +952,8 @@ CompileResult Compiler::compile_source(
                 spv_opts.local_size_z = ck.local_size[2];
                 spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
                 spv_opts.spirv_version = opts.spirv_version;
-                spv_opts.precise_float = true; // the GPU rounds as the CPU build does
+                // The GPU rounds as the CPU build does, but for render math.
+                spv_opts.precise_float = !fn->fast_math;
 
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
                 if (opts.emit_spirv_disassembly) {

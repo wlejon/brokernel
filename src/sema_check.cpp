@@ -952,6 +952,7 @@ const CheckedFunction* SemaContext::instantiate_function(
     if (decl.has_attribute("vertex")) cfn.stage = Stage::Vertex;
     else if (decl.has_attribute("fragment")) cfn.stage = Stage::Fragment;
     else cfn.stage = Stage::Compute;
+    cfn.fast_math = cfn.stage != Stage::Compute || decl.has_attribute("fast");
     if (const Attribute* grid_attr = decl.find_attribute("grid")) {
         if (!grid_attr->int_args.empty()) {
             int64_t gd = grid_attr->int_args[0];
