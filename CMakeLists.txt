@@ -40,6 +40,7 @@ add_library(brokernel STATIC
     src/lowering_expr.cpp
     src/lowering_math.cpp
     src/lowering_ops.cpp
+    src/lowering_block.cpp
     src/lowering_texture.cpp
 )
 add_library(brokernel::brokernel ALIAS brokernel)

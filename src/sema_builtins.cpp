@@ -430,17 +430,37 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = Type::void_type();
         return Type::void_type();
     }
-    if (n == "set_vertex_output") {
-        if (fn.stage != Stage::Vertex) {
-            ctx.diags.error(e->span, "'set_vertex_output' is only valid in @vertex shaders");
+    // set_vertex_output / set_frag_output(location, value): a constant
+    // location and f32, i32 or u32 lanes, 1 to 4.
+    if (n == "set_vertex_output" || n == "set_frag_output") {
+        Stage want = n == "set_vertex_output" ? Stage::Vertex : Stage::Fragment;
+        if (fn.stage != want) {
+            ctx.diags.error(e->span, "'" + n + "' is only valid in @" +
+                                         (want == Stage::Vertex ? "vertex" : "fragment") + " shaders");
         }
         if (e->args.size() == 2) {
             check_expr(e->args[0].get(), Type::i32());
-            Type v4 = Type::vec(ScalarKind::F32, 4);
-            check_expr(e->args[1].get(), v4);
-            check_assignable(e->args[1].get(), v4, ctx.diags, e->args[1]->span);
+            auto loc = ctx.eval_const_int(e->args[0].get(), fn.module_name, genv, scopes);
+            if (!loc || *loc < 0) ctx.diags.error(e->args[0]->span, "'" + n + "' location must be a constant >= 0");
+            Type vt = check_expr(e->args[1].get());
+            if (!(vt.is_scalar() || vt.is_vector()) ||
+                (vt.scalar != ScalarKind::F32 && vt.scalar != ScalarKind::I32 && vt.scalar != ScalarKind::U32)) {
+                ctx.diags.error(e->args[1]->span, "a stage output is f32, i32 or u32, or a vector of one, not '" +
+                                                      vt.to_string() + "'");
+            }
         } else {
-            ctx.diags.error(e->span, "'set_vertex_output(loc, val)' expects 2 arguments");
+            ctx.diags.error(e->span, "'" + n + "(location, value)' expects 2 arguments");
+        }
+        e->resolved_type = Type::void_type();
+        return Type::void_type();
+    }
+    if (n == "set_frag_depth") {
+        if (fn.stage != Stage::Fragment) ctx.diags.error(e->span, "'set_frag_depth' is only valid in @fragment shaders");
+        if (e->args.size() == 1) {
+            check_expr(e->args[0].get(), Type::f32());
+            check_assignable(e->args[0].get(), Type::f32(), ctx.diags, e->args[0]->span);
+        } else {
+            ctx.diags.error(e->span, "'set_frag_depth(depth)' expects 1 f32 argument");
         }
         e->resolved_type = Type::void_type();
         return Type::void_type();
@@ -471,21 +491,6 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
             check_assignable(e->args[0].get(), v4, ctx.diags, e->args[0]->span);
         } else {
             ctx.diags.error(e->span, "'set_frag_color' expects 1 vec4<f32> argument");
-        }
-        e->resolved_type = Type::void_type();
-        return Type::void_type();
-    }
-    if (n == "set_frag_output") {
-        if (fn.stage != Stage::Fragment) {
-            ctx.diags.error(e->span, "'set_frag_output' is only valid in @fragment shaders");
-        }
-        if (e->args.size() == 2) {
-            check_expr(e->args[0].get(), Type::i32());
-            Type v4 = Type::vec(ScalarKind::F32, 4);
-            check_expr(e->args[1].get(), v4);
-            check_assignable(e->args[1].get(), v4, ctx.diags, e->args[1]->span);
-        } else {
-            ctx.diags.error(e->span, "'set_frag_output(loc, val)' expects 2 arguments");
         }
         e->resolved_type = Type::void_type();
         return Type::void_type();

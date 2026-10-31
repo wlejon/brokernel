@@ -81,6 +81,15 @@ general graphics:
   `grid_linear_index()`, `grid_total_cells()`) are i64, stores take i32 or
   i64 coordinates, and the CPU's grid loop indexes in i64, so a grid may
   pass 2^31 cells.
+- **Vertex and fragment stages** (`@vertex`, `@fragment`):
+  - Their inputs are parameters at `@location(n)`: f32, i32 or u32, or a
+    vector of one. A fragment input is interpolated unless it is marked
+    `@flat`; an integer input is always flat.
+  - `set_vertex_output(location, value)` and `set_frag_output(location,
+    value)` take the same types. `set_frag_color(rgba)` is location 0.
+  - Also `set_vertex_position`, `set_frag_depth`, `vertex_index()`,
+    `instance_index()`, `frag_coord()` and `front_facing()`.
+  - Their other parameters are push constants.
 - **Textures are parameters at a descriptor**, `@binding(set, binding)`:
   - Samplers (a combined image and sampler) are `sampler1d`, `sampler2d`,
     `sampler3d`, `sampler_cube`, `sampler2d_array` and `sampler_cube_array`,
@@ -102,6 +111,15 @@ general graphics:
     whole.
   - A texture passed to a helper function still names its descriptor.
     `CompiledKernel::spirv.descriptors` lists each texture's shape.
+- **Buffers at a descriptor** are parameters too, `@binding(set, binding)`:
+  - `uniform<T>` holds one T, laid out std140.
+  - `buffer<T>` and `read_buffer<T>` hold an array of T, laid out std430.
+    Only `buffer<T>` is written.
+  - T is a struct, or a 32-bit scalar or vector.
+  - An access is a path of fields, indices (dynamic ones too) and swizzles.
+    It reads or writes only the words the path names, at the offset its
+    layout gives.
+  - A kernel that takes a texture or a buffer runs on the GPU alone.
 - **Type introspection for generics.** `is_f64<T>()` and `sizeof<T>()`
   fold to constants at check time, so a generic body can branch on its
   scalar; `bitcast<T>(x)` reinterprets a value's bits as a type of the same
@@ -130,7 +148,8 @@ general graphics:
   and workgroup of one:
   - The subgroup operations are the identity there.
   - Vertex and fragment stages have no CPU build. Neither do kernels that
-    cooperate through barriers or shared memory, or that take a texture.
+    cooperate through barriers or shared memory, or that take a texture or
+    a buffer at a descriptor.
   - Derivatives, `front_facing` and `discard_fragment` (a demote to helper)
     are fragment-only.
   - A kernel's native code is compiled the first time something runs it on

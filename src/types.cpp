@@ -51,7 +51,9 @@ uint32_t Type::size_in_bytes() const noexcept {
         case TypeKind::Stencil:
         case TypeKind::Store:  return 8; // 64-bit buffer device address / pointer
         case TypeKind::Image:
-        case TypeKind::Sampler: return 0;
+        case TypeKind::Sampler:
+        case TypeKind::Uniform:
+        case TypeKind::Buffer: return 0;
     }
     return 0;
 }
@@ -95,6 +97,10 @@ std::string Type::to_string() const {
             if (image_shadow()) return oss.str() + "_shadow";
             oss << "<" << element_type().to_string() << ">";
             return oss.str();
+        case TypeKind::Uniform:
+            return "uniform<" + element_type().to_string() + ">";
+        case TypeKind::Buffer:
+            return std::string(access == AccessMode::Read ? "read_buffer<" : "buffer<") + element_type().to_string() + ">";
     }
     return "unknown";
 }
@@ -129,6 +135,10 @@ bool Type::operator==(const Type& o) const noexcept {
         case TypeKind::Sampler:
             return scalar == o.scalar && dimension == o.dimension &&
                    elem_kind == o.elem_kind && elem_lanes == o.elem_lanes && image_flags == o.image_flags;
+        case TypeKind::Uniform:
+        case TypeKind::Buffer:
+            return scalar == o.scalar && access == o.access && elem_kind == o.elem_kind &&
+                   elem_lanes == o.elem_lanes && struct_id == o.struct_id;
     }
     return false;
 }

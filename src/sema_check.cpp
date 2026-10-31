@@ -574,6 +574,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 }
                 return rt;
             }
+            if (recv.is_uniform()) recv = recv.element_type();   // a field of the block's T
             if (recv.is_struct()) {
                 const StructDef* sdef = ctx.out->types.find_struct(recv.struct_id);
                 if (sdef) {
@@ -591,6 +592,21 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         }
         case Expr::Kind::Index: {
             Type recv = check_expr(e->lhs.get());
+            if (recv.is_buffer()) {   // an element of a storage buffer
+                if (e->args.size() != 1) {
+                    ctx.diags.error(e->span, "a buffer takes 1 index");
+                }
+                for (auto& a : e->args) {
+                    Type at = check_expr(a.get(), Type::i32());
+                    if (!at.is_integer() || !at.is_scalar()) {
+                        ctx.diags.error(a->span, "buffer index must be a scalar integer, got '" + at.to_string() + "'");
+                    }
+                }
+                Type elem = recv.element_type();
+                mark_type_usage(elem);
+                e->resolved_type = elem;
+                return elem;
+            }
             if (recv.is_stencil()) {
                 LocalVar* lv = (e->lhs->kind == Expr::Kind::Ident) ? lookup_var(e->lhs->name) : nullptr;
                 if (lv && lv->param_index >= 0) {
@@ -775,7 +791,14 @@ void FnCheckState::check_stmt(Stmt* s) {
                 ctx.diags.error(s->span, "cannot assign to sub-element of store '" + base->name + "' directly; assign a full store element");
                 return;
             }
-            if (!lv->is_mutable) {
+            if (lv->type.is_block()) {
+                // A place in the buffer: the variable naming it is not what changes.
+                if (!lv->type.is_buffer() || lv->type.access == AccessMode::Read) {
+                    ctx.diags.error(s->span, "'" + base->name + "' is read-only (" + lv->type.to_string() + ")");
+                } else if (s->assign_target->kind == Expr::Kind::Ident) {
+                    ctx.diags.error(s->span, "assign to an element of buffer '" + base->name + "', not the buffer");
+                }
+            } else if (!lv->is_mutable) {
                 ctx.diags.error(s->span, "cannot assign to immutable variable '" + base->name + "' (declare with 'var' instead of 'let')");
             }
             Type target_t = check_expr(s->assign_target.get());
@@ -1044,8 +1067,14 @@ const CheckedFunction* SemaContext::instantiate_function(
             cp.image_format = resolve_image_format(cp, pdecl.find_attribute("format"), diags);
         } else if (cp.type.is_sampler()) {
             cp.role = ParamRole::Sampler;
+        } else if (cp.type.is_uniform()) {
+            cp.role = ParamRole::Uniform;
+        } else if (cp.type.is_buffer()) {
+            cp.role = ParamRole::Buffer;
         }
-        if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) cfn.uses_textures = true;
+        if (cp.role == ParamRole::Image || cp.role == ParamRole::Sampler || cp.role == ParamRole::Uniform ||
+            cp.role == ParamRole::Buffer)
+            cfn.uses_descriptors = true;
         for (const auto& pattr : pdecl.attributes) {
             if (pattr.name == "binding") {
                 if (pattr.int_args.size() == 1) {
@@ -1055,6 +1084,26 @@ const CheckedFunction* SemaContext::instantiate_function(
                     cp.descriptor_binding = static_cast<uint32_t>(pattr.int_args[1]);
                 }
             }
+        }
+        // A vertex stage's attribute or a fragment stage's interpolated
+        // input: f32, i32 or u32 lanes, 1 to 4.
+        if (const Attribute* loc = pdecl.find_attribute("location")) {
+            if (cfn.stage != Stage::Vertex && cfn.stage != Stage::Fragment) {
+                diags.error(loc->span, "@location is a vertex or fragment stage's input");
+            }
+            if (loc->int_args.size() != 1 || loc->int_args[0] < 0) {
+                diags.error(loc->span, "@location takes one location, e.g. @location(0)");
+            }
+            if (!(cp.type.is_scalar() || cp.type.is_vector()) ||
+                (cp.type.scalar != ScalarKind::F32 && cp.type.scalar != ScalarKind::I32 &&
+                 cp.type.scalar != ScalarKind::U32)) {
+                diags.error(cp.span, "a stage input is f32, i32 or u32, or a vector of one");
+            }
+            cp.role = ParamRole::StageInput;
+            cp.location = loc->int_args.empty() ? 0 : static_cast<uint32_t>(loc->int_args[0]);
+            cp.flat = pdecl.find_attribute("flat") != nullptr || cp.type.scalar != ScalarKind::F32;
+        } else if (pdecl.find_attribute("flat")) {
+            diags.error(cp.span, "@flat marks a stage input (@location)");
         }
         cfn.params.push_back(std::move(cp));
     }

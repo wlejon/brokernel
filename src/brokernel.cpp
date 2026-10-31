@@ -135,7 +135,7 @@ uint64_t pack_f64_bits(double v) noexcept {
 size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
     size_t c = 0;
     for (const auto& p : params) {
-        if (p.role != ParamRole::Grid && p.role != ParamRole::Image && p.role != ParamRole::Sampler) {
+        if (!is_bound_param(p.role)) {
             ++c;
         }
     }
@@ -190,7 +190,7 @@ bool pack_cpu_args(
     slots_out.clear();
     size_t arg_idx = 0;
     for (const auto& p : kernel.params) {
-        if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
+        if (is_bound_param(p.role)) {
             if (!skip_domain_args) ++arg_idx;
             continue;
         }
@@ -447,7 +447,7 @@ bool CompiledKernel::gpu_launch(
     vk_args.clear();
     size_t arg_idx = 0;
     for (const auto& p : params) {
-        if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
+        if (is_bound_param(p.role)) {
             if (!skip_domain_args) ++arg_idx;
             continue;
         }
@@ -593,7 +593,7 @@ bool CompiledKernel::dispatch_gpu(
         const bool skip_domain_args = (args.size() == non_grid && params.size() != non_grid);
         size_t arg_idx = 0;
         for (const auto& p : params) {
-            if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
+            if (is_bound_param(p.role)) {
                 if (!skip_domain_args) ++arg_idx;
                 continue;
             }
@@ -809,7 +809,7 @@ ParityReport CompiledKernel::compare_cpu_gpu(
     // Compare writable store buffers (and copy GPU output back to caller's writable buffers)
     size_t arg_idx = 0;
     for (const auto& p : params) {
-        if (p.role == ParamRole::Grid || p.role == ParamRole::Image || p.role == ParamRole::Sampler) {
+        if (is_bound_param(p.role)) {
             if (!skip_domain_args) ++arg_idx;
             continue;
         }

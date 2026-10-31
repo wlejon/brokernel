@@ -5,6 +5,7 @@
 #include "lowering_ops.h"
 
 #include <functional>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -98,6 +99,32 @@ struct MirBodyLowerer {
     std::unordered_map<const brass::Value*, size_t> texture_param;
     // An image's or a sampler's method (lowering_texture.cpp).
     ValueList lower_texture_call(const Expr* e);
+
+    // Buffers at descriptors (lowering_block.cpp). A block parameter's
+    // placeholder value -> its parameter index.
+    std::unordered_map<const brass::Value*, size_t> block_param;
+    struct BlockLayout {
+        uint32_t size = 0, align = 0;
+    };
+    struct BlockPlace {
+        size_t param = 0;
+        bool std140 = false;
+        brass::Value* offset = nullptr;   // bytes, i32
+        Type type;
+        std::vector<uint32_t> lanes;      // a swizzle's
+    };
+    BlockLayout block_layout(const Type& t, bool std140) const;
+    uint32_t block_stride(const Type& elem, bool std140) const;
+    uint32_t block_field_offset(const StructDef& sdef, const std::string& field, bool std140) const;
+    uint32_t uniform_bytes(const CheckedParam& param) const;
+    bool block_place(const Expr* e, BlockPlace& p);
+    bool is_block_path(const Expr* e) const;
+    void block_words(const Type& t, bool std140, brass::Value* base, std::vector<brass::Value*>& out,
+                     std::vector<ScalarKind>& kinds);
+    ValueList block_load(const Expr* e, const BlockPlace& p);
+    void block_store(const Expr* e, const BlockPlace& p, const ValueList& value);
+    std::optional<ValueList> try_block_read(const Expr* e);
+    bool try_block_assign(const Stmt* s, ValueList rhs);
     // `store` accessed at a cell, covering `dim` axes: its pointer alone.
     ValueList at_cells(const ValueList& store, uint32_t dim);
     // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are

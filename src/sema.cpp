@@ -1041,6 +1041,22 @@ Type SemaContext::resolve_type(
         return Type::image(elem, dim, mode, n == "image2d_array" ? Type::kImageArrayed : 0);
     }
 
+    // Buffers at descriptors: uniform<T> holds one T (std140), buffer<T> /
+    // read_buffer<T> an array of T (std430).
+    if (n == "uniform" || n == "buffer" || n == "read_buffer") {
+        Type elem = Type::f32();
+        if (texpr->args.size() == 1 && texpr->args[0].type_arg) {
+            elem = resolve_type(texpr->args[0].type_arg.get(), current_mod, genv);
+        } else {
+            diags.error(texpr->span, "'" + n + "<T>' takes one type");
+        }
+        if (!(elem.is_scalar() || elem.is_vector() || elem.is_struct()) || elem.is_64bit() || elem.is_bool()) {
+            diags.error(texpr->span, "'" + n + "' holds a struct, or 32-bit scalars or vectors");
+        }
+        if (n == "uniform") return Type::block(TypeKind::Uniform, elem, AccessMode::Read);
+        return Type::block(TypeKind::Buffer, elem, n == "buffer" ? AccessMode::ReadWrite : AccessMode::Read);
+    }
+
     if (n.rfind("sampler", 0) == 0) {
         static const struct { const char* name; uint32_t dim; uint8_t flags; } kSamplers[] = {
             {"sampler", 2, 0},

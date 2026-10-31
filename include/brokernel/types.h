@@ -37,6 +37,8 @@ enum class TypeKind : uint8_t {
     Store = 7,
     Image = 8,
     Sampler = 9,
+    Uniform = 10,   // a uniform buffer at a descriptor holding one T (std140)
+    Buffer = 11,    // a storage buffer at a descriptor, an array of T (std430)
 };
 
 /// Value type descriptor.
@@ -163,6 +165,20 @@ struct Type {
         return t;
     }
 
+    // uniform<T> (kind Uniform) or buffer<T> / read_buffer<T> (kind Buffer).
+    static Type block(TypeKind k, const Type& elem, AccessMode mode = AccessMode::Read) {
+        Type t;
+        t.kind = k;
+        t.scalar = elem.scalar;
+        t.dimension = elem.is_array() ? elem.dimension : 1;
+        t.access = mode;
+        t.elem_kind = elem.kind;
+        t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
+        t.struct_id = elem.struct_id;
+        t.struct_name = elem.struct_name;
+        return t;
+    }
+
     bool image_arrayed() const noexcept { return (image_flags & kImageArrayed) != 0; }
     bool image_shadow() const noexcept { return (image_flags & kImageShadow) != 0; }
     bool image_cube() const noexcept { return (image_flags & kImageCube) != 0; }
@@ -180,8 +196,11 @@ struct Type {
     bool is_store() const noexcept { return kind == TypeKind::Store; }
     bool is_image() const noexcept { return kind == TypeKind::Image; }
     bool is_sampler() const noexcept { return kind == TypeKind::Sampler; }
+    bool is_uniform() const noexcept { return kind == TypeKind::Uniform; }
+    bool is_buffer() const noexcept { return kind == TypeKind::Buffer; }
+    bool is_block() const noexcept { return is_uniform() || is_buffer(); }
     bool is_resource() const noexcept {
-        return is_grid() || is_stencil() || is_store() || is_image() || is_sampler();
+        return is_grid() || is_stencil() || is_store() || is_image() || is_sampler() || is_block();
     }
 
     bool is_bool() const noexcept { return is_scalar() && scalar == ScalarKind::Bool; }
@@ -212,7 +231,7 @@ struct Type {
 
     Type element_type() const {
         if (is_vector()) return scalar_type(scalar);
-        if (is_array() || is_store() || is_stencil() || is_image() || is_sampler()) {
+        if (is_array() || is_store() || is_stencil() || is_image() || is_sampler() || is_block()) {
             if (elem_kind == TypeKind::Struct) return make_struct(struct_id, struct_name);
             if (elem_kind == TypeKind::Vector) return vec(scalar, elem_lanes);
             return scalar_type(scalar);

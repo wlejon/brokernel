@@ -103,14 +103,15 @@ void MirBodyLowerer::lower_branch(brass::Value* cond, const std::function<void()
     b.build_br(merge_bb, args);
     b.position_at_end(merge_bb);
 }
-// The names of the variables `s` assigns (a store's elements are not
-// variables).
+// The names of the variables `s` assigns (a store's or a buffer's elements
+// are not variables).
 static void collect_assigned_names(const Stmt* s, std::set<std::string>& out) {
     if (!s) return;
     if (s->kind == Stmt::Kind::Assign) {
         const Expr* t = s->assign_target.get();
         while (t && (t->kind == Expr::Kind::Field || t->kind == Expr::Kind::Index) &&
-               !(t->kind == Expr::Kind::Index && t->lhs->resolved_type.is_store())) {
+               !(t->kind == Expr::Kind::Index && t->lhs->resolved_type.is_store()) &&
+               !t->lhs->resolved_type.is_block()) {
             t = t->lhs.get();
         }
         if (t && t->kind == Expr::Kind::Ident) out.insert(t->name);
@@ -224,6 +225,8 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
         }
         case Stmt::Kind::Assign: {
             ValueList rhs = lower_expr(s->assign_value.get());
+            // 0. A place in a storage buffer at a descriptor.
+            if (try_block_assign(s, rhs)) return;
             // 1. Store indexing assignment: `st[x, y] = val` or `st[x, y] += val`
             if (s->assign_target->kind == Expr::Kind::Index &&
                 s->assign_target->lhs->resolved_type.is_store()) {
@@ -550,7 +553,7 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
     f.params.reserve(fn.params.size());
     int32_t slot = 0;
     for (const auto& cp : fn.params) {
-        if (cp.role == ParamRole::Grid || cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) {
+        if (is_bound_param(cp.role)) {
             f.params.push_back({b.build_iconst_i32(0)});
         } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
             f.params.push_back({b.build_load(brass::Type::ptr(), args_pack, slot * 8),
@@ -708,6 +711,22 @@ LoweredKernelMir lower_kernel_to_mir(
                     b.build_iconst_i32(static_cast<int32_t>((cp.descriptor_set << 16) | cp.descriptor_binding));
                 lowerer.texture_param[placeholder] = out.param_infos.size();
                 lowerer.alloc_var(cp.name, {placeholder});
+            } else if (cp.role == ParamRole::Uniform || cp.role == ParamRole::Buffer) {
+                pinfo.mir_param_count = 0;
+                brass::Value* placeholder =
+                    b.build_iconst_i32(static_cast<int32_t>((cp.descriptor_set << 16) | cp.descriptor_binding));
+                lowerer.block_param[placeholder] = out.param_infos.size();
+                lowerer.alloc_var(cp.name, {placeholder});
+            } else if (cp.role == ParamRole::StageInput) {
+                pinfo.mir_param_count = 0;
+                const uint32_t lanes = cp.type.is_vector() ? cp.type.dimension : 1;
+                const bool integer = cp.type.scalar != ScalarKind::F32;
+                ValueList leaves;
+                for (uint32_t i = 0; i < lanes; ++i) {
+                    leaves.push_back(kb.stage_input(cp.location, lanes, i, integer,
+                                                    cp.flat ? brass::target::kSpirvStageFlat : 0u));
+                }
+                lowerer.alloc_var(cp.name, std::move(leaves));
             } else {
                 auto kinds = mod.types.flatten_scalars(cp.type);
                 pinfo.mir_param_count = static_cast<uint32_t>(kinds.size());
@@ -814,9 +833,9 @@ LoweredKernelMir lower_kernel_to_mir(
     // The CPU runs compute kernels cell by cell, a subgroup and workgroup of
     // one. Vertex and fragment stages (rasterizer inputs, derivatives,
     // discard), kernels that cooperate through barriers or shared memory
-    // and kernels that read textures have no meaning there, so they get no
-    // CPU build.
-    if (fn.stage != Stage::Compute || fn.uses_barriers_or_shared || fn.uses_textures) return out;
+    // and kernels that bind textures or buffers at descriptors have no
+    // meaning there, so they get no CPU build.
+    if (fn.stage != Stage::Compute || fn.uses_barriers_or_shared || fn.uses_descriptors) return out;
     out.cpu_point_function = out.cpu_module->create_function(
         fn.name + "_cpu_point", brass::Type::void_type(),
         {brass::Type::ptr(), brass::Type::ptr(), brass::Type::ptr()});
@@ -843,7 +862,7 @@ LoweredKernelMir lower_kernel_to_mir(
         lowerer.gd = b.build_load(brass::Type::i32(), coords_shape, 20);
         int32_t slot = 0;
         for (const auto& cp : fn.params) {
-            if (cp.role == ParamRole::Grid || cp.role == ParamRole::Image || cp.role == ParamRole::Sampler) {
+            if (is_bound_param(cp.role)) {
                 lowerer.alloc_var(cp.name, {b.build_iconst_i32(0)});
             } else if (cp.role == ParamRole::Store || cp.role == ParamRole::Stencil) {
                 brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);

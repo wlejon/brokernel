@@ -572,6 +572,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return out;
         }
         case Expr::Kind::Field: {
+            if (auto v = try_block_read(e)) return *v;
             ValueList recv = lower_expr(e->lhs.get());
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_scalar()) return recv;
@@ -600,6 +601,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return recv;
         }
         case Expr::Kind::Index: {
+            if (auto v = try_block_read(e)) return *v;
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_stencil()) return lower_stencil_read(e->lhs.get(), rt, e->args);
             if (rt.is_store()) {
@@ -926,18 +928,6 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             // Vertex & Fragment intrinsics
             if (n == "vertex_index") return {is_gpu ? b.build_call("spirv_vertex_index", brass::Type::i32()) : gx};
             if (n == "instance_index") return {is_gpu ? b.build_call("spirv_instance_index", brass::Type::i32()) : gy};
-            if (n == "vertex_input" || n == "frag_input") {
-                ValueList loc = lower_expr(e->args[0].get());
-                if (is_gpu) {
-                    return {
-                        b.build_call("spirv_stage_input_f32", brass::Type::f32(), {loc[0], b.build_iconst_i32(0)}),
-                        b.build_call("spirv_stage_input_f32", brass::Type::f32(), {loc[0], b.build_iconst_i32(1)}),
-                        b.build_call("spirv_stage_input_f32", brass::Type::f32(), {loc[0], b.build_iconst_i32(2)}),
-                        b.build_call("spirv_stage_input_f32", brass::Type::f32(), {loc[0], b.build_iconst_i32(3)}),
-                    };
-                }
-                return make_zero_leaves(e->resolved_type);
-            }
             if (n == "set_vertex_position") {
                 ValueList v = lower_expr(e->args[0].get());
                 if (is_gpu && v.size() >= 4) {
@@ -948,17 +938,22 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (n == "set_vertex_output" || n == "set_frag_output") {
                 ValueList loc = lower_expr(e->args[0].get());
                 ValueList v = lower_expr(e->args[1].get());
-                if (is_gpu && v.size() >= 4) {
-                    b.build_call("spirv_stage_output_vec4", brass::Type::void_type(), {loc[0], v[0], v[1], v[2], v[3]});
+                const brass::Instruction* def = loc[0]->is_instruction() ? loc[0]->defining_instruction() : nullptr;
+                if (!def || def->opcode() != brass::Opcode::iconst_i32) {
+                    diags.error(e->args[0]->span, "a stage output's location must be a constant");
+                    return {};
                 }
+                if (is_gpu) kb.stage_output(static_cast<uint32_t>(def->imm_i32()), v);
                 return {};
             }
             if (n == "set_frag_color") {
                 ValueList v = lower_expr(e->args[0].get());
-                if (is_gpu && v.size() >= 4) {
-                    b.build_call("spirv_stage_output_vec4", brass::Type::void_type(),
-                                 {b.build_iconst_i32(0), v[0], v[1], v[2], v[3]});
-                }
+                if (is_gpu) kb.stage_output(0, v);
+                return {};
+            }
+            if (n == "set_frag_depth") {
+                ValueList v = lower_expr(e->args[0].get());
+                if (is_gpu) kb.set_frag_depth(v[0]);
                 return {};
             }
             if (n == "frag_coord") {

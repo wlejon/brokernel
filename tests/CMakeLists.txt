@@ -16,6 +16,10 @@ brokernel_add_test(test_lexer_parser)
 brokernel_add_test(test_sema_types)
 brokernel_add_test(test_modules_generics)
 brokernel_add_test(test_spirv_stages)
+# Every stage's module goes through spirv-val when the Vulkan SDK has it.
+find_program(BROKERNEL_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/bin")
+target_compile_definitions(test_spirv_stages PRIVATE
+    BROKERNEL_SPIRV_VAL="$<$<BOOL:${BROKERNEL_SPIRV_VAL}>:${BROKERNEL_SPIRV_VAL}>")
 brokernel_add_test(test_cpu_gpu_parity)
 brokernel_add_test(test_math_parity)
 brokernel_add_test(test_fastnoise2_parity)
