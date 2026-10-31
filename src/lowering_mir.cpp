@@ -218,6 +218,15 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
             break;
         case Stmt::Kind::Let:
         case Stmt::Kind::Var: {
+            if (s->kind == Stmt::Kind::Let && s->init_expr &&
+                (s->resolved_var_type.is_struct() || s->resolved_var_type.is_array())) {
+                BlockPlace bp;
+                if (is_block_path(s->init_expr.get()) && block_place(s->init_expr.get(), bp)) {
+                    int id = alloc_var(s->var_name, {});
+                    block_places[id] = std::move(bp);
+                    break;
+                }
+            }
             ValueList init = s->init_expr ? lower_expr(s->init_expr.get())
                                           : make_zero_leaves(s->resolved_var_type);
             alloc_var(s->var_name, std::move(init));

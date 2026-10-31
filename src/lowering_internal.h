@@ -122,10 +122,13 @@ struct MirBodyLowerer {
     struct BlockPlace {
         size_t param = 0;
         bool std140 = false;
+        bool aligned16 = true;
+        bool vec4_base = false;
         brass::Value* offset = nullptr;   // bytes, i32
         Type type;
         std::vector<uint32_t> lanes;      // a swizzle's
     };
+    std::unordered_map<int, BlockPlace> block_places;
     BlockLayout block_layout(const Type& t, bool std140) const { return mod.types.block_layout(t, std140); }
     uint32_t block_stride(const Type& elem, bool std140) const { return mod.types.block_stride(elem, std140); }
     uint32_t block_field_offset(const StructDef& sdef, const std::string& field, bool std140) const {
@@ -156,6 +159,7 @@ struct MirBodyLowerer {
     void pop_scope() {
         for (const auto& [name, id] : scopes.back()) {
             var_values.erase(id);
+            block_places.erase(id);
         }
         scopes.pop_back();
     }
@@ -207,7 +211,8 @@ struct MirBodyLowerer {
                     const std::vector<const Stmt*>& writers,
                     const std::function<brass::Value*()>& cond_fn, const std::function<void()>& body_fn,
                     const std::function<void()>& step_fn);
-    ValueList lower_inlined_call(const CheckedFunction& callee, const std::vector<ValueList>& arg_vals);
+    ValueList lower_inlined_call(const CheckedFunction& callee, const std::vector<ValueList>& arg_vals,
+                                 const std::vector<std::optional<BlockPlace>>& arg_places = {});
 };
 
 } // namespace brokernel::detail

@@ -434,7 +434,8 @@ brass::Value* MirBodyLowerer::lower_scalar_math_3(const std::string& name, brass
     }
 ValueList MirBodyLowerer::lower_inlined_call(
     const CheckedFunction& callee,
-    const std::vector<ValueList>& arg_vals) {
+    const std::vector<ValueList>& arg_vals,
+    const std::vector<std::optional<BlockPlace>>& arg_places) {
     // Save outer return tracking, loop stack, and scopes
     int saved_has_ret = has_returned_var_id;
     int saved_ret_val = ret_val_var_id;
@@ -452,7 +453,10 @@ ValueList MirBodyLowerer::lower_inlined_call(
         ret_val_var_id = -1;
     }
     for (size_t i = 0; i < callee.params.size() && i < arg_vals.size(); ++i) {
-        alloc_var(callee.params[i].name, arg_vals[i]);
+        int id = alloc_var(callee.params[i].name, arg_vals[i]);
+        if (i < arg_places.size() && arg_places[i].has_value()) {
+            block_places[id] = *arg_places[i];
+        }
     }
     lower_stmt_list(callee.body);
     ValueList result;
@@ -489,6 +493,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return {e->bool_val ? b.true_value() : b.build_iconst_i32(0)};
         case Expr::Kind::Ident: {
             if (e->global_index >= 0) return global_value(e);
+            if (auto v = try_block_read(e)) return *v;
             int id = lookup_var_id(e->name);
             if (id >= 0) return var_values[id];
             return make_zero_leaves(e->resolved_type);
@@ -803,11 +808,23 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             // 1. User / stdlib function call (inlined)
             if (const CheckedFunction* callee = mod.find_function(n)) {
                 std::vector<ValueList> arg_vals;
+                std::vector<std::optional<BlockPlace>> arg_places;
                 arg_vals.reserve(e->args.size());
-                for (const auto& a : e->args) {
-                    arg_vals.push_back(lower_expr(a.get()));
+                arg_places.reserve(e->args.size());
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    const Expr* a = e->args[i].get();
+                    BlockPlace bp;
+                    if (i < callee->params.size() &&
+                        (callee->params[i].type.is_struct() || callee->params[i].type.is_array()) &&
+                        is_block_path(a) && block_place(a, bp)) {
+                        arg_vals.emplace_back();
+                        arg_places.emplace_back(std::move(bp));
+                    } else {
+                        arg_vals.push_back(lower_expr(a));
+                        arg_places.emplace_back(std::nullopt);
+                    }
                 }
-                return lower_inlined_call(*callee, arg_vals);
+                return lower_inlined_call(*callee, arg_vals, arg_places);
             }
             // 2. Internal splat helper inserted by Sema
             if (n == "__splat") {

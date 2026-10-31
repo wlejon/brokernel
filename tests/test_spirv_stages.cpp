@@ -294,6 +294,80 @@ static void test_buffers() {
         if (r.ok) std::cerr << "buffers: accepted\n" << bad << "\n";
         assert(!r.ok);
     }
+
+    // Lazy place aliases (`let atm = lighting.atm;` and struct arguments) and
+    // coalesced 16-byte vec4 loads on uniform<T> and std430 buffer<T>.
+    const char* lazy_src = R"(
+        struct Atmosphere {
+            sun_dir: vec4<f32>,
+            sun_illuminance: vec4<f32>,
+            rayleigh: vec4<f32>,
+            mie: vec4<f32>,
+            ozone: vec4<f32>,
+            shell: vec4<f32>,
+            origin: vec4<f32>,
+            ground: vec4<f32>,
+            sky_view: vec4<f32>,
+            froxel: vec4<f32>,
+            froxel_view_proj: mat4f,
+        }
+        struct Light {
+            position: vec4<f32>,
+            direction: vec4<f32>,
+            color: vec4<f32>,
+            shadow: vec4<f32>,
+            shadow_reach: vec4<f32>,
+        }
+        struct Lighting {
+            lights: array<Light, 32>,
+            atm: Atmosphere,
+        }
+        @binding(1, 0) var lighting: uniform<Lighting>;
+        @binding(1, 1) var palette: read_buffer<vec4<f32>>;
+
+        fn read_sun(atm: Atmosphere) -> vec4<f32> {
+            return atm.sun_dir;
+        }
+        fn read_light(l: Light) -> vec4<f32> {
+            return l.color;
+        }
+        @fragment fn only_sun() {
+            let atm = lighting.atm;
+            set_frag_color(read_sun(atm));
+        }
+        @fragment fn indexed_light(@location(0) @flat i: i32) {
+            let l = lighting.lights[i];
+            set_frag_color(read_light(l) + palette[i]);
+        }
+    )";
+    auto lazy_res = compile_source(lazy_src, "lazy_buffers.bk", opts);
+    if (!lazy_res.ok) std::cerr << lazy_res.error_message() << "\n";
+    assert(lazy_res.ok);
+    require_valid(lazy_res);
+    auto count_op = [](const std::string& dis, const std::string& op) {
+        size_t n = 0;
+        std::istringstream lines(dis);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream w(line);
+            std::string a, b, c;
+            if ((w >> a && a == op) || (w >> b >> c && c == op)) ++n;
+        }
+        return n;
+    };
+    const CompiledKernel* only_sun = nullptr;
+    const CompiledKernel* indexed_light = nullptr;
+    for (const auto& k : lazy_res.kernels) {
+        if (k.name == "only_sun") only_sun = &k;
+        if (k.name == "indexed_light") indexed_light = &k;
+    }
+    assert(only_sun && indexed_light);
+    // `let atm = lighting.atm; read_sun(atm)` emits one 16-byte uvec4 load, not 60 word loads.
+    assert(count_op(only_sun->spirv_disassembly, "OpAccessChain") == 1);
+    assert(count_op(only_sun->spirv_disassembly, "OpLoad") == 1);
+    // `lighting.lights[i].color` + `palette[i]` emits two 16-byte uvec4 loads (plus one stage-input load for `i`).
+    assert(count_op(indexed_light->spirv_disassembly, "OpAccessChain") == 2);
+    assert(count_op(indexed_light->spirv_disassembly, "OpLoad") == 3);
 }
 
 // Render math: a fragment stage's f32 transcendentals are the device's own
