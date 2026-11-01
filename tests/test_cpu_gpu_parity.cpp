@@ -13,12 +13,33 @@
 
 using namespace brokernel;
 
-static void test_planetary_elevation_f64_parity() {
+// f64 is the CPU's: a @cpu kernel bakes a tile in f64 and has no GPU build,
+// and the same kernel without @cpu is a compile error at its first f64.
+static void test_planetary_elevation_f64_cpu() {
+    const char* gpu_src = R"(
+        import std::noise::{fbm};
+
+        @kernel @grid(2)
+        fn bake(g: grid<2>, out_elev: write_store<f32, 2>, freq: f32) {
+            let dir = vec3<f32>(g.uv(), 1.0);
+            let d: f64 = fbm<f64, 3>(vec3<f64>(dir.x as f64, dir.y as f64, 1.0) * (freq as f64), 4, 2.0, 0.5);
+            out_elev.write(d as f32);
+        }
+    )";
+    auto bad = compile_source(gpu_src, "planet_gpu.bk");
+    assert(!bad.ok);
+    const std::string msg = bad.error_message();
+    assert(msg.find("f64 in GPU kernel 'bake'") != std::string::npos);
+    assert(msg.find("planet_gpu.bk:7") != std::string::npos);
+    CompileOptions no_gpu;
+    no_gpu.emit_spirv = false;   // nothing compiled for the GPU: no error
+    assert(compile_source(gpu_src, "planet_gpu.bk", no_gpu).ok);
+
     const char* src = R"(
         import std::noise::{fbm, ridged};
         import std::sphere;
 
-        @kernel @grid(2)
+        @kernel @cpu @grid(2)
         fn bake_planet_tile(g: grid<2>, out_elev: write_store<f64, 2>, freq: f64) {
             let uv: vec2<f64> = g.uv_f64();
             let lat: f64 = (uv.y - 0.5) * 3.141592653589793;
@@ -37,21 +58,17 @@ static void test_planetary_elevation_f64_parity() {
     assert(res.ok);
     const auto* k = res.default_kernel();
     assert(k != nullptr);
-    assert(k->uses_f64);
+    assert(k->uses_f64 && k->cpu_only && k->spirv.words.empty());
     assert(k->grid_dim == 2);
 
     const uint32_t W = 32, H = 16;
     std::vector<double> elev(W * H, 0.0);
     std::vector<KernelArg> args = {KernelArg::store(elev), KernelArg(2.5)};
 
-    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-9, 1e-9);
-    if (!rep.ok) {
-        std::cerr << "planet_tile parity failed: " << rep.message << "\n";
-    }
-    assert(rep.ok && rep.ran_gpu);
-    assert(rep.elements_compared == W * H);
-    // Agreement on a constant (or unwritten) tile proves nothing: the GPU's
-    // heights, written back into elev, must vary and be finite.
+    std::string err;
+    assert(k->dispatch_cpu(GridShape(W, H), args, nullptr, &err));
+    assert(!k->dispatch_gpu(GridShape(W, H), args, nullptr, &err) && err.find("@cpu") != std::string::npos);
+    // The heights must vary and be finite.
     double lo = elev[0], hi = elev[0];
     for (double e : elev) {
         assert(std::isfinite(e));
@@ -61,11 +78,11 @@ static void test_planetary_elevation_f64_parity() {
     assert(hi - lo > 100.0);
 }
 
-static void test_simplex3d_range_and_parity() {
+static void test_simplex3d_range() {
     const char* src = R"(
         import std::noise::{simplex};
 
-        @kernel @grid(2)
+        @kernel @cpu @grid(2)
         fn slice(g: grid<2>, out: write_store<f64, 2>, z: f64) {
             let uv: vec2<f64> = g.uv_f64();
             out.write(simplex<f64, 3>(vec3<f64>(uv.x * 23.0, uv.y * 23.0, z), 7));
@@ -78,9 +95,8 @@ static void test_simplex3d_range_and_parity() {
     const uint32_t W = 128, H = 128;
     std::vector<double> v(W * H, -99.0);
     std::vector<KernelArg> args = {KernelArg::store(v), KernelArg(0.37)};
-    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-12, 1e-12);
-    if (!rep.ok) std::cerr << "simplex3d parity failed: " << rep.message << "\n";
-    assert(rep.ok && rep.ran_gpu);
+    std::string err;
+    assert(k->dispatch_cpu(GridShape(W, H), args, nullptr, &err));
     double lo = 1e9, hi = -1e9, sum = 0.0;
     for (double x : v) {
         lo = std::min(lo, x);
@@ -97,7 +113,7 @@ static void test_stencil_diffusion_f64_and_point_query() {
     const char* src = R"(
         from std::filter import laplacian2d;
 
-        @kernel @grid(2)
+        @kernel @cpu @precise @grid(2)
         fn diffuse_height(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, dt: f64) -> f64 {
             let next_h: f64 = h.at(0, 0) + dt * laplacian2d(h);
             out.write(next_h);
@@ -127,15 +143,10 @@ static void test_stencil_diffusion_f64_and_point_query() {
         KernelArg(0.125),
     };
 
-    // 1. Compare full-grid CPU vs GPU dispatch
-    auto rep = k->compare_cpu_gpu(GridShape(W, H), args, 1e-11, 1e-11);
-    if (!rep.ok) {
-        std::cerr << "diffuse parity failed: " << rep.message << "\n";
-    }
-    assert(rep.ok && rep.ran_gpu);
-
-    // The GPU's result (written back into h_out) against the host: one
-    // explicit diffusion step, neighbours clamped at the edges.
+    // 1. The grid on the CPU against the host: one explicit diffusion step,
+    // neighbours clamped at the edges.
+    std::string err;
+    assert(k->dispatch_cpu(GridShape(W, H), args, nullptr, &err));
     auto at = [&](int x, int y) {
         x = std::clamp(x, 0, int(W) - 1);
         y = std::clamp(y, 0, int(H) - 1);
@@ -183,7 +194,7 @@ static void test_3d_voxel_and_control_flow_parity() {
             return acc;
         }
 
-        @kernel @grid(3)
+        @kernel @precise @grid(3)
         fn fill_voxels(out: write_store<f32, 3>, scale: f32, iters: i32) {
             let x = grid_x() as f32;
             let y = grid_y() as f32;
@@ -250,7 +261,7 @@ static void test_vector_grid_lanes() {
             out[x, y] = v + f32(n);
             return v * 0.5;
         }
-        @kernel @grid(2)
+        @kernel @cpu @grid(2)
         fn k_f64(g: grid<2>, out: write_store<f64, 2>) {
             let x = g.x();
             let p = f64(x) * 0.25 + f64(g.y());
@@ -291,9 +302,13 @@ static void test_vector_grid_lanes() {
     }
     std::vector<double> d(W * H, -9.0);
     std::vector<KernelArg> dargs = {KernelArg::store(d)};
-    auto rep = k64->compare_cpu_gpu(GridShape(W, H), dargs, 1e-12, 1e-12);
-    if (!rep.ok) std::cerr << "f64 vector grid parity failed: " << rep.message << "\n";
-    assert(rep.ok);
+    assert(k64->dispatch_cpu(GridShape(W, H), dargs, nullptr, &err));
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            const double p = double(x) * 0.25 + double(y);
+            assert(d[y * W + x] == ((x % 3) == 1 ? -p : p * p));
+        }
+    }
 }
 
 // A vector build runs a group whose stencil reads all land inside its row
@@ -302,7 +317,7 @@ static void test_vector_grid_lanes() {
 // most (64), against the clamped reads on the host and on the GPU.
 static void test_vector_stencil_edges() {
     const char* src = R"(
-        @kernel @grid(2)
+        @kernel @precise @grid(2)
         fn k_reach(g: grid<2>, s: stencil<f32, 2>, out: write_store<f32, 2>) {
             let x = g.x();
             let y = g.y();
@@ -356,7 +371,7 @@ static void test_vector_stencil_edges() {
 // instead: a store too small for the grid is refused.
 static void test_store_bounds() {
     const char* src = R"(
-        @kernel @grid(1)
+        @kernel @precise @grid(1)
         fn k_bounds(g: grid<1>, table: read_store<f32, 1>, idx: read_store<i32, 1>,
                     out_a: write_store<f32, 1>, out_b: write_store<f32, 1>,
                     scatter: write_store<f32, 1>, edge: write_store<f32, 1>, tail: write_store<f32, 1>) {
@@ -452,7 +467,7 @@ static void test_vector_bool_masks() {
         const CONST_TRUE: bool = 2 < 5;
         const CONST_FALSE: bool = 2 > 5;
 
-        @kernel @grid(1)
+        @kernel @precise @grid(1)
         fn k_bool_masks(g: grid<1>, out: write_store<f32, 1>, flag_on: bool, flag_off: bool) -> f32 {
             let x = g.x();
             let a = f32(x) + 10.0;
@@ -543,7 +558,7 @@ static void test_assignment_targets_parity() {
             b: Branch,
         }
 
-        @kernel @grid(1)
+        @kernel @precise @grid(1)
         fn k_assign_targets(g: grid<1>, out: write_store<f32, 1>) -> f32 {
             let x = g.x();
             let dyn_i = x % 4;
@@ -647,7 +662,7 @@ static void test_assignment_targets_parity() {
 
 static void test_atomics_parity() {
     const char* src = R"(
-        @kernel @grid(1)
+        @kernel @precise @grid(1)
         fn k_atomics(g: grid<1>,
                      s_i32: rw_store<i32, 1>,
                      s_u32: rw_store<u32, 1>,
@@ -752,7 +767,7 @@ static void test_lowering_quirks_parity() {
             return (x & 1) == 0;
         }
 
-        @kernel fn k_lowering_quirks(
+        @kernel @precise fn k_lowering_quirks(
             and_store: rw_store<i32, 1>,
             and_count: rw_store<i32, 1>,
             or_store: rw_store<i32, 1>,
@@ -966,8 +981,8 @@ int main() {
         std::cout << "test_cpu_gpu_parity: no Vulkan device, skipped\n";
         return 77;
     }
-    test_planetary_elevation_f64_parity();
-    test_simplex3d_range_and_parity();
+    test_planetary_elevation_f64_cpu();
+    test_simplex3d_range();
     test_stencil_diffusion_f64_and_point_query();
     test_3d_voxel_and_control_flow_parity();
     test_vector_grid_lanes();

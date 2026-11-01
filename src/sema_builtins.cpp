@@ -28,7 +28,7 @@ Type FnCheckState::check_method_call(Expr* e) {
             return rt;
         }
         if (m == "uv_f64") {
-            fn.uses_f64 = true;
+            note_f64(&e->span);
             Type rt = (dim == 1) ? Type::f64() : Type::vec(ScalarKind::F64, dim);
             e->resolved_type = rt;
             return rt;
@@ -475,7 +475,7 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
     if (n == "grid_uv_f64") {
         uint32_t d = std::max(1u, fn.grid_dim);
         ensure_grid_dim(d);
-        fn.uses_f64 = true;
+        note_f64(&e->span);
         Type rt = (d == 1) ? Type::f64() : Type::vec(ScalarKind::F64, d);
         e->resolved_type = rt;
         return rt;

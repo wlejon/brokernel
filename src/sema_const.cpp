@@ -544,6 +544,7 @@ void FnCheckState::check_block_stmts(std::vector<StmtPtr>& stmts) {
 
 void FnCheckState::check_stmt(Stmt* s) {
     if (!s) return;
+    SiteScope at(*this, &s->span);
     switch (s->kind) {
         case Stmt::Kind::Block:
             push_scope();

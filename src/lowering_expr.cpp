@@ -894,9 +894,15 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList a = lower_expr(e->args[0].get());
                 brass::Value* sum = b.build_mul(a[0], a[0]);
                 for (size_t i = 1; i < a.size(); ++i) sum = b.build_add(sum, b.build_mul(a[i], a[i]));
-                brass::Value* len = b.build_sqrt(sum);
                 ValueList out;
                 out.reserve(a.size());
+                if (is_gpu && root_fn.fast_math && e->resolved_type.scalar == ScalarKind::F32) {
+                    // The device's inverse square root, times each component.
+                    brass::Value* inv = b.build_call("rsqrtf", brass::Type::f32(), {sum});
+                    for (brass::Value* v : a) out.push_back(b.build_mul(v, inv));
+                    return out;
+                }
+                brass::Value* len = b.build_sqrt(sum);
                 for (brass::Value* v : a) out.push_back(b.build_sdiv(v, len));
                 return out;
             }

@@ -1,5 +1,6 @@
 #include "brokernel/brokernel.h"
 
+#include <brass/target/host_cpu.hpp>
 #include <brass/target/ptx_target.hpp>
 #include <brass/verify/gpu_equiv.hpp>
 
@@ -74,7 +75,7 @@ bool CompiledKernel::gpu_launch(
         return false;
     }
     if (spirv.words.empty()) {
-        if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
+        if (err) *err = "kernel '" + name + (cpu_only ? "' is a @cpu kernel: it has no GPU build" : "' has no compiled SPIR-V binary");
         return false;
     }
 
@@ -201,7 +202,7 @@ bool CompiledKernel::dispatch_gpu(
     void* return_store_out,
     std::string* err) const {
     if (spirv.words.empty()) {
-        if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
+        if (err) *err = "kernel '" + name + (cpu_only ? "' is a @cpu kernel: it has no GPU build" : "' has no compiled SPIR-V binary");
         return false;
     }
     if (!brass::gpu::vulkan_available()) {
@@ -638,6 +639,25 @@ CompileResult Compiler::compile_source(
     }
 
     for (const CheckedFunction* fn : targets) {
+        // GPU code is f32: a kernel built for the GPU that reaches f64 is an
+        // error at the f64. A @cpu kernel has no GPU build and may use it; a
+        // plain function compiled as an entry (no @kernel in the module) has
+        // only its CPU build when it does.
+        bool gpu_build = opts.emit_spirv && !fn->cpu_only;
+        if (fn->cpu_only && fn->stage != Stage::Compute) {
+            res.diagnostics.error(fn->span, "'" + fn->source_name + "' is a vertex or fragment stage: it cannot be @cpu");
+            continue;
+        }
+        if (gpu_build && fn->uses_f64) {
+            if (fn->is_entry_kernel) {
+                res.diagnostics.error(fn->f64_site ? *fn->f64_site : fn->span,
+                                      "f64 in GPU kernel '" + fn->source_name +
+                                          "': GPU code is f32 (compute in f64 on the CPU and pass f32 offsets from an "
+                                          "anchor near the work), or mark the kernel @cpu");
+                continue;
+            }
+            gpu_build = false;
+        }
         LoweredKernelMir lowered = lower_kernel_to_mir(*checked, *fn, res.diagnostics);
         if (res.diagnostics.has_errors()) {
             res.ok = false;
@@ -661,6 +681,7 @@ CompileResult Compiler::compile_source(
         ck.return_flat_leaves = static_cast<uint32_t>(ck.return_leaf_kinds.size());
         ck.return_byte_size = checked->types.byte_size(fn->return_type);
         ck.uses_f64 = fn->uses_f64;
+        ck.cpu_only = fn->cpu_only;
         ck.uses_grid_coords = fn->uses_grid_coords;
         ck.max_stencil_radius = fn->max_stencil_radius;
         ck.stencil_halo[0] = fn->stencil_halo[0];
@@ -668,7 +689,7 @@ CompileResult Compiler::compile_source(
         ck.stencil_halo[2] = fn->stencil_halo[2];
 
         try {
-            if (opts.emit_spirv) {
+            if (gpu_build) {
                 brass::target::SpirvOptions spv_opts;
                 spv_opts.stage = ck.stage;
                 spv_opts.local_size_x = ck.local_size[0];
@@ -700,7 +721,7 @@ CompileResult Compiler::compile_source(
                 }
             }
 
-            if (opts.emit_ptx && ck.stage == Stage::Compute) {
+            if (opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
                 ck.ptx = brass::target::PtxTarget::emit_function(*lowered.gpu_function);
             }
 
@@ -708,7 +729,8 @@ CompileResult Compiler::compile_source(
                 auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
                 cpu->options.opt_level = opts.opt_level;
                 cpu->options.enable_optimizations = (opts.opt_level > 0);
-                cpu->options.enable_fma = false;
+                // Fast math fuses multiply-adds where the host has FMA.
+                cpu->options.enable_fma = fn->fast_math && brass::host_has_fma();
                 cpu->options.enable_parallel = false;
                 cpu->options.enable_superopt = false;
                 cpu->options.enable_smt_guard_elim = false;

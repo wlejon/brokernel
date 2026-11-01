@@ -19,7 +19,7 @@ static void test_builtin_stdlib_modules() {
         import std::sphere;
         import std::color;
 
-        @kernel fn planet_height(lat: f64, lon: f64) -> f64 {
+        @kernel @cpu fn planet_height(lat: f64, lon: f64) -> f64 {
             let p: vec3<f64> = sphere::latlon_to_unit<f64>(lat, lon);
             let h: f64 = fbm<f64, 3>(p * 2.0, 4, 2.0, 0.5);
             return math::remap<f64>(h, -1.0, 1.0, -4000.0, 8000.0);
@@ -72,7 +72,7 @@ static void test_custom_and_filesystem_modules_and_cycles() {
     const char* main_src = R"(
         from biome::moisture import ClimateSample, aridity_index;
 
-        @kernel fn compute_aridity(temp: f64, rain: f64) -> f64 {
+        @kernel @cpu fn compute_aridity(temp: f64, rain: f64) -> f64 {
             let sample = ClimateSample<f64> { temp: temp, rain: rain };
             return aridity_index(sample);
         }
@@ -100,7 +100,7 @@ static void test_generic_stencil_filter_module() {
     const char* src = R"(
         from std::filter import laplacian2d, box_blur2d;
 
-        @kernel fn diffuse_step(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, alpha: f64) {
+        @kernel @cpu fn diffuse_step(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, alpha: f64) {
             let lap: f64 = laplacian2d(h);
             out.write(h.at(0, 0) + alpha * lap);
         }
@@ -139,7 +139,7 @@ static void test_generic_type_pattern_inference() {
             return s.load(x, y);
         }
 
-        @kernel fn run_inferred(inp: store<f64, 2>, out: write_store<f64, 2>, dom: grid<2>) {
+        @kernel @cpu fn run_inferred(inp: store<f64, 2>, out: write_store<f64, 2>, dom: grid<2>) {
             let v = vec3<f64>(1.5, 2.5, 3.0);
             let sum_v: f64 = f(v);
             let cell: f64 = g(inp, dom.x(), dom.y());

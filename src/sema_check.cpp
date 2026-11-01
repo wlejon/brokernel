@@ -245,7 +245,7 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     e->kind = Expr::Kind::Call;
     e->path.clear();
     e->name = inst_name;
-    if (inst_f64) fn.uses_f64 = true;
+    if (inst_f64) note_f64(inst->f64_site ? &*inst->f64_site : &e->span);
     if (inst->uses_descriptors) fn.uses_descriptors = true;   // a resource read in the callee
     if (inst->uses_textures) fn.uses_textures = true;
     if (inst->uses_barriers_or_shared) fn.uses_barriers_or_shared = true;
@@ -399,6 +399,7 @@ void SemaContext::resolve_globals() {
 
 Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
     if (!e) return Type::void_type();
+    SiteScope at(*this, &e->span);
     switch (e->kind) {
         case Expr::Kind::IntLit: {
             ScalarKind sk = (e->literal_suffix != ScalarKind::Void) ? e->literal_suffix : ScalarKind::I32;
@@ -892,7 +893,8 @@ const CheckedFunction* SemaContext::instantiate_function(
         cfn.stage = Stage::Compute;
         if (cfn.is_entry_kernel) cfn.required_stage = Stage::Compute;
     }
-    cfn.fast_math = cfn.stage != Stage::Compute || decl.has_attribute("fast");
+    cfn.fast_math = !decl.has_attribute("precise");
+    cfn.cpu_only = decl.has_attribute("cpu");
     if (const Attribute* grid_attr = decl.find_attribute("grid")) {
         if (!grid_attr->int_args.empty()) {
             int64_t gd = grid_attr->int_args[0];
@@ -919,7 +921,10 @@ const CheckedFunction* SemaContext::instantiate_function(
         cp.name = pdecl.name;
         cp.type = resolve_type(pdecl.type.get(), decl_mod, genv);
         cp.access = cp.type.access;
-        if (cp.type.scalar == ScalarKind::F64) cfn.uses_f64 = true;
+        if (cp.type.scalar == ScalarKind::F64) {
+            cfn.uses_f64 = true;
+            if (!cfn.f64_site) cfn.f64_site = pdecl.type ? pdecl.type->span : cp.span;
+        }
         if (cp.type.is_scalar()) cp.role = ParamRole::Scalar;
         else if (cp.type.is_vector()) cp.role = ParamRole::Vector;
         else if (cp.type.is_struct()) cp.role = ParamRole::Struct;
@@ -974,7 +979,10 @@ const CheckedFunction* SemaContext::instantiate_function(
         else if (cfn.grid_dim == 3) { cfn.local_size[0] = 4; cfn.local_size[1] = 4; cfn.local_size[2] = 4; }
     }
     cfn.return_type = decl.return_type ? resolve_type(decl.return_type.get(), decl_mod, genv) : Type::void_type();
-    if (cfn.return_type.scalar == ScalarKind::F64) cfn.uses_f64 = true;
+    if (cfn.return_type.scalar == ScalarKind::F64) {
+        cfn.uses_f64 = true;
+        if (!cfn.f64_site) cfn.f64_site = decl.return_type ? decl.return_type->span : decl.span;
+    }
     for (const auto& s : decl.body) cfn.body.push_back(clone_stmt(s.get()));
     active_fn_stack.push_back(mangled);
     {

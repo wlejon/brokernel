@@ -260,7 +260,8 @@ public:
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
     std::vector<ScalarKind> return_leaf_kinds;
-    bool uses_f64 = false;
+    bool uses_f64 = false;               // only a @cpu kernel's (GPU code is f32)
+    bool cpu_only = false;               // @cpu: no GPU build
     bool uses_grid_coords = false;
     bool uses_barriers_or_shared = false;
     uint32_t cpu_shared_bytes = 0;

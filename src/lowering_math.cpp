@@ -605,7 +605,10 @@ brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass
         return b.build_select(b.build_sgt(x, zero), one, b.build_select(b.build_slt(x, zero), neg_one, zero));
     }
     if (name == "sqrt") return b.build_sqrt(x);
-    if (name == "rsqrt" || name == "inversesqrt") return b.build_sdiv(one, b.build_sqrt(x));
+    if (name == "rsqrt" || name == "inversesqrt") {
+        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) return b.build_call("rsqrtf", brass::Type::f32(), {x});
+        return b.build_sdiv(one, b.build_sqrt(x));
+    }
     if (name == "floor") return b.build_floor(x);
     if (name == "ceil") return b.build_ceil(x);
     if (name == "round") return b.build_round(x);

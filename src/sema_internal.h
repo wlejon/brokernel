@@ -103,12 +103,27 @@ struct FnCheckState {
         }
         return nullptr;
     }
+    // The expression or statement being checked: where an f64 it uses is.
+    const SourceSpan* site = nullptr;
+    struct SiteScope {
+        FnCheckState& st;
+        const SourceSpan* saved;
+        SiteScope(FnCheckState& s, const SourceSpan* span) : st(s), saved(s.site) { if (span) s.site = span; }
+        ~SiteScope() { st.site = saved; }
+    };
+    void note_f64(const SourceSpan* at) {
+        fn.uses_f64 = true;
+        if (!fn.f64_site) {
+            if (at) fn.f64_site = *at;
+            else if (site) fn.f64_site = *site;
+        }
+    }
     void mark_type_usage(const Type& t) {
-        if (t.scalar == ScalarKind::F64) fn.uses_f64 = true;
+        if (t.scalar == ScalarKind::F64) { note_f64(nullptr); return; }
         if (t.is_struct()) {
             auto leaves = ctx.out->types.flatten_scalars(t);
             for (auto sk : leaves) {
-                if (sk == ScalarKind::F64) fn.uses_f64 = true;
+                if (sk == ScalarKind::F64) { note_f64(nullptr); return; }
             }
         }
     }

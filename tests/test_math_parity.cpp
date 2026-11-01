@@ -1,6 +1,6 @@
 // The transcendentals (lowering_math.cpp) against the host's libm, on the CPU
 // build and on the GPU build: each function over a sweep of its domain plus
-// its edge values (0, +-inf, NaN, out of domain), in f32 and f64. Exits 77
+// its edge values (0, +-inf, NaN, out of domain), in f32 and (CPU only) f64. Exits 77
 // (skipped) after the CPU checks when there is no Vulkan device.
 
 #include "brokernel/brokernel.h"
@@ -62,7 +62,10 @@ template <typename T>
 void check_fn(const Fn& f) {
     const bool f64 = sizeof(T) == 8;
     const char* tn = f64 ? "f64" : "f32";
-    std::string src = std::string("@kernel @grid(1)\nfn k(xs: read_store<") + tn + ", 1>, " +
+    // f64 is CPU only (@cpu); the f32 kernel is @precise, the exact path a
+    // GPU build must match the CPU's to.
+    std::string src = std::string("@kernel @grid(1) ") + (f64 ? "@cpu" : "@precise") + "\nfn k(xs: read_store<" + tn +
+                      ", 1>, " +
                       (f.arity == 2 ? std::string("ys: read_store<") + tn + ", 1>, " : std::string()) +
                       "out: write_store<" + tn + ", 1>) {\n    out.write(" + f.name + "(xs.read()" +
                       (f.arity == 2 ? ", ys.read()" : "") + "));\n}\n";
@@ -124,7 +127,7 @@ void check_fn(const Fn& f) {
 
     std::vector<T> cpu(xs.size(), T(-12345));
     if (run(false, cpu)) verify("CPU", cpu);
-    if (g_have_gpu) {
+    if (g_have_gpu && !f64) {
         std::vector<T> gpu(xs.size(), T(-12345));
         if (run(true, gpu)) verify("GPU", gpu);
     }

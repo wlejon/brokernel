@@ -44,9 +44,9 @@ static void require_valid(const CompileResult& res) {
 static void test_compute_spirv_and_ptx() {
     const char* src = R"(
         @kernel @grid(2) @workgroup_size(16, 16, 1)
-        fn height_erode(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, k: f64) {
-            let c: f64 = h.at(0, 0);
-            let n: f64 = 0.25 * (h.at(-1, 0) + h.at(1, 0) + h.at(0, -1) + h.at(0, 1));
+        fn height_erode(h: stencil<f32, 2, 1>, out: write_store<f32, 2>, k: f32) {
+            let c: f32 = h.at(0, 0);
+            let n: f32 = 0.25 * (h.at(-1, 0) + h.at(1, 0) + h.at(0, -1) + h.at(0, 1));
             out.write(c + k * (n - c));
         }
     )";
@@ -70,7 +70,7 @@ static void test_compute_spirv_and_ptx() {
     assert(!k->spirv.words.empty());
     // Verify SPIR-V magic word 0x07230203
     assert(k->spirv.words[0] == 0x07230203u);
-    assert(k->spirv_disassembly.find("OpCapability Float64") != std::string::npos);
+    assert(k->spirv_disassembly.find("OpCapability Float64") == std::string::npos);
     assert(k->spirv_disassembly.find("OpEntryPoint GLCompute") != std::string::npos);
     assert(!k->ptx.empty());
     assert(k->ptx.find(".visible .entry height_erode") != std::string::npos);
@@ -370,9 +370,9 @@ static void test_buffers() {
     assert(count_op(indexed_light->spirv_disassembly, "OpLoad") == 3);
 }
 
-// Render math: a fragment stage's f32 transcendentals are the device's own
-// instructions and its arithmetic may fuse; a compute kernel's are the
-// CPU-exact polynomials under NoContraction unless it is marked @fast.
+// Render math: f32 transcendentals are the device's own instructions and
+// arithmetic may fuse, in every stage; a kernel marked @precise takes the
+// CPU-exact polynomials under NoContraction instead.
 static void test_render_math() {
     const char* src = R"(
         struct Cam { view: mat4f, proj: mat4f, nrm: mat3f, eye: vec4f }
@@ -385,10 +385,10 @@ static void test_render_math() {
             let n: vec3f = (rot * fc.xyz) + (fc.xyz * transpose(rot));
             set_frag_color(clip + vec4<f32>(n + vec3f(a), a * k + 1.0));
         }
-        @kernel @grid(1) fn exact(out: write_store<f32, 1>, k: f32) {
+        @kernel @grid(1) @precise fn exact(out: write_store<f32, 1>, k: f32) {
             out.write(sin(k) * k + 1.0);
         }
-        @kernel @grid(1) @fast fn quick(out: write_store<f32, 1>, k: f32) {
+        @kernel @grid(1) fn quick(out: write_store<f32, 1>, k: f32) {
             out.write(sin(k) * k + 1.0);
         }
     )";

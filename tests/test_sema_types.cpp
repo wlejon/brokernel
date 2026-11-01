@@ -38,7 +38,7 @@ static void test_f64_precision_discipline() {
     // 3. Explicit casts (`as f32`, `as f64`, `f32(x)`, `f64(x)`) and contextual literals succeed
     {
         const char* src = R"(
-            @kernel fn explicit_ok(a: f64, b: f32) -> f64 {
+            @kernel @cpu fn explicit_ok(a: f64, b: f32) -> f64 {
                 let a_scaled: f64 = a * 2.5 + 1.0;
                 let b_wide: f64 = b as f64;
                 let combined: f64 = a_scaled + f64(b) + b_wide;
@@ -60,7 +60,7 @@ static void test_stencil_validation() {
     // 1. Valid stencil accesses within declared radius R = 1
     {
         const char* src = R"(
-            @kernel fn stencil_ok(h: stencil<f64, 2, 1>, out: write_store<f64, 2>) {
+            @kernel @cpu fn stencil_ok(h: stencil<f64, 2, 1>, out: write_store<f64, 2>) {
                 let c = h.at(0, 0);
                 let l = h.at(-1, 0);
                 let r = h[1, 0];
@@ -266,7 +266,7 @@ static void test_64bit_grid_indexing_and_bitcast() {
                 }
             }
 
-            @kernel fn test_intrinsics(buf: store<f32, 1>, idx: i64, val: f32) -> i32 {
+            @kernel @cpu fn test_intrinsics(buf: store<f32, 1>, idx: i64, val: f32) -> i32 {
                 buf[idx] = val;
                 let read_back: f32 = buf[idx];
                 return type_tag<f32>(read_back) + type_tag<f64>(1.0 as f64);

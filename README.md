@@ -23,7 +23,7 @@ brass MIR (KernelBuilder)
 
 - **brass** does the code generation. Its SPIR-V target already lowers MIR
   built with `KernelBuilder` (the same MIR its PTX target takes) to verified
-  SPIR-V 1.5/1.6 for the compute, vertex and fragment stages, with f64
+  SPIR-V 1.5/1.6 for the compute, vertex and fragment stages
   (brass `docs/spirv_backend_design.md`, `docs/ptx_kernel_authoring.md`).
   brokernel is a frontend over it, as bronze (JavaScript) and brasslua (Lua)
   are frontends over brass's CPU backends.
@@ -39,30 +39,36 @@ general graphics:
   world's own fields) by module, not by textual include.
 - **Generics.** One noise or filter written once over its dimension and
   scalar type.
-- **f64 as a first-class scalar.** Positions on an Earth-radius body need
-  it; a kernel says where precision is needed and where f32 suffices.
+- **GPU code is f32; f64 is the CPU's.** A consumer GPU runs f64 at a
+  small fraction of its f32 rate, and some (MoltenVK) have none, so a kernel
+  built for the GPU that reaches f64 is a compile error at the f64 that
+  reaches it (`f64 in GPU kernel 'k': ...`). Precision far from the origin
+  comes from anchors: the host computes, in f64, a position near the work
+  (a tile's centre, the camera) and hands the GPU f32 offsets from it. A
+  kernel marked `@cpu` has no GPU build and may use f64 freely (a point
+  query about an Earth-radius body, a planet's height for physics); its
+  `dispatch_gpu` fails naming it. A plain function compiled as an entry
+  that reaches f64 just has no GPU build.
 - **Grids, stencils and stores as language constructs.** A kernel is
   written per point of a grid; neighbour reads are stencils the compiler
   sees; the stores it reads and writes are typed. That is what lets one
   source become both a GPU dispatch and a CPU point query, and lets the
   engine schedule and cache what a kernel makes.
-- **The same semantics on both targets.** A kernel's CPU and GPU builds
-  run the same operations:
-  - The GPU build is emitted with brass's `precise_float`, so the driver
-    rounds every float add, mul and div as the CPU does. It may not fuse
-    them into FMAs or re-associate them.
-  - The transcendentals (`sin` through `atan2`, `exp`/`log` and their base-2
-    forms, `pow`, the hyperbolics) are lowered as MIR arithmetic
-    (`src/lowering_math.cpp`), not called. That avoids both the host's libm
-    and the driver's GLSL.std.450, and covers f64, which GLSL.std.450 has no
-    transcendentals for.
-  - f64 is within a few ulp of libm, and f32 uses Cephes' single-precision
-    polynomials.
-  - Render math is the exception: a vertex or fragment stage, and a
-    kernel marked `@fast`, is emitted without `precise_float`, so the driver
-    may fuse and reorder, and its f32 transcendentals are the device's own
-    GLSL.std.450 instructions. A `@fast` kernel's CPU build keeps the exact
-    polynomials, so its two builds agree only to the device's precision.
+- **Fast math by default; exact on request.** Kernels are for games, so
+  every stage takes the hardware's fast path:
+  - The GPU build may fuse multiply-adds and reorder, f32 `sin`, `cos`,
+    `exp`, `log`, `pow` and their kin are the device's own GLSL.std.450
+    instructions, and `inverseSqrt` / `normalize` use its inverse square
+    root. The CPU build fuses multiply-adds where the host has FMA. The two
+    builds agree to the device's precision, not bit for bit.
+  - A kernel marked `@precise` is the exact path: its GPU build is emitted
+    with brass's `precise_float` (every float add, mul and div rounded as
+    the CPU rounds it; no fusing, no re-association), its CPU build does not
+    fuse, and its transcendentals are MIR arithmetic
+    (`src/lowering_math.cpp`, Cephes' single-precision polynomials in f32)
+    rather than the driver's, so its two builds agree to the bit.
+  - f64 (CPU only) always takes the MIR transcendentals, within a few ulp of
+    libm; GLSL.std.450 has none for it.
   - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
     fails, with `ran_gpu` false, when there is no Vulkan device.
 - **A store access never leaves its store.** A kernel's store takes its
