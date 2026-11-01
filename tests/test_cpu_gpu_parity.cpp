@@ -113,7 +113,7 @@ static void test_stencil_diffusion_f64_and_point_query() {
     const char* src = R"(
         from std::filter import laplacian2d;
 
-        @kernel @cpu @precise @grid(2)
+        @kernel @cpu @grid(2)
         fn diffuse_height(h: stencil<f64, 2, 1>, out: write_store<f64, 2>, dt: f64) -> f64 {
             let next_h: f64 = h.at(0, 0) + dt * laplacian2d(h);
             out.write(next_h);
@@ -194,7 +194,7 @@ static void test_3d_voxel_and_control_flow_parity() {
             return acc;
         }
 
-        @kernel @precise @grid(3)
+        @kernel @grid(3)
         fn fill_voxels(out: write_store<f32, 3>, scale: f32, iters: i32) {
             let x = grid_x() as f32;
             let y = grid_y() as f32;
@@ -317,7 +317,7 @@ static void test_vector_grid_lanes() {
 // most (64), against the clamped reads on the host and on the GPU.
 static void test_vector_stencil_edges() {
     const char* src = R"(
-        @kernel @precise @grid(2)
+        @kernel @grid(2)
         fn k_reach(g: grid<2>, s: stencil<f32, 2>, out: write_store<f32, 2>) {
             let x = g.x();
             let y = g.y();
@@ -371,7 +371,7 @@ static void test_vector_stencil_edges() {
 // instead: a store too small for the grid is refused.
 static void test_store_bounds() {
     const char* src = R"(
-        @kernel @precise @grid(1)
+        @kernel @grid(1)
         fn k_bounds(g: grid<1>, table: read_store<f32, 1>, idx: read_store<i32, 1>,
                     out_a: write_store<f32, 1>, out_b: write_store<f32, 1>,
                     scatter: write_store<f32, 1>, edge: write_store<f32, 1>, tail: write_store<f32, 1>) {
@@ -467,7 +467,7 @@ static void test_vector_bool_masks() {
         const CONST_TRUE: bool = 2 < 5;
         const CONST_FALSE: bool = 2 > 5;
 
-        @kernel @precise @grid(1)
+        @kernel @grid(1)
         fn k_bool_masks(g: grid<1>, out: write_store<f32, 1>, flag_on: bool, flag_off: bool) -> f32 {
             let x = g.x();
             let a = f32(x) + 10.0;
@@ -558,7 +558,7 @@ static void test_assignment_targets_parity() {
             b: Branch,
         }
 
-        @kernel @precise @grid(1)
+        @kernel @grid(1)
         fn k_assign_targets(g: grid<1>, out: write_store<f32, 1>) -> f32 {
             let x = g.x();
             let dyn_i = x % 4;
@@ -662,7 +662,7 @@ static void test_assignment_targets_parity() {
 
 static void test_atomics_parity() {
     const char* src = R"(
-        @kernel @precise @grid(1)
+        @kernel @grid(1)
         fn k_atomics(g: grid<1>,
                      s_i32: rw_store<i32, 1>,
                      s_u32: rw_store<u32, 1>,
@@ -767,7 +767,7 @@ static void test_lowering_quirks_parity() {
             return (x & 1) == 0;
         }
 
-        @kernel @precise fn k_lowering_quirks(
+        @kernel fn k_lowering_quirks(
             and_store: rw_store<i32, 1>,
             and_count: rw_store<i32, 1>,
             or_store: rw_store<i32, 1>,

@@ -371,8 +371,7 @@ static void test_buffers() {
 }
 
 // Render math: f32 transcendentals are the device's own instructions and
-// arithmetic may fuse, in every stage; a kernel marked @precise takes the
-// CPU-exact polynomials under NoContraction instead.
+// arithmetic may fuse, in every stage.
 static void test_render_math() {
     const char* src = R"(
         struct Cam { view: mat4f, proj: mat4f, nrm: mat3f, eye: vec4f }
@@ -384,9 +383,6 @@ static void test_render_math() {
             let rot: mat3f = mat3f(cam.view) * cam.nrm;
             let n: vec3f = (rot * fc.xyz) + (fc.xyz * transpose(rot));
             set_frag_color(clip + vec4<f32>(n + vec3f(a), a * k + 1.0));
-        }
-        @kernel @grid(1) @precise fn exact(out: write_store<f32, 1>, k: f32) {
-            out.write(sin(k) * k + 1.0);
         }
         @kernel @grid(1) fn quick(out: write_store<f32, 1>, k: f32) {
             out.write(sin(k) * k + 1.0);
@@ -403,9 +399,8 @@ static void test_render_math() {
         return nullptr;
     };
     const auto* fs = find("shade");
-    const auto* exact = find("exact");
     const auto* quick = find("quick");
-    assert(fs && exact && quick);
+    assert(fs && quick);
     assert(fs->spirv.descriptors.size() == 1 && fs->spirv.descriptors[0].bytes == 192);
     const std::string& d = fs->spirv_disassembly;
     assert(d.find("OpTypeMatrix") != std::string::npos);
@@ -431,7 +426,7 @@ static void test_render_math() {
         }
         return false;
     };
-    assert(!exact_math(d) && exact_math(exact->spirv_disassembly) && !has_ext(exact->spirv_disassembly, 13));
+    assert(!exact_math(d));
     assert(!exact_math(quick->spirv_disassembly) && has_ext(quick->spirv_disassembly, 13) && quick->has_cpu_build());
 }
 

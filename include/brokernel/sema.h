@@ -108,13 +108,6 @@ struct CheckedFunction {
     bool uses_barriers_or_shared = false;
     bool uses_descriptors = false;     // a texture or buffer parameter at a descriptor
     bool uses_textures = false;        // an image or sampler at a descriptor: GPU only, no CPU build
-    // The hardware's fast math, unless the kernel is marked @precise: on the
-    // GPU the driver may fuse and reorder float arithmetic and the f32
-    // transcendentals are the device's own (GLSL.std.450); on the CPU float
-    // multiply-adds fuse into FMAs. @precise rounds every operation as MIR
-    // does on both targets, with the polynomial transcendentals, so its CPU
-    // and GPU builds agree.
-    bool fast_math = true;
     // @cpu: a kernel with no GPU build (it may use f64).
     bool cpu_only = false;
     int32_t max_stencil_radius = 0;

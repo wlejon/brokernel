@@ -1,7 +1,6 @@
 // The transcendentals (lowering_math.cpp) against the host's libm, on the CPU
-// build and on the GPU build: each function over a sweep of its domain plus
-// its edge values (0, +-inf, NaN, out of domain), in f32 and (CPU only) f64. Exits 77
-// (skipped) after the CPU checks when there is no Vulkan device.
+// build: each function over a sweep of its domain plus its edge values (0,
+// +-inf, NaN, out of domain), in f32 and f64.
 
 #include "brokernel/brokernel.h"
 
@@ -18,7 +17,6 @@ using namespace brokernel;
 namespace {
 
 int g_failures = 0;
-bool g_have_gpu = false;
 
 struct Fn {
     const char* name;
@@ -62,9 +60,9 @@ template <typename T>
 void check_fn(const Fn& f) {
     const bool f64 = sizeof(T) == 8;
     const char* tn = f64 ? "f64" : "f32";
-    // f64 is CPU only (@cpu); the f32 kernel is @precise, the exact path a
-    // GPU build must match the CPU's to.
-    std::string src = std::string("@kernel @grid(1) ") + (f64 ? "@cpu" : "@precise") + "\nfn k(xs: read_store<" + tn +
+    // The CPU build's transcendentals (MIR arithmetic) against libm; a GPU
+    // build's f32 ones are the device's own instructions, at its precision.
+    std::string src = std::string("@kernel @grid(1) ") + (f64 ? "@cpu" : "") + "\nfn k(xs: read_store<" + tn +
                       ", 1>, " +
                       (f.arity == 2 ? std::string("ys: read_store<") + tn + ", 1>, " : std::string()) +
                       "out: write_store<" + tn + ", 1>) {\n    out.write(" + f.name + "(xs.read()" +
@@ -93,15 +91,14 @@ void check_fn(const Fn& f) {
     const double rel = f64 ? f.rel64 : f.rel32;
     const double abs = f64 ? f.abs64 : f.abs32;
 
-    auto run = [&](bool gpu, std::vector<T>& out) {
+    auto run = [&](std::vector<T>& out) {
         std::vector<KernelArg> args = {KernelArg::store(xs)};
         if (f.arity == 2) args.push_back(KernelArg::store(ys));
         args.push_back(KernelArg::store(out));
         std::string err;
-        bool ok = gpu ? k->dispatch_gpu(GridShape(uint32_t(xs.size())), args, nullptr, &err)
-                      : k->dispatch_cpu(GridShape(uint32_t(xs.size())), args, nullptr, &err);
+        bool ok = k->dispatch_cpu(GridShape(uint32_t(xs.size())), args, nullptr, &err);
         if (!ok) {
-            std::cerr << f.name << "<" << tn << "> " << (gpu ? "GPU" : "CPU") << " dispatch failed: " << err << "\n";
+            std::cerr << f.name << "<" << tn << "> CPU dispatch failed: " << err << "\n";
             ++g_failures;
         }
         return ok;
@@ -126,17 +123,12 @@ void check_fn(const Fn& f) {
     };
 
     std::vector<T> cpu(xs.size(), T(-12345));
-    if (run(false, cpu)) verify("CPU", cpu);
-    if (g_have_gpu && !f64) {
-        std::vector<T> gpu(xs.size(), T(-12345));
-        if (run(true, gpu)) verify("GPU", gpu);
-    }
+    if (run(cpu)) verify("CPU", cpu);
 }
 
 } // namespace
 
 int main() {
-    g_have_gpu = brass::gpu::vulkan_available();
     const std::vector<Fn> fns = {
         {"sin", 1, -60.0, 60.0, false, 4e-16, 2e-7, 4e-15, 4e-6, [](double x, double) { return std::sin(x); }},
         {"cos", 1, -60.0, 60.0, false, 4e-16, 2e-7, 4e-15, 4e-6, [](double x, double) { return std::cos(x); }},
@@ -165,10 +157,6 @@ int main() {
         std::cerr << "test_math_parity: " << g_failures << " failure(s)\n";
         return 1;
     }
-    if (!g_have_gpu) {
-        std::cout << "test_math_parity: CPU passed; no Vulkan device, GPU skipped\n";
-        return 77;
-    }
-    std::cout << "test_math_parity: ALL PASSED (CPU + GPU)\n";
+    std::cout << "test_math_parity: ALL PASSED\n";
     return 0;
 }

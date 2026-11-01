@@ -697,7 +697,6 @@ CompileResult Compiler::compile_source(
                 spv_opts.local_size_z = ck.local_size[2];
                 spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
                 spv_opts.spirv_version = opts.spirv_version;
-                spv_opts.precise_float = !fn->fast_math;
 
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
                 if (opts.emit_spirv_disassembly) {
@@ -730,7 +729,7 @@ CompileResult Compiler::compile_source(
                 cpu->options.opt_level = opts.opt_level;
                 cpu->options.enable_optimizations = (opts.opt_level > 0);
                 // Fast math fuses multiply-adds where the host has FMA.
-                cpu->options.enable_fma = fn->fast_math && brass::host_has_fma();
+                cpu->options.enable_fma = brass::host_has_fma();
                 cpu->options.enable_parallel = false;
                 cpu->options.enable_superopt = false;
                 cpu->options.enable_smt_guard_elim = false;

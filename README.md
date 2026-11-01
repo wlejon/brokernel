@@ -54,21 +54,16 @@ general graphics:
   sees; the stores it reads and writes are typed. That is what lets one
   source become both a GPU dispatch and a CPU point query, and lets the
   engine schedule and cache what a kernel makes.
-- **Fast math by default; exact on request.** Kernels are for games, so
-  every stage takes the hardware's fast path:
+- **Fast math.** Kernels are for games, so every stage takes the
+  hardware's fast path:
   - The GPU build may fuse multiply-adds and reorder, f32 `sin`, `cos`,
     `exp`, `log`, `pow` and their kin are the device's own GLSL.std.450
     instructions, and `inverseSqrt` / `normalize` use its inverse square
     root. The CPU build fuses multiply-adds where the host has FMA. The two
     builds agree to the device's precision, not bit for bit.
-  - A kernel marked `@precise` is the exact path: its GPU build is emitted
-    with brass's `precise_float` (every float add, mul and div rounded as
-    the CPU rounds it; no fusing, no re-association), its CPU build does not
-    fuse, and its transcendentals are MIR arithmetic
-    (`src/lowering_math.cpp`, Cephes' single-precision polynomials in f32)
-    rather than the driver's, so its two builds agree to the bit.
-  - f64 (CPU only) always takes the MIR transcendentals, within a few ulp of
-    libm; GLSL.std.450 has none for it.
+  - On the CPU the transcendentals are MIR arithmetic
+    (`src/lowering_math.cpp`: Cephes' single-precision polynomials for f32,
+    within a few ulp of libm for f64).
   - `compare_cpu_gpu` dispatches both builds and compares what they wrote. It
     fails, with `ran_gpu` false, when there is no Vulkan device.
 - **A store access never leaves its store.** A kernel's store takes its

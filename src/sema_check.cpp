@@ -893,7 +893,6 @@ const CheckedFunction* SemaContext::instantiate_function(
         cfn.stage = Stage::Compute;
         if (cfn.is_entry_kernel) cfn.required_stage = Stage::Compute;
     }
-    cfn.fast_math = !decl.has_attribute("precise");
     cfn.cpu_only = decl.has_attribute("cpu");
     if (const Attribute* grid_attr = decl.find_attribute("grid")) {
         if (!grid_attr->int_args.empty()) {

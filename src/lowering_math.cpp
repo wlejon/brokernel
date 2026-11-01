@@ -606,7 +606,7 @@ brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass
     }
     if (name == "sqrt") return b.build_sqrt(x);
     if (name == "rsqrt" || name == "inversesqrt") {
-        if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) return b.build_call("rsqrtf", brass::Type::f32(), {x});
+        if (is_gpu && sk == ScalarKind::F32) return b.build_call("rsqrtf", brass::Type::f32(), {x});
         return b.build_sdiv(one, b.build_sqrt(x));
     }
     if (name == "floor") return b.build_floor(x);
@@ -625,7 +625,7 @@ brass::Value* MirBodyLowerer::lower_scalar_math_1(const std::string& name, brass
         brass::Value* c = (sk == ScalarKind::F64) ? b.build_fconst_f64(kDegToRad) : b.build_fconst_f32(static_cast<float>(kDegToRad));
         return b.build_mul(x, c);
     }
-    if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32) {
+    if (is_gpu && sk == ScalarKind::F32) {
         if (brass::Value* t = lower_native_math_1(name, x)) return t;
     }
     if (brass::Value* t = lower_transcendental_1(b, name, x, sk)) return t;
@@ -657,7 +657,7 @@ brass::Value* MirBodyLowerer::lower_scalar_math_2(const std::string& name, brass
         if (is_fp) return b.build_fmax(a, c);
         return b.build_select(is_unsigned ? b.build_ugt(a, c) : b.build_sgt(a, c), a, c);
     }
-    if (is_gpu && root_fn.fast_math && sk == ScalarKind::F32 && (name == "pow" || name == "atan2")) {
+    if (is_gpu && sk == ScalarKind::F32 && (name == "pow" || name == "atan2")) {
         return b.build_call(name == "pow" ? "powf" : "atan2f", brass::Type::f32(), {a, c});
     }
     if (brass::Value* t = lower_transcendental_2(b, name, a, c, sk)) return t;

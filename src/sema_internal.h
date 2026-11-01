@@ -151,7 +151,6 @@ struct FnCheckState {
         }
         fn.required_stage = want;
         fn.stage = want;
-        if (want != Stage::Compute) fn.fast_math = true;
     }
     Type check_expr(Expr* e, std::optional<Type> expected = std::nullopt);
     void check_stmt(Stmt* s);
