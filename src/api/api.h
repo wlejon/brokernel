@@ -72,7 +72,9 @@ public:
     /// A buffer of `bytes` bytes, reading zero.
     virtual std::shared_ptr<GpuBuffer> createBuffer(size_t bytes, std::string* err) = 0;
     /// `kernel`'s SPIR-V as a pipeline; null (and `err`) when the device
-    /// cannot run it.
+    /// cannot run it. A host may build it on a thread of its own, its first
+    /// dispatch waiting for it (and failing with the build's error); the API
+    /// makes a grid kernel's program with its handle (KernelModule.kernel).
     virtual std::shared_ptr<GpuProgram> createProgram(const CompiledKernel& kernel, std::string* err) = 0;
     /// One dispatch of `program` (made from `kernel`).
     virtual bool dispatch(GpuProgram& program, const CompiledKernel& kernel, const GpuLaunch& launch,

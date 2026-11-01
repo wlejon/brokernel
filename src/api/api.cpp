@@ -31,7 +31,7 @@ struct ModuleHandle {
 
 struct KernelHandle {
     std::shared_ptr<const CompiledKernel> kernel;  // aliases its CompileResult
-    std::shared_ptr<GpuProgram> program;           // its pipeline, made at the first dispatch
+    std::shared_ptr<GpuProgram> program;           // its pipeline, made with the handle (else at the first dispatch)
 };
 
 struct BufferHandle {
@@ -525,6 +525,13 @@ void decorateModule(ev::ObjectBuilder& b) {
         if (!k) return ev::throwError("KernelModule.kernel: no kernel '" + name + "'");
         auto handle = std::make_unique<KernelHandle>();
         handle->kernel = std::shared_ptr<const CompiledKernel>(h->result, k);
+        // A grid kernel's program made now: a device builds its pipeline
+        // while the page goes on, not in the frame of its first dispatch.
+        // One that fails is made again there, which says why.
+        if (k->grid_dim > 0 && !k->spirv.words.empty() && t_device && t_device->available()) {
+            std::string err;
+            handle->program = t_device->createProgram(*k, &err);
+        }
         return g_kernelClass.createInstance(std::move(handle));
     });
     b.accessor("kernels", [](Value self, std::span<const Value>) -> Value {
