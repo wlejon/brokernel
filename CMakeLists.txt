@@ -34,6 +34,9 @@ add_library(brokernel STATIC
     src/lexer.cpp
     src/parser.cpp
     src/stdlib_modules.cpp
+    src/stdlib_noise_core.cpp
+    src/stdlib_noise_3d.cpp
+    src/stdlib_noise_fractal_warp.cpp
     src/sema.cpp
     src/sema_const.cpp
     src/sema_check.cpp
@@ -68,7 +71,13 @@ if(BROKERNEL_BUILD_TESTS)
 endif()
 
 if(BROKERNEL_BUILD_BENCH)
-    add_executable(bench_hillclimb bench/bench_hillclimb.cpp tests/no_dialogs.cpp)
+    add_executable(bench_hillclimb
+        bench/bench_hillclimb.cpp
+        bench/bench_hillclimb_common.cpp
+        bench/bench_hillclimb_glsl_noise.cpp
+        bench/bench_hillclimb_stencil.cpp
+        tests/no_dialogs.cpp
+    )
     target_link_libraries(bench_hillclimb PRIVATE brokernel FastNoise)
     target_compile_definitions(bench_hillclimb PRIVATE
         BROKERNEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
