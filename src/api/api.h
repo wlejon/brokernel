@@ -53,6 +53,8 @@ public:
     /// Copy `n` bytes at byte `offset` into `out`, after every dispatch so
     /// far (blocks until they are done).
     virtual bool read(size_t offset, void* out, size_t n, std::string* err) = 0;
+    /// Release the buffer's GPU memory once in-flight work finishes.
+    virtual void destroy() {}
 };
 
 /// A compiled kernel as the host's pipeline (GpuDevice::createProgram).
@@ -71,6 +73,8 @@ public:
     virtual bool available() const = 0;
     /// A buffer of `bytes` bytes, reading zero.
     virtual std::shared_ptr<GpuBuffer> createBuffer(size_t bytes, std::string* err) = 0;
+    /// Reclaim GPU memory from destroyed buffers whose work has finished.
+    virtual void reclaim() {}
     /// `kernel`'s SPIR-V as a pipeline; null (and `err`) when the device
     /// cannot run it. A host may build it on a thread of its own, its first
     /// dispatch waiting for it (and failing with the build's error); the API

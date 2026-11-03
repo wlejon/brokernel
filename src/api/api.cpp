@@ -24,6 +24,28 @@ ev::HostClass g_bufferClass;
 
 // The device this thread's realms dispatch on (setGpuDevice).
 thread_local std::shared_ptr<GpuDevice> t_device;
+// GPU buffer bytes allocated since the last collection, less bytes explicitly
+// released by KernelBuffer.destroy().
+thread_local size_t t_uncollectedBufferBytes = 0;
+constexpr size_t kGcPressureBytes = 64ull * 1024 * 1024;
+
+void collectAndReclaim() {
+    t_uncollectedBufferBytes = 0;
+    ev::collectGarbage();
+    if (t_device) t_device->reclaim();
+}
+
+std::shared_ptr<GpuBuffer> allocateBuffer(size_t bytes, std::string* err) {
+    if (t_uncollectedBufferBytes + bytes >= kGcPressureBytes) collectAndReclaim();
+    std::shared_ptr<GpuBuffer> b = t_device->createBuffer(bytes, err);
+    if (!b) {
+        collectAndReclaim();
+        if (err) err->clear();
+        b = t_device->createBuffer(bytes, err);
+    }
+    if (b) t_uncollectedBufferBytes += bytes;
+    return b;
+}
 
 struct ModuleHandle {
     std::shared_ptr<const CompileResult> result;
@@ -141,8 +163,10 @@ public:
             if (!isPassed(p)) continue;
             const Value v = js[i];
             if (isStore(p) && gpu) {
-                std::shared_ptr<GpuBuffer> b = bufferOf(v);
-                if (!b) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a KernelBuffer");
+                auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(v));
+                if (!h) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a KernelBuffer");
+                if (!h->buffer) ev::throwError(what + ": '" + p.name + "' is a destroyed KernelBuffer");
+                std::shared_ptr<GpuBuffer> b = h->buffer;
                 args_[i] = KernelArg::device(b->address(), b->bytes(), b->capacity());
                 buffers_.push_back(std::move(b));
             } else if (isStore(p)) {
@@ -363,7 +387,7 @@ Value js_dispatch(Value self, std::span<const Value> args) {
     }
     std::shared_ptr<GpuBuffer> returns;
     if (const size_t bytes = k.gpu_return_bytes(shape)) {
-        returns = t_device->createBuffer(bytes, &err);
+        returns = allocateBuffer(bytes, &err);
         if (!returns) return ev::throwError("Kernel.dispatch: " + err);
     }
     GpuLaunch launch;
@@ -387,6 +411,7 @@ size_t offsetArg(std::span<const Value> args, size_t i, const std::string& what)
 GpuBuffer* unwrapBuffer(Value self, const std::string& what) {
     auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
     if (!h) ev::throwTypeError(what + ": invalid receiver");
+    if (!h->buffer) ev::throwError(what + ": the KernelBuffer has been destroyed");
     return h->buffer.get();
 }
 
@@ -422,12 +447,29 @@ Value js_bufferRead(Value self, std::span<const Value> args) {
     return args[0];
 }
 
+// buffer.destroy(): releases the buffer's GPU memory once in-flight work
+// finishes; any later use of the buffer throws.
+Value js_bufferDestroy(Value self, std::span<const Value>) {
+    auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
+    if (!h) return ev::throwTypeError("KernelBuffer.destroy: invalid receiver");
+    if (h->buffer) {
+        const size_t bytes = h->buffer->bytes();
+        t_uncollectedBufferBytes = t_uncollectedBufferBytes > bytes ? t_uncollectedBufferBytes - bytes : 0;
+        h->buffer->destroy();
+        h->buffer.reset();
+    }
+    return ev::undefined();
+}
+
 void decorateBuffer(ev::ObjectBuilder& b) {
     b.def("write", 1, js_bufferWrite);
     b.def("read", 1, js_bufferRead);
+    b.def("destroy", 0, js_bufferDestroy);
     b.accessor("byteLength", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
-        return h ? ev::fromDouble(static_cast<double>(h->buffer->bytes())) : ev::undefined();
+        if (!h) return ev::undefined();
+        if (!h->buffer) return ev::throwError("KernelBuffer.byteLength: the KernelBuffer has been destroyed");
+        return ev::fromDouble(static_cast<double>(h->buffer->bytes()));
     });
 }
 
@@ -451,7 +493,7 @@ Value js_createBuffer(Value, std::span<const Value> args) {
         return ev::throwTypeError("bro.kernel.createBuffer: takes a byte length or a typed array");
     }
     std::string err;
-    std::shared_ptr<GpuBuffer> buffer = t_device->createBuffer(bytes, &err);
+    std::shared_ptr<GpuBuffer> buffer = allocateBuffer(bytes, &err);
     if (!buffer) return ev::throwError("bro.kernel.createBuffer: " + err);
     if (fromArray && bytes > 0) {
         const auto info = ev::typedArrayInfo(args[0]);
@@ -647,7 +689,10 @@ void installKernel() {
     if (t_device) b.def("createBuffer", 1, js_createBuffer);
 }
 
-void setGpuDevice(std::shared_ptr<GpuDevice> device) { t_device = std::move(device); }
+void setGpuDevice(std::shared_ptr<GpuDevice> device) {
+    t_device = std::move(device);
+    t_uncollectedBufferBytes = 0;
+}
 
 std::shared_ptr<const CompiledKernel> kernelOf(Value v) {
     auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(v));
