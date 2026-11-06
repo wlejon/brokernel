@@ -1,6 +1,7 @@
 #include "brokernel/module_loader.h"
 #include "stdlib_noise_parts.h"
 
+#include <algorithm>
 #include <fstream>
 #include <mutex>
 #include <sstream>
