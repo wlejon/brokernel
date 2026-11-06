@@ -27,21 +27,18 @@ public:
         while (!is_at_end()) {
             std::vector<Attribute> attrs = parse_attributes();
             bool is_pub = match(TokenKind::KwPub);
+            if (check(TokenKind::At)) {
+                auto more = parse_attributes();
+                attrs.insert(attrs.end(), std::make_move_iterator(more.begin()), std::make_move_iterator(more.end()));
+            }
             if (check(TokenKind::KwImport) || check(TokenKind::KwFrom)) {
-                if (!attrs.empty()) {
-                    error(attrs.front().span, "attributes are not allowed on import declarations");
-                }
-                mod->imports.push_back(parse_import());
+                if (!attrs.empty()) error(attrs.front().span, "attributes are not allowed on import declarations");
+                mod->imports.push_back(parse_import(is_pub));
             } else if (check(TokenKind::KwStruct)) {
-                if (!attrs.empty()) {
-                    error(attrs.front().span, "attributes are not allowed on struct declarations");
-                }
+                if (!attrs.empty()) error(attrs.front().span, "attributes are not allowed on struct declarations");
                 mod->structs.push_back(parse_struct(is_pub));
             } else if (check(TokenKind::KwConst)) {
-                if (!attrs.empty()) {
-                    error(attrs.front().span, "attributes are not allowed on const declarations");
-                }
-                mod->consts.push_back(parse_const(is_pub));
+                mod->consts.push_back(parse_const(is_pub, std::move(attrs)));
             } else if (check(TokenKind::KwFn)) {
                 mod->functions.push_back(parse_fn(is_pub, std::move(attrs)));
             } else if (check(TokenKind::KwVar) || check(TokenKind::KwShared)) {
@@ -143,24 +140,20 @@ private:
         return attrs;
     }
     // ---- Imports --------------------------------------------------------------
-    ImportDecl parse_import() {
+    ImportDecl parse_import(bool is_pub = false) {
         ImportDecl imp;
+        imp.is_pub = is_pub;
         imp.span = peek().span;
         if (match(TokenKind::KwFrom)) {
-            // `from std::noise import fbm, simplex2d;` or `from "path.bk" import *;`
-            if (check(TokenKind::StringLit)) {
-                imp.file_path = advance().text;
-            } else {
-                imp.module_path = parse_ident_path("module name");
-            }
+            if (check(TokenKind::StringLit)) imp.file_path = advance().text;
+            else imp.module_path = parse_ident_path("module name");
             consume(TokenKind::KwImport, "'import' in from-import declaration");
             if (match(TokenKind::Star)) {
                 imp.wildcard = true;
             } else {
                 bool braced = match(TokenKind::LBrace);
                 do {
-                    const Token& sym = consume(TokenKind::Ident, "imported symbol name");
-                    imp.symbols.push_back(sym.text);
+                    imp.symbols.push_back(consume(TokenKind::Ident, "imported symbol name").text);
                 } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
                 if (braced) consume(TokenKind::RBrace, "'}'");
             }
@@ -171,30 +164,19 @@ private:
         consume(TokenKind::KwImport, "'import'");
         if (check(TokenKind::StringLit)) {
             imp.file_path = advance().text;
-            if (match(TokenKind::KwAs)) {
-                imp.alias = consume(TokenKind::Ident, "module alias").text;
-            } else {
-                imp.wildcard = true;
-            }
+            if (match(TokenKind::KwAs)) imp.alias = consume(TokenKind::Ident, "module alias").text;
+            else imp.wildcard = true;
             match(TokenKind::Semi);
             imp.span = SourceSpan::merge(imp.span, previous().span);
             return imp;
         }
-        // `import std::noise;`, `import noise::{fbm, perlin};`, `import noise::*;`, `import noise as n;`
-        const Token& first = consume(TokenKind::Ident, "module name");
-        imp.module_path.push_back(first.text);
+        imp.module_path.push_back(consume(TokenKind::Ident, "module name").text);
         while (match(TokenKind::ColonColon)) {
-            if (match(TokenKind::Star)) {
-                imp.wildcard = true;
-                break;
-            }
+            if (match(TokenKind::Star)) { imp.wildcard = true; break; }
             if (match(TokenKind::LBrace)) {
                 while (!check(TokenKind::RBrace) && !is_at_end()) {
-                    if (match(TokenKind::Star)) {
-                        imp.wildcard = true;
-                    } else {
-                        imp.symbols.push_back(consume(TokenKind::Ident, "imported symbol").text);
-                    }
+                    if (match(TokenKind::Star)) imp.wildcard = true;
+                    else imp.symbols.push_back(consume(TokenKind::Ident, "imported symbol").text);
                     if (!match(TokenKind::Comma)) break;
                 }
                 consume(TokenKind::RBrace, "'}' after import list");
@@ -202,9 +184,7 @@ private:
             }
             imp.module_path.push_back(consume(TokenKind::Ident, "module path segment").text);
         }
-        if (match(TokenKind::KwAs)) {
-            imp.alias = consume(TokenKind::Ident, "module alias").text;
-        }
+        if (match(TokenKind::KwAs)) imp.alias = consume(TokenKind::Ident, "module alias").text;
         match(TokenKind::Semi);
         imp.span = SourceSpan::merge(imp.span, previous().span);
         return imp;
@@ -337,14 +317,18 @@ private:
         s.span = SourceSpan::merge(s.span, rb.span);
         return s;
     }
-    ConstDecl parse_const(bool is_pub) {
+    ConstDecl parse_const(bool is_pub, std::vector<Attribute> attrs = {}) {
         ConstDecl c;
         c.is_pub = is_pub;
-        c.span = consume(TokenKind::KwConst, "'const'").span;
-        c.name = consume(TokenKind::Ident, "constant name").text;
-        if (match(TokenKind::Colon)) {
-            c.type = parse_type();
+        for (const auto& a : attrs) {
+            if (a.name == "knob") c.is_knob = true;
+            else error(a.span, "attributes other than '@knob' are not allowed on const declarations");
         }
+        c.attributes = std::move(attrs);
+        c.span = consume(TokenKind::KwConst, "'const'").span;
+        if (!c.attributes.empty()) c.span = SourceSpan::merge(c.attributes.front().span, c.span);
+        c.name = consume(TokenKind::Ident, "constant name").text;
+        if (match(TokenKind::Colon)) c.type = parse_type();
         consume(TokenKind::Eq, "'=' in const declaration");
         c.value = parse_expr();
         const Token& semi = consume(TokenKind::Semi, "';' after const declaration");
@@ -876,6 +860,14 @@ private:
             e->kind = Expr::Kind::BoolLit;
             e->span = tok.span;
             e->bool_val = (tok.kind == TokenKind::KwTrue);
+            return e;
+        }
+        if (match(TokenKind::StringLit)) {
+            const Token& tok = previous();
+            auto e = std::make_unique<Expr>();
+            e->kind = Expr::Kind::StringLit;
+            e->span = tok.span;
+            e->name = tok.text;
             return e;
         }
         if (match(TokenKind::LParen)) {

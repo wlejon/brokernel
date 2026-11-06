@@ -203,6 +203,7 @@ struct Expr {
         Field,       // receiver.field or vector swizzle (.x, .xy, .zyx)
         Index,       // receiver[i] or stencil[dx, dy]
         StructLit,   // StructName<Args> { field: val, ... }
+        StringLit,   // "label"
     };
 
     Kind kind = Kind::IntLit;
@@ -306,6 +307,8 @@ struct StructDecl {
 struct ConstDecl {
     SourceSpan span;
     bool is_pub = true;
+    bool is_knob = false;
+    std::vector<Attribute> attributes;
     std::string name;
     TypeExprPtr type;
     ExprPtr value;
@@ -377,6 +380,7 @@ struct BindingDecl {
 
 struct ImportDecl {
     SourceSpan span;
+    bool is_pub = false;
     std::vector<std::string> module_path; // e.g. {"std", "noise"} or {"noise"}
     std::string file_path;                // Non-empty if `import "path.bk" as alias;`
     std::string alias;                    // Optional alias (`import std::noise as n;`)

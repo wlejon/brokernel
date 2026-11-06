@@ -251,6 +251,13 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     if (inst->uses_barriers_or_shared) fn.uses_barriers_or_shared = true;
     if (inst->required_stage) require_stage(*inst->required_stage, callee_decl.name, e->span);
     if (inst_grid) ensure_grid_dim(std::max(1u, inst_grid_dim));
+    for (const auto& pr : inst->probes) {
+        bool seen = false;
+        for (const auto& existing : fn.probes) {
+            if (existing.name == pr.name) { seen = true; break; }
+        }
+        if (!seen) fn.probes.push_back(pr);
+    }
     // Coerce and validate arguments against instantiated parameter types, and propagate stencil offsets
     for (size_t i = 0; i < e->args.size() && i < inst_params.size(); ++i) {
         const auto& cparam = inst_params[i];
@@ -423,6 +430,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         }
         case Expr::Kind::BoolLit:
             e->resolved_type = Type::bool_type();
+            return e->resolved_type;
+        case Expr::Kind::StringLit:
+            e->resolved_type = Type::void_type();
             return e->resolved_type;
         case Expr::Kind::Ident: {
             if (LocalVar* lv = lookup_var(e->name)) {
@@ -601,6 +611,11 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return target;
         }
         case Expr::Kind::Call: {
+            if (e->path.empty() &&
+                (e->name == "probe" || e->name == "grad" || e->name == "expect" ||
+                 e->name == "moments" || e->name == "cell_expect")) {
+                return check_ad_or_quadrature_call(e, expected);
+            }
             std::string callee_mod;
             const FnDecl* fdecl = ctx.find_fn_decl(fn.module_name, e->path, e->name, &callee_mod);
             if (fdecl) {
@@ -794,6 +809,7 @@ const CheckedFunction* SemaContext::instantiate_function(
     cfn.name = mangled;
     cfn.source_name = decl.name;
     cfn.module_name = decl_mod;
+    cfn.is_pub = decl.is_pub;
     cfn.is_entry_kernel = as_entry_kernel || decl.is_entry_kernel();
     if (decl.has_attribute("vertex")) {
         cfn.stage = Stage::Vertex;

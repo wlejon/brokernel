@@ -84,6 +84,63 @@ struct ConstValue {
     double float_val = 0.0;
     bool bool_val = false;
     std::vector<ConstValue> elements = {};
+
+    static ConstValue from_f32(float v) {
+        ConstValue c;
+        c.type = Type::f32();
+        c.float_val = static_cast<double>(v);
+        return c;
+    }
+    static ConstValue from_f64(double v) {
+        ConstValue c;
+        c.type = Type::f64();
+        c.float_val = v;
+        return c;
+    }
+    static ConstValue from_i32(int32_t v) {
+        ConstValue c;
+        c.type = Type::i32();
+        c.int_val = v;
+        return c;
+    }
+    static ConstValue from_u32(uint32_t v) {
+        ConstValue c;
+        c.type = Type::u32();
+        c.int_val = static_cast<int64_t>(v);
+        return c;
+    }
+    static ConstValue from_bool(bool v) {
+        ConstValue c;
+        c.type = Type::bool_type();
+        c.bool_val = v;
+        c.int_val = v ? 1 : 0;
+        return c;
+    }
+};
+
+/// Exported constant or `@knob` declaration metadata.
+struct ConstInfo {
+    std::string name;
+    std::string module;
+    Type type;
+    ConstValue value;
+    bool is_knob = false;
+};
+
+/// Named probe metadata (`probe("label", expr)`).
+struct ProbeInfo {
+    std::string name;
+    Type type;
+    uint32_t index = 0;
+};
+
+/// Captured runtime value for a named probe at a single invocation/cell.
+struct ProbeSample {
+    std::string name;
+    Type type;
+    float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t lanes = 1;
+    bool hit = false;
 };
 
 /// A concrete, monomorphized, type-checked function ready for MIR lowering.
@@ -93,6 +150,7 @@ struct CheckedFunction {
     std::string source_name;           // Original function name in source
     std::string module_name;
     bool is_entry_kernel = false;
+    bool is_pub = true;
     Stage stage = Stage::Compute;
     std::optional<Stage> required_stage;
     uint32_t grid_dim = 0;             // 0 = point/raw kernel, 1..3 = 1D/2D/3D grid kernel
@@ -112,6 +170,7 @@ struct CheckedFunction {
     bool cpu_only = false;
     int32_t max_stencil_radius = 0;
     int32_t stencil_halo[3] = {0, 0, 0};
+    std::vector<ProbeInfo> probes;
     std::vector<StmtPtr> body;         // Deep-cloned, type-annotated & const-specialized body
 };
 
@@ -120,6 +179,11 @@ struct CheckedModule {
     std::string module_name;
     TypeRegistry types;
     std::unordered_map<std::string, ConstValue> constants;
+    std::vector<ConstInfo> exported_constants;
+    std::vector<ProbeInfo> probes;
+    std::vector<std::string> exported_functions;
+    bool enable_probes = false;
+    bool enable_fragment_probes = false;
     // Module-level resources at descriptors (`@binding(s, b) var name: T;`),
     // each as the bound parameter it stands for, keyed "module::name".
     std::vector<CheckedParam> globals;
@@ -141,6 +205,7 @@ std::unique_ptr<CheckedModule> check_module(
     ModuleRegistry& registry,
     DiagnosticBag& diags,
     const std::filesystem::path& root_dir = {},
-    std::string_view entry_name = {});
+    std::string_view entry_name = {},
+    const std::unordered_map<std::string, ConstValue>* knob_overrides = nullptr);
 
 } // namespace brokernel

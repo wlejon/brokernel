@@ -117,10 +117,14 @@ struct alignas(8) CpuPointContext {
     void* shared_base;
     void (*barrier_fn)(void*);
     void* barrier_ctx;
+    void* probe_buf;
 };
 static_assert(offsetof(CpuPointContext, shared_base) == 72);
 static_assert(offsetof(CpuPointContext, barrier_fn) == 80);
 static_assert(offsetof(CpuPointContext, barrier_ctx) == 88);
+static_assert(offsetof(CpuPointContext, probe_buf) == 96);
+
+thread_local float* t_active_cpu_probe_buf = nullptr;
 
 uint64_t pack_f32_bits(float v) noexcept {
     uint32_t u = 0;
@@ -391,7 +395,7 @@ bool CompiledKernel::eval_grid_point_cpu(
         gx / lx, gy / ly, gz / lz,
         lx, ly, lz,
         (gw + lx - 1) / lx, (gh + ly - 1) / ly, (gd + lz - 1) / lz,
-        shared_buf.data(), nullptr, nullptr,
+        shared_buf.data(), nullptr, nullptr, t_active_cpu_probe_buf,
     };
 
     alignas(16) uint8_t scratch_ret[256] = {};
@@ -448,6 +452,48 @@ double CompiledKernel::eval_point_2d_f64(
     double res = 0.0;
     eval_grid_point_cpu(gx, gy, 0, GridShape(width, height, 1), args, &res, nullptr);
     return res;
+}
+
+bool CompiledKernel::probe_cpu(
+    int32_t gx, int32_t gy, int32_t gz,
+    GridShape shape,
+    std::span<const KernelArg> args,
+    std::vector<ProbeSample>& out,
+    std::string* err) const {
+    out.clear();
+    if (!probes_compiled && !probes.empty() && build_probed_variant && gpu_cache_) {
+        std::shared_ptr<const CompiledKernel> pv;
+        {
+            std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+            if (!gpu_cache_->probed_variant) {
+                gpu_cache_->probed_variant = build_probed_variant();
+            }
+            pv = gpu_cache_->probed_variant;
+        }
+        if (pv) return pv->probe_cpu(gx, gy, gz, shape, args, out, err);
+    }
+    uint32_t max_idx = 0;
+    for (const auto& p : probes) max_idx = std::max(max_idx, p.index + 1);
+    std::vector<float> pbuf(static_cast<size_t>(max_idx) * 5, 0.0f);
+    float* prev = t_active_cpu_probe_buf;
+    t_active_cpu_probe_buf = pbuf.empty() ? nullptr : pbuf.data();
+    bool ok = eval_grid_point_cpu(gx, gy, gz, shape, args, nullptr, err);
+    t_active_cpu_probe_buf = prev;
+    if (!ok) return false;
+    out.reserve(probes.size());
+    for (const auto& p : probes) {
+        ProbeSample s;
+        s.name = p.name;
+        s.type = p.type;
+        s.lanes = p.type.is_vector() ? p.type.dimension : 1;
+        size_t base = static_cast<size_t>(p.index) * 5;
+        if (base + 5 <= pbuf.size()) {
+            s.hit = (pbuf[base] != 0.0f);
+            for (int i = 0; i < 4; ++i) s.values[i] = pbuf[base + 1 + i];
+        }
+        out.push_back(std::move(s));
+    }
+    return true;
 }
 
 bool CompiledKernel::dispatch_cpu(

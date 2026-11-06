@@ -234,6 +234,9 @@ struct CompileOptions {
     bool compile_cpu = true;
     bool verify_spirv_equivalence = false;
     int opt_level = 2;
+    bool enable_probes = false;
+    bool enable_fragment_probes = false;
+    std::unordered_map<std::string, ConstValue> knob_overrides;
 };
 
 /// One GPU dispatch of a kernel (CompiledKernel::gpu_launch): its arguments in
@@ -250,12 +253,17 @@ struct GpuLaunch {
 class CompiledKernel {
 public:
     std::string name;
+    bool is_entry_kernel = true;
+    bool is_pub = true;
     Stage stage = Stage::Compute;
     uint32_t grid_dim = 0;               // 0 = point kernel, 1..3 = 1D/2D/3D grid kernel
     uint32_t local_size[3] = {64, 1, 1};
     std::vector<KernelParamInfo> params; // Source parameters
     std::vector<KernelParamInfo> all_mir_params; // Includes implicit GridDim and ReturnStore
     std::vector<KernelParamInfo> block_bindings; // Descriptor-bound uniform<T> / buffer<T> used by the kernel
+    std::vector<ProbeInfo> probes;
+    bool probes_compiled = false;
+    std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
     Type return_type = Type::void_type();
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
@@ -444,11 +452,46 @@ public:
         return compare_cpu_gpu(shape, std::span<const KernelArg>(args.begin(), args.size()), rel_tol, abs_tol);
     }
 
+    // -----------------------------------------------------------------------
+    // Named Probes (`probe("label", expr)`)
+    // -----------------------------------------------------------------------
+
+    bool probe_cpu(
+        int32_t gx, int32_t gy, int32_t gz,
+        GridShape shape,
+        std::span<const KernelArg> args,
+        std::vector<ProbeSample>& out,
+        std::string* err = nullptr) const;
+    bool probe_cpu(
+        int32_t gx, int32_t gy, int32_t gz,
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        std::vector<ProbeSample>& out,
+        std::string* err = nullptr) const {
+        return probe_cpu(gx, gy, gz, shape, std::span<const KernelArg>(args.begin(), args.size()), out, err);
+    }
+
+    bool probe_gpu(
+        int32_t gx, int32_t gy, int32_t gz,
+        GridShape shape,
+        std::span<const KernelArg> args,
+        std::vector<ProbeSample>& out,
+        std::string* err = nullptr) const;
+    bool probe_gpu(
+        int32_t gx, int32_t gy, int32_t gz,
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        std::vector<ProbeSample>& out,
+        std::string* err = nullptr) const {
+        return probe_gpu(gx, gy, gz, shape, std::span<const KernelArg>(args.begin(), args.size()), out, err);
+    }
+
 private:
     // The Vulkan pipeline, built on the first GPU dispatch and shared by copies.
     struct GpuCache {
         std::mutex mu;
         std::unique_ptr<brass::gpu::VulkanModule> module;
+        std::shared_ptr<const CompiledKernel> probed_variant;
     };
     std::shared_ptr<GpuCache> gpu_cache_ = std::make_shared<GpuCache>();
 };
@@ -473,13 +516,26 @@ struct CompileResult {
     DiagnosticBag diagnostics;
     TypeRegistry types;
     std::vector<ResourceInfo> resources;   // by set, then binding
+    std::vector<ConstInfo> constants;      // root module's pub consts and @knob consts
+    std::vector<ProbeInfo> probes;         // distinct probes across compiled functions
+    std::vector<std::string> exported_functions; // root module's pub fn names
     std::vector<CompiledKernel> kernels;
+
+    std::string source;
+    std::string file_name = "kernel.bk";
+    CompileOptions options;
+    std::unordered_map<std::string, std::string> loaded_modules;
+    std::vector<std::filesystem::path> search_paths;
+    ModuleRegistry::ModuleResolver module_resolver;
 
     const CompiledKernel* find_kernel(std::string_view name) const noexcept;
     const CompiledKernel* default_kernel() const noexcept {
         return kernels.empty() ? nullptr : &kernels.front();
     }
     std::string error_message() const { return diagnostics.format_all(); }
+
+    /// Recompiles the module with updated `@knob` overrides without editing source text.
+    CompileResult with_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const;
 };
 
 /// Stateful compiler holding a ModuleRegistry (standard library + custom modules + search paths).
@@ -492,6 +548,9 @@ public:
 
     void register_module(std::string name, std::string source);
     void add_search_path(std::filesystem::path dir);
+    void set_module_resolver(ModuleRegistry::ModuleResolver resolver) {
+        modules_.set_resolver(std::move(resolver));
+    }
 
     CompileResult compile_source(
         std::string_view source,

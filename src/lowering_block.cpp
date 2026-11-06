@@ -278,6 +278,88 @@ void MirBodyLowerer::block_store(const Expr* e, const BlockPlace& p, const Value
     }
 }
 
+void MirBodyLowerer::emit_probe(uint32_t probe_idx, const Type& val_type, const ValueList& vals) {
+    if (b.vector_mode()) return;
+    if (!mod.enable_probes && !mod.enable_fragment_probes) return;
+
+    auto to_f32 = [&](brass::Value* v, ScalarKind sk) -> brass::Value* {
+        switch (sk) {
+            case ScalarKind::F32: return v;
+            case ScalarKind::F64: return b.build_fptrunc_f32_f64(v);
+            case ScalarKind::U32: return b.build_sitofp_f32_i64(b.build_zext_i64(v));
+            case ScalarKind::I32:
+            case ScalarKind::Bool:
+                return b.build_sitofp_f32_i32(v);
+            default:
+                return b.build_fconst_f32(0.0f);
+        }
+    };
+    brass::Value* fvals[4];
+    for (int i = 0; i < 4; ++i) {
+        if (static_cast<size_t>(i) < vals.size()) {
+            fvals[i] = to_f32(vals[i], val_type.scalar);
+        } else {
+            fvals[i] = b.build_fconst_f32(0.0f);
+        }
+    }
+    brass::Value* one_f = b.build_fconst_f32(1.0f);
+
+    if (!is_gpu) {
+        if (!cpu_probe_ptr || !cpu_probe_active) return;
+        lower_branch(cpu_probe_active, [&] {
+            int32_t base_off = static_cast<int32_t>(probe_idx * 20);
+            brass::Value* zero_idx = b.build_iconst_i64(0);
+            b.build_store_indexed(brass::Type::f32(), cpu_probe_ptr, zero_idx, 1, base_off + 0, one_f);
+            for (int i = 0; i < 4; ++i) {
+                b.build_store_indexed(brass::Type::f32(), cpu_probe_ptr, zero_idx, 1, base_off + 4 + i * 4, fvals[i]);
+            }
+        }, {});
+        return;
+    }
+
+    if (root_fn.stage == Stage::Fragment && (mod.enable_fragment_probes || mod.enable_probes)) {
+        // Descriptor buffer @binding(4, 23): words 0..1 hold [target_x, target_y],
+        // followed by 5 floats [1.0f, v0, v1, v2, v3] per probe starting at word 2 (byte 8).
+        brass::Value* fx = b.build_fptosi_i32_f32(b.build_call("spirv_frag_coord_x", brass::Type::f32()));
+        brass::Value* fy = b.build_fptosi_i32_f32(b.build_call("spirv_frag_coord_y", brass::Type::f32()));
+        brass::Value* w0 = kb.buffer_load(4, 23, 0, b.build_iconst_i32(0), brass::Type::i32());
+        brass::Value* w1 = kb.buffer_load(4, 23, 0, b.build_iconst_i32(4), brass::Type::i32());
+        auto decode_coord = [&](brass::Value* w) {
+            brass::Value* is_f32 = b.build_sge(w, b.build_iconst_i32(0x3f800000));
+            return b.build_select(is_f32, b.build_fptosi_i32_f32(b.build_bitcast_f32_i32(w)), w);
+        };
+        brass::Value* tx = decode_coord(w0);
+        brass::Value* ty = decode_coord(w1);
+        brass::Value* match = b.build_and(b.build_eq(fx, tx), b.build_eq(fy, ty));
+        lower_branch(match, [&] {
+            int32_t base_off = static_cast<int32_t>(8 + probe_idx * 20);
+            kb.buffer_store(4, 23, b.build_iconst_i32(base_off + 0), one_f);
+            for (int i = 0; i < 4; ++i) {
+                kb.buffer_store(4, 23, b.build_iconst_i32(base_off + 4 + i * 4), fvals[i]);
+            }
+        }, {});
+        return;
+    }
+
+    if (root_fn.stage == Stage::Compute && mod.enable_probes && gpu_probe_ptr) {
+        // Compute probe buffer: words 0..3 hold [target_gx, target_gy, target_gz, 0],
+        // followed by 5 floats [1.0f, v0, v1, v2, v3] per probe starting at byte 16.
+        brass::Value* tgx = b.build_load(brass::Type::i32(), gpu_probe_ptr, 0);
+        brass::Value* tgy = b.build_load(brass::Type::i32(), gpu_probe_ptr, 4);
+        brass::Value* tgz = b.build_load(brass::Type::i32(), gpu_probe_ptr, 8);
+        brass::Value* match = b.build_and(b.build_eq(gx, tgx),
+                                          b.build_and(b.build_eq(gy, tgy), b.build_eq(gz, tgz)));
+        lower_branch(match, [&] {
+            int32_t base_off = static_cast<int32_t>(16 + probe_idx * 20);
+            brass::Value* zero_idx = b.build_iconst_i64(0);
+            b.build_store_indexed(brass::Type::f32(), gpu_probe_ptr, zero_idx, 1, base_off + 0, one_f);
+            for (int i = 0; i < 4; ++i) {
+                b.build_store_indexed(brass::Type::f32(), gpu_probe_ptr, zero_idx, 1, base_off + 4 + i * 4, fvals[i]);
+            }
+        }, {});
+    }
+}
+
 uint32_t MirBodyLowerer::uniform_bytes(const CheckedParam& param) const {
     if (!param.type.is_uniform()) return 0;
     return round_up(block_layout(param.type.element_type(), true).size, 16);

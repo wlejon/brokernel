@@ -9,7 +9,9 @@
 #include "brokernel/diagnostics.h"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -19,10 +21,20 @@ namespace brokernel {
 
 class ModuleRegistry {
 public:
+    using ModuleResolver = std::function<std::optional<std::string>(std::string_view)>;
+
     ModuleRegistry();
 
     /// Registers a built-in or user module by canonical name (e.g. "noise" or "world::climate").
     void register_module(std::string name, std::string source, std::string virtual_path = {});
+
+    /// Sets a dynamic resolver callback invoked when an imported module is not yet registered.
+    void set_resolver(ModuleResolver resolver);
+    const ModuleResolver& resolver() const noexcept { return resolver_; }
+
+    /// Returns all non-builtin modules currently registered in memory.
+    std::unordered_map<std::string, std::string> custom_modules() const;
+    const std::vector<std::filesystem::path>& search_paths() const noexcept { return search_paths_; }
 
     /// Adds a directory to search when resolving `import foo;` or `import "foo.bk";`.
     void add_search_path(std::filesystem::path dir);
@@ -54,6 +66,7 @@ private:
     std::unordered_map<std::string, Entry> modules_;
     std::unordered_map<std::string, std::string> aliases_; // e.g. "std::noise" -> "noise"
     std::vector<std::filesystem::path> search_paths_;
+    ModuleResolver resolver_;
 
     void register_builtin_modules();
     Entry* find_or_discover(std::string_view key, const std::filesystem::path& importing_dir);

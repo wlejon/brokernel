@@ -709,6 +709,11 @@ LoweredKernelMir lower_kernel_to_mir(
             gpu_out_ptr = b.add_param(brass::Type::ptr());
             mir_idx += 1;
         }
+        if (mod.enable_probes && fn.stage == Stage::Compute && !fn.probes.empty()) {
+            out.probe_out_mir_index = mir_idx;
+            lowerer.gpu_probe_ptr = b.add_param(brass::Type::ptr());
+            mir_idx += 1;
+        }
         {
             std::vector<brass::Type> ptypes;
             ptypes.reserve(entry->params().size());
@@ -824,6 +829,11 @@ LoweredKernelMir lower_kernel_to_mir(
         lowerer.cpu_shared_base = b.build_load(brass::Type::ptr(), coords_shape, 72);
         lowerer.cpu_barrier_fn = b.build_load(brass::Type::ptr(), coords_shape, 80);
         lowerer.cpu_barrier_ctx = b.build_load(brass::Type::ptr(), coords_shape, 88);
+        if (mod.enable_probes && !fn.probes.empty()) {
+            lowerer.cpu_probe_ptr = b.build_load(brass::Type::ptr(), coords_shape, 96);
+            lowerer.cpu_probe_active =
+                b.build_ne(b.build_load(brass::Type::i64(), coords_shape, 96), b.build_iconst_i64(0));
+        }
         lowerer.init_shared_memory();
         int32_t slot = 0;
         for (size_t i = 0; i < fn.params.size(); ++i) {

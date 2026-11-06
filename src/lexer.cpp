@@ -26,7 +26,7 @@ bool is_hex_digit(char c) noexcept {
 
 TokenKind classify_keyword(std::string_view text) noexcept {
     if (text == "module")   return TokenKind::KwModule;
-    if (text == "import")   return TokenKind::KwImport;
+    if (text == "import" || text == "use") return TokenKind::KwImport;
     if (text == "from")     return TokenKind::KwFrom;
     if (text == "as")       return TokenKind::KwAs;
     if (text == "pub")      return TokenKind::KwPub;

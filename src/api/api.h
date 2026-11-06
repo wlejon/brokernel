@@ -26,7 +26,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "embed/embed.h"
 
@@ -104,5 +106,9 @@ std::shared_ptr<GpuBuffer> bufferOf(bronze::Value v);
 /// A `KernelBuffer` object over a buffer the host made (a view into memory
 /// it owns, say), in the current realm; undefined for null.
 bronze::Value bufferValue(std::shared_ptr<GpuBuffer> buffer);
+
+/// Resolves a module by name using the current thread/realm's registered
+/// modules (`bro.kernel.registerModule`) or JS resolver (`bro.kernel.resolve`).
+std::optional<std::string> resolveRegisteredModule(std::string_view name);
 
 } // namespace brokernel::api

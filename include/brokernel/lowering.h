@@ -60,6 +60,7 @@ struct LoweredKernelMir {
     std::vector<KernelParamInfo> block_bindings;
     uint32_t grid_dim_mir_index = UINT32_MAX;   // Index of __grid_w in GPU MIR params (if grid_dim > 0)
     uint32_t return_out_mir_index = UINT32_MAX; // Index of __out in GPU MIR params (if return_type != void)
+    uint32_t probe_out_mir_index = UINT32_MAX;  // Index of __probe_buf in GPU MIR params (when enable_probes && !probes.empty())
     uint32_t cpu_shared_bytes = 0;              // Total workgroup shared memory bytes needed on CPU
     bool uses_barriers_or_shared = false;       // Needs workgroup fiber runner on CPU
 };

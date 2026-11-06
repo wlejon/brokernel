@@ -2,6 +2,7 @@
 // Internal shared structures for brokernel semantic analysis (src/sema.cpp & src/sema_check.cpp).
 #include "brokernel/sema.h"
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +17,8 @@ struct ModuleScope {
     std::unordered_map<std::string, std::string> module_aliases; // alias -> canonical module name
     std::unordered_map<std::string, std::pair<std::string, std::string>> imported_symbols; // local -> (mod, sym)
     std::vector<std::string> wildcard_modules;
+    std::unordered_map<std::string, std::pair<std::string, std::string>> pub_imported_symbols; // local -> (mod, sym)
+    std::vector<std::string> pub_wildcard_modules;
 };
 struct LocalVar {
     std::string name;
@@ -44,6 +47,17 @@ struct SemaContext {
           out(std::make_unique<CheckedModule>()) {}
     bool load_and_index_module(const ModuleAst& ast, const std::string& canonical_name,
                                const std::filesystem::path& file_dir);
+    bool symbol_exists_in_module(const std::string& mod_name, const std::string& sym,
+                                 std::string* resolved_mod_out, std::string* resolved_sym_out,
+                                 std::set<std::string>& visited) const;
+    const FnDecl* find_fn_in_module(const std::string& mod_name, const std::string& sym,
+                                    std::string* resolved_mod_out, std::set<std::string>& visited) const;
+    const StructDecl* find_struct_in_module(const std::string& mod_name, const std::string& sym,
+                                            std::string* resolved_mod_out, std::set<std::string>& visited) const;
+    std::optional<ConstValue> find_const_in_module(const std::string& mod_name, const std::string& sym,
+                                                   std::set<std::string>& visited) const;
+    int32_t find_global_in_module(const std::string& mod_name, const std::string& sym,
+                                  std::set<std::string>& visited) const;
     const FnDecl* find_fn_decl(const std::string& current_mod,
                                const std::vector<std::string>& path,
                                const std::string& name,
@@ -157,6 +171,7 @@ struct FnCheckState {
     void check_block_stmts(std::vector<StmtPtr>& stmts);
     bool validate_stencil_access(CheckedParam& param, const std::vector<ExprPtr>& offset_args, const SourceSpan& span);
     Type check_builtin_call(Expr* e, std::optional<Type> expected);
+    Type check_ad_or_quadrature_call(Expr* e, std::optional<Type> expected);
     Type check_user_call(Expr* e, const FnDecl& callee_decl, const std::string& callee_mod);
     Type check_method_call(Expr* e);
     Type check_texture_method(Expr* e, const Type& recv_t);   // an image's or a sampler's method

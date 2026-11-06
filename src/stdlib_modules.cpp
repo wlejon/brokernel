@@ -280,6 +280,20 @@ void ModuleRegistry::add_search_path(std::filesystem::path dir) {
     search_paths_.push_back(std::move(dir));
 }
 
+void ModuleRegistry::set_resolver(ModuleResolver resolver) {
+    resolver_ = std::move(resolver);
+}
+
+std::unordered_map<std::string, std::string> ModuleRegistry::custom_modules() const {
+    std::unordered_map<std::string, std::string> out;
+    for (const auto& [k, e] : modules_) {
+        if (!e.path.starts_with("<builtin:")) {
+            out.emplace(k, e.source);
+        }
+    }
+    return out;
+}
+
 std::string ModuleRegistry::format_module_path(const std::vector<std::string>& path) {
     std::string out;
     for (size_t i = 0; i < path.size(); ++i) {
@@ -300,6 +314,30 @@ ModuleRegistry::Entry* ModuleRegistry::find_or_discover(
     auto it = modules_.find(k);
     if (it != modules_.end()) {
         return &it->second;
+    }
+
+    if (resolver_) {
+        std::optional<std::string> resolved = resolver_(key);
+        if (!resolved && k != key) {
+            resolved = resolver_(k);
+        }
+        if (!resolved) {
+            std::string canon = k;
+            if (canon.ends_with(".bk")) canon.resize(canon.size() - 3);
+            for (size_t pos = 0; pos < canon.size(); ++pos) {
+                if (canon[pos] == '/' || canon[pos] == '\\') {
+                    canon.replace(pos, 1, "::");
+                    pos += 1;
+                }
+            }
+            if (canon != key && canon != k) {
+                resolved = resolver_(canon);
+            }
+        }
+        if (resolved.has_value()) {
+            register_module(k, std::move(*resolved));
+            return &modules_[k];
+        }
     }
 
     // Convert `foo::bar` to `foo/bar.bk` when searching on disk

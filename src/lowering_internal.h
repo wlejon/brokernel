@@ -78,6 +78,9 @@ struct MirBodyLowerer {
     brass::Value* cpu_shared_base = nullptr;
     brass::Value* cpu_barrier_fn = nullptr;
     brass::Value* cpu_barrier_ctx = nullptr;
+    brass::Value* cpu_probe_ptr = nullptr;
+    brass::Value* cpu_probe_active = nullptr;
+    brass::Value* gpu_probe_ptr = nullptr;
     std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> cpu_block_ptrs;
     std::set<size_t> used_block_params;
 
@@ -270,6 +273,7 @@ struct MirBodyLowerer {
     brass::Value* lower_scalar_math_3(const std::string& name, brass::Value* x, brass::Value* y, brass::Value* z, ScalarKind sk);
 
     ValueList lower_expr(const Expr* e);
+    void emit_probe(uint32_t probe_idx, const Type& val_type, const ValueList& vals);
     void lower_stmt(const Stmt* s);
     void lower_stmt_list(const std::vector<StmtPtr>& stmts);
 

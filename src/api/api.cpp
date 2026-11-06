@@ -1,9 +1,4 @@
-#include "api.h"
-
-#include "brokernel/brokernel.h"
-#include "embed/embed_host_class.h"
-#include "embed/embed_object_builder.h"
-#include "embed/embed_typed_array.h"
+#include "api_internal.h"
 
 #include <cstring>
 #include <filesystem>
@@ -13,14 +8,12 @@
 
 namespace brokernel::api {
 
-namespace ev = bronze::embed;
-using Value = bronze::Value;
-
-namespace {
-
 ev::HostClass g_moduleClass;
 ev::HostClass g_kernelClass;
 ev::HostClass g_bufferClass;
+ev::HostClass g_fnClass;
+
+namespace {
 
 // The device this thread's realms dispatch on (setGpuDevice).
 thread_local std::shared_ptr<GpuDevice> t_device;
@@ -34,31 +27,6 @@ void collectAndReclaim() {
     ev::collectGarbage();
     if (t_device) t_device->reclaim();
 }
-
-std::shared_ptr<GpuBuffer> allocateBuffer(size_t bytes, std::string* err) {
-    if (t_uncollectedBufferBytes + bytes >= kGcPressureBytes) collectAndReclaim();
-    std::shared_ptr<GpuBuffer> b = t_device->createBuffer(bytes, err);
-    if (!b) {
-        collectAndReclaim();
-        if (err) err->clear();
-        b = t_device->createBuffer(bytes, err);
-    }
-    if (b) t_uncollectedBufferBytes += bytes;
-    return b;
-}
-
-struct ModuleHandle {
-    std::shared_ptr<const CompileResult> result;
-};
-
-struct KernelHandle {
-    std::shared_ptr<const CompiledKernel> kernel;  // aliases its CompileResult
-    std::shared_ptr<GpuProgram> program;           // its pipeline, made with the handle (else at the first dispatch)
-};
-
-struct BufferHandle {
-    std::shared_ptr<GpuBuffer> buffer;
-};
 
 const CompiledKernel* unwrapKernel(Value self) {
     auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
@@ -91,197 +59,6 @@ const char* accessName(AccessMode m) {
     }
 }
 
-// The parameters a caller passes: all but the grid, the GPU's descriptor
-// bindings and a stage's inputs.
-bool isPassed(const KernelParamInfo& p) {
-    return !is_bound_param(p.role);
-}
-
-bool isStore(const KernelParamInfo& p) {
-    return p.role == ParamRole::Store || p.role == ParamRole::Stencil;
-}
-
-// The typed-array element kind of a scalar: what a store of them takes.
-std::optional<bronze::ElementKind> elementKindOf(ScalarKind sk) {
-    switch (sk) {
-        case ScalarKind::F32: return ev::elements::Float32;
-        case ScalarKind::F64: return ev::elements::Float64;
-        case ScalarKind::I32:
-        case ScalarKind::Bool: return ev::elements::Int32;
-        case ScalarKind::U32: return ev::elements::Uint32;
-        case ScalarKind::I64: return ev::elements::BigInt64;
-        case ScalarKind::U64: return ev::elements::BigUint64;
-        default: return std::nullopt;
-    }
-}
-
-const char* elementKindName(bronze::ElementKind k) {
-    if (k == ev::elements::Float32) return "Float32Array";
-    if (k == ev::elements::Float64) return "Float64Array";
-    if (k == ev::elements::Int32) return "Int32Array";
-    if (k == ev::elements::Uint32) return "Uint32Array";
-    if (k == ev::elements::BigInt64) return "BigInt64Array";
-    if (k == ev::elements::BigUint64) return "BigUint64Array";
-    return "typed array";
-}
-
-size_t scalarBytes(ScalarKind sk) {
-    return (sk == ScalarKind::F64 || sk == ScalarKind::I64 || sk == ScalarKind::U64) ? 8 : 4;
-}
-
-KernelArg scalarArg(ScalarKind sk, Value v) {
-    switch (sk) {
-        case ScalarKind::F32: return KernelArg(static_cast<float>(ev::toDouble(v)));
-        case ScalarKind::F64: return KernelArg(ev::toDouble(v));
-        case ScalarKind::U32: return KernelArg(static_cast<uint32_t>(ev::toUint64(v)));
-        case ScalarKind::I64: return KernelArg(ev::toInt64(v));
-        case ScalarKind::U64: return KernelArg(ev::toUint64(v));
-        case ScalarKind::Bool: return KernelArg(ev::toBool(v));
-        default: return KernelArg(static_cast<int32_t>(ev::toInt64(v)));
-    }
-}
-
-// One call's arguments as KernelArgs. In two passes because of the
-// typed-array pointer contract (embed_typed_array.h): the constructor reads
-// every value (numbers, arrays of them, a vector's bytes), then bind() takes
-// the stores' pointers last, with nothing allocating between them and the
-// dispatch. A bad argument throws, naming the call. For a GPU dispatch
-// (`gpu`) a store is a KernelBuffer, and nothing needs binding.
-class ArgPack {
-public:
-    ArgPack(const CompiledKernel& k, std::span<const Value> js, const std::string& what, bool gpu = false) {
-        size_t passed = 0;
-        for (const auto& p : k.params) passed += isPassed(p) ? 1 : 0;
-        if (js.size() != passed) {
-            ev::throwTypeError(what + ": kernel '" + k.name + "' takes " + std::to_string(passed) +
-                               " argument(s), got " + std::to_string(js.size()));
-        }
-        args_.resize(passed);
-        bytes_.resize(passed);
-        size_t i = 0;
-        for (const auto& p : k.params) {
-            if (!isPassed(p)) continue;
-            const Value v = js[i];
-            if (isStore(p) && gpu) {
-                auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(v));
-                if (!h) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a KernelBuffer");
-                if (!h->buffer) ev::throwError(what + ": '" + p.name + "' is a destroyed KernelBuffer");
-                std::shared_ptr<GpuBuffer> b = h->buffer;
-                args_[i] = KernelArg::device(b->address(), b->bytes(), b->capacity());
-                buffers_.push_back(std::move(b));
-            } else if (isStore(p)) {
-                if (!ev::isTypedArray(v)) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a typed array");
-                const Type elem = p.type.element_type();
-                const auto want = elem.is_scalar() ? elementKindOf(elem.scalar) : std::nullopt;
-                if (want && ev::typedArrayInfo(v).elementKind != *want) {
-                    ev::throwTypeError(what + ": store '" + p.name + "' takes a " + elementKindName(*want));
-                }
-                stores_.push_back(i);
-            } else if (p.role == ParamRole::Scalar) {
-                if (!ev::isNumber(v) && !ev::isBigInt(v) && !ev::isBool(v)) {
-                    ev::throwTypeError(what + ": '" + p.name + "' takes a number");
-                }
-                args_[i] = scalarArg(p.type.scalar, v);
-            } else if (ev::isTypedArray(v)) {
-                // A vector or struct as its bytes, copied now.
-                const auto info = ev::typedArrayInfo(v);
-                bytes_[i].assign(info.data, info.data + info.byteLength);
-                args_[i] = KernelArg::buffer(static_cast<const void*>(bytes_[i].data()), bytes_[i].size());
-            } else if (ev::isObject(v) && p.role != ParamRole::Struct) {
-                // A vector or array as numbers, laid out as its scalar's bytes.
-                const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
-                if (n != p.mir_param_count) {
-                    ev::throwTypeError(what + ": '" + p.name + "' takes " + std::to_string(p.mir_param_count) +
-                                       " number(s)");
-                }
-                const ScalarKind sk = p.type.scalar;
-                const size_t eb = scalarBytes(sk);
-                bytes_[i].assign(n * eb, 0);
-                for (uint32_t e = 0; e < n; ++e) {
-                    const double d = ev::toDouble(ev::getElement(v, e));
-                    uint8_t* at = bytes_[i].data() + e * eb;
-                    if (sk == ScalarKind::F64) {
-                        std::memcpy(at, &d, 8);
-                    } else if (sk == ScalarKind::F32) {
-                        const float f = static_cast<float>(d);
-                        std::memcpy(at, &f, 4);
-                    } else if (eb == 8) {
-                        const int64_t x = static_cast<int64_t>(d);
-                        std::memcpy(at, &x, 8);
-                    } else {
-                        const int32_t x = static_cast<int32_t>(static_cast<int64_t>(d));
-                        std::memcpy(at, &x, 4);
-                    }
-                }
-                args_[i] = KernelArg::buffer(static_cast<const void*>(bytes_[i].data()), bytes_[i].size());
-            } else {
-                ev::throwTypeError(what + ": '" + p.name + "' takes " +
-                                   (p.role == ParamRole::Struct ? "a typed array of its bytes" : "an array of numbers"));
-            }
-            ++i;
-        }
-    }
-
-    // The stores' pointers, read from `js` (which the caller keeps current
-    // across anything that allocated), immediately before the dispatch.
-    std::span<const KernelArg> bind(std::span<const Value> js) {
-        for (size_t i : stores_) {
-            const auto info = ev::typedArrayInfo(js[i]);
-            args_[i] = KernelArg::buffer(static_cast<void*>(info.data), info.byteLength);
-        }
-        return args_;
-    }
-
-    // A GPU dispatch's arguments (its stores are buffers' addresses).
-    std::span<const KernelArg> gpuArgs() const { return args_; }
-
-private:
-    std::vector<KernelArg> args_;
-    std::vector<std::shared_ptr<GpuBuffer>> buffers_;  // a GPU dispatch's stores, held across it
-    std::vector<size_t> stores_;
-    std::vector<std::vector<uint8_t>> bytes_;
-};
-
-// Values that must stay current across allocations: the call's arguments.
-struct HeldArgs {
-    explicit HeldArgs(std::span<const Value> js) {
-        held.reserve(js.size());
-        for (Value v : js) held.emplace_back(v);
-    }
-    std::vector<Value> current() const {
-        std::vector<Value> out;
-        out.reserve(held.size());
-        for (const auto& p : held) out.push_back(p.get());
-        return out;
-    }
-    std::vector<ev::Persistent> held;
-};
-
-Value decodeLeaves(const CompiledKernel& k, const uint8_t* raw) {
-    auto leaf = [&](size_t i, size_t& off) -> Value {
-        const ScalarKind sk = k.return_leaf_kinds[i];
-        double d = 0.0;
-        switch (sk) {
-            case ScalarKind::F64: { double x; std::memcpy(&x, raw + off, 8); d = x; off += 8; break; }
-            case ScalarKind::F32: { float x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
-            case ScalarKind::I64: { int64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
-            case ScalarKind::U64: { uint64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
-            case ScalarKind::U32: { uint32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
-            case ScalarKind::Bool: { int32_t x; std::memcpy(&x, raw + off, 4); off += 4; return ev::fromBool(x != 0); }
-            default: { int32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
-        }
-        return ev::fromDouble(d);
-    };
-    size_t off = 0;
-    if (k.return_leaf_kinds.size() == 1) return leaf(0, off);
-    ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(k.return_leaf_kinds.size())));
-    for (size_t i = 0; i < k.return_leaf_kinds.size(); ++i) {
-        ev::Persistent v(leaf(i, off));
-        arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), v.get()));
-    }
-    return arr.get();
-}
-
 // kernel.eval(...args): a point kernel at one point, on the CPU.
 Value js_eval(Value self, std::span<const Value> args) {
     const CompiledKernel* k = unwrapKernel(self);
@@ -295,31 +72,6 @@ Value js_eval(Value self, std::span<const Value> args) {
     if (!ok) return ev::throwError("Kernel.eval: " + err);
     if (!k->has_return_value() || k->return_byte_size > sizeof ret) return ev::undefined();
     return decodeLeaves(*k, ret);
-}
-
-// The grid shape `v` names: a width, or [width, height, depth].
-GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
-    auto extent = [&](Value e) -> uint32_t {
-        const double d = ev::toDouble(e);
-        if (!(d >= 1.0) || d > 4294967295.0) ev::throwRangeError(what + ": a grid extent is a positive integer");
-        return static_cast<uint32_t>(d);
-    };
-    GridShape s;
-    if (ev::isNumber(v)) {
-        s.width = extent(v);
-    } else if (ev::isObject(v)) {
-        const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
-        if (n < 1 || n > 3) ev::throwTypeError(what + ": the grid is [width, height, depth] (1 to 3 extents)");
-        s.width = extent(ev::getElement(v, 0));
-        if (n >= 2) s.height = extent(ev::getElement(v, 1));
-        if (n >= 3) s.depth = extent(ev::getElement(v, 2));
-    } else {
-        ev::throwTypeError(what + ": the grid is a width or [width, height, depth]");
-    }
-    if ((s.height > 1 && k.grid_dim < 2) || (s.depth > 1 && k.grid_dim < 3)) {
-        ev::throwTypeError(what + ": '" + k.name + "' is a " + std::to_string(k.grid_dim) + "D grid kernel");
-    }
-    return s;
 }
 
 // kernel.run(grid, ...args): a grid kernel over its grid, on the CPU. Its
@@ -357,12 +109,6 @@ Value js_run(Value self, std::span<const Value> args) {
     std::string err;
     if (!k->dispatch_cpu(shape, pack.bind(kargs), nullptr, &err)) return ev::throwError("Kernel.run: " + err);
     return ev::undefined();
-}
-
-Value makeBuffer(std::shared_ptr<GpuBuffer> buffer) {
-    auto handle = std::make_unique<BufferHandle>();
-    handle->buffer = std::move(buffer);
-    return g_bufferClass.createInstance(std::move(handle));
 }
 
 // kernel.dispatch(grid, ...args): a grid kernel over its grid, on the GPU,
@@ -510,7 +256,6 @@ Value paramInfo(const KernelParamInfo& p) {
     if (isStore(p)) {
         b.set("access", accessName(p.access));
         b.set("dimension", p.dimension);
-        // The grid axes the kernel accesses it at, so it must cover them (0: none).
         b.set("cells", p.grid_cover_dim);
     }
     return b.get();
@@ -551,6 +296,7 @@ void decorateKernel(ev::ObjectBuilder& b) {
         }
         return arr.get();
     });
+    decorateKernelExtras(b);
 }
 
 const CompileResult* unwrapModule(Value self) {
@@ -566,10 +312,8 @@ void decorateModule(ev::ObjectBuilder& b) {
         const CompiledKernel* k = h->result->find_kernel(name);
         if (!k) return ev::throwError("KernelModule.kernel: no kernel '" + name + "'");
         auto handle = std::make_unique<KernelHandle>();
+        handle->module_result = h->result;
         handle->kernel = std::shared_ptr<const CompiledKernel>(h->result, k);
-        // A grid kernel's program made now: a device builds its pipeline
-        // while the page goes on, not in the frame of its first dispatch.
-        // One that fails is made again there, which says why.
         if (k->grid_dim > 0 && !k->spirv.words.empty() && t_device && t_device->available()) {
             std::string err;
             handle->program = t_device->createProgram(*k, &err);
@@ -586,10 +330,112 @@ void decorateModule(ev::ObjectBuilder& b) {
         }
         return arr.get();
     });
+    decorateModuleExtras(b);
 }
 
-// A compile error: an Error whose message is the formatted diagnostics and
-// whose `diagnostics` lists them ({severity, file, line, column, message}).
+Value js_compile(Value, std::span<const Value> args) {
+    if (args.empty() || !ev::isString(args[0])) return ev::throwTypeError("bro.kernel.compile: the source is a string");
+    const std::string source = ev::toUtf8(args[0]);
+    std::string file = "kernel.bk";
+    Compiler compiler;
+    CompileOptions compile_opts;
+    configureCompilerModulesAndOptions(args, compiler, file, compile_opts);
+    auto result = std::make_shared<CompileResult>(compiler.compile_source(source, file, compile_opts));
+    if (!result->ok) throwCompileError(*result);
+    auto handle = std::make_unique<ModuleHandle>();
+    handle->result = std::move(result);
+    return g_moduleClass.createInstance(std::move(handle));
+}
+
+Value ensureBroKernel() {
+    ev::Persistent broP;
+    auto bro = ev::globalValue("bro");
+    if (bro.found && ev::isObject(bro.value)) broP.set(bro.value);
+    if (!ev::isObject(broP.get())) {
+        broP.set(ev::createObject());
+        ev::registerGlobal("bro", broP.get());
+    }
+    ev::Persistent kernelP(ev::getProperty(broP.get(), "kernel"));
+    if (!ev::isObject(kernelP.get())) {
+        kernelP.set(ev::createObject());
+        broP.set(ev::setProperty(broP.get(), "kernel", kernelP.get()));
+    }
+    return kernelP.get();
+}
+
+} // namespace
+
+GpuDevice* currentDevice() {
+    return (t_device && t_device->available()) ? t_device.get() : nullptr;
+}
+
+std::shared_ptr<GpuBuffer> allocateBuffer(size_t bytes, std::string* err) {
+    if (t_uncollectedBufferBytes + bytes >= kGcPressureBytes) collectAndReclaim();
+    std::shared_ptr<GpuBuffer> b = t_device->createBuffer(bytes, err);
+    if (!b) {
+        collectAndReclaim();
+        if (err) err->clear();
+        b = t_device->createBuffer(bytes, err);
+    }
+    if (b) t_uncollectedBufferBytes += bytes;
+    return b;
+}
+
+Value makeBuffer(std::shared_ptr<GpuBuffer> buffer) {
+    auto handle = std::make_unique<BufferHandle>();
+    handle->buffer = std::move(buffer);
+    return g_bufferClass.createInstance(std::move(handle));
+}
+
+Value decodeLeaves(const CompiledKernel& k, const uint8_t* raw) {
+    auto leaf = [&](size_t i, size_t& off) -> Value {
+        const ScalarKind sk = k.return_leaf_kinds[i];
+        double d = 0.0;
+        switch (sk) {
+            case ScalarKind::F64: { double x; std::memcpy(&x, raw + off, 8); d = x; off += 8; break; }
+            case ScalarKind::F32: { float x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
+            case ScalarKind::I64: { int64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
+            case ScalarKind::U64: { uint64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
+            case ScalarKind::U32: { uint32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
+            case ScalarKind::Bool: { int32_t x; std::memcpy(&x, raw + off, 4); off += 4; return ev::fromBool(x != 0); }
+            default: { int32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
+        }
+        return ev::fromDouble(d);
+    };
+    size_t off = 0;
+    if (k.return_leaf_kinds.size() == 1) return leaf(0, off);
+    ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(k.return_leaf_kinds.size())));
+    for (size_t i = 0; i < k.return_leaf_kinds.size(); ++i) {
+        ev::Persistent v(leaf(i, off));
+        arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), v.get()));
+    }
+    return arr.get();
+}
+
+GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
+    auto extent = [&](Value e) -> uint32_t {
+        const double d = ev::toDouble(e);
+        if (!(d >= 1.0) || d > 4294967295.0) ev::throwRangeError(what + ": a grid extent is a positive integer");
+        return static_cast<uint32_t>(d);
+    };
+    GridShape s;
+    if (ev::isNumber(v)) {
+        s.width = extent(v);
+    } else if (ev::isObject(v)) {
+        const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
+        if (n < 1 || n > 3) ev::throwTypeError(what + ": the grid is [width, height, depth] (1 to 3 extents)");
+        s.width = extent(ev::getElement(v, 0));
+        if (n >= 2) s.height = extent(ev::getElement(v, 1));
+        if (n >= 3) s.depth = extent(ev::getElement(v, 2));
+    } else {
+        ev::throwTypeError(what + ": the grid is a width or [width, height, depth]");
+    }
+    if ((s.height > 1 && k.grid_dim < 2) || (s.depth > 1 && k.grid_dim < 3)) {
+        ev::throwTypeError(what + ": '" + k.name + "' is a " + std::to_string(k.grid_dim) + "D grid kernel");
+    }
+    return s;
+}
+
 [[noreturn]] void throwCompileError(const CompileResult& r) {
     ev::Persistent list(ev::makeArray(static_cast<uint32_t>(r.diagnostics.items().size())));
     uint32_t i = 0;
@@ -617,67 +463,11 @@ void decorateModule(ev::ObjectBuilder& b) {
     ev::throwValue(err.get());
 }
 
-// bro.kernel.compile(source, { file, modules }): every kernel of `source`,
-// compiled for the CPU and the GPU. `modules` maps a module name
-// ("world::fields") to its source, for `import`; `file` names the source in
-// diagnostics.
-Value js_compile(Value, std::span<const Value> args) {
-    if (args.empty() || !ev::isString(args[0])) return ev::throwTypeError("bro.kernel.compile: the source is a string");
-    const std::string source = ev::toUtf8(args[0]);
-    std::string file = "kernel.bk";
-    Compiler compiler;
-    if (args.size() > 1 && ev::isObject(args[1])) {
-        ev::Persistent opts(args[1]);
-        const Value f = ev::getProperty(opts.get(), "file");
-        // A name only: an import is never looked for beside it on disk.
-        if (ev::isString(f)) file = std::filesystem::path(ev::toUtf8(f)).filename().string();
-        ev::Persistent mods(ev::getProperty(opts.get(), "modules"));
-        if (ev::isObject(mods.get())) {
-            auto object = ev::globalValue("Object");
-            if (!object.found) return ev::throwError("bro.kernel.compile: no Object global");
-            ev::Persistent keysFn(ev::getProperty(object.value, "keys"));
-            const Value marg = mods.get();
-            auto keys = ev::call(keysFn.get(), ev::undefined(), std::span<const Value>(&marg, 1));
-            if (keys.thrown) return ev::throwValue(keys.value);
-            ev::Persistent names(keys.value);
-            const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(names.get(), "length")));
-            for (uint32_t i = 0; i < n; ++i) {
-                const std::string name = ev::toUtf8(ev::getElement(names.get(), i));
-                const Value src = ev::getProperty(mods.get(), name);
-                if (!ev::isString(src)) return ev::throwTypeError("bro.kernel.compile: module '" + name + "' is not a string");
-                compiler.register_module(name, ev::toUtf8(src));
-            }
-        }
-    }
-    auto result = std::make_shared<CompileResult>(compiler.compile_source(source, file));
-    if (!result->ok) throwCompileError(*result);
-    auto handle = std::make_unique<ModuleHandle>();
-    handle->result = std::move(result);
-    return g_moduleClass.createInstance(std::move(handle));
-}
-
-Value ensureBroKernel() {
-    ev::Persistent broP;
-    auto bro = ev::globalValue("bro");
-    if (bro.found && ev::isObject(bro.value)) broP.set(bro.value);
-    if (!ev::isObject(broP.get())) {
-        broP.set(ev::createObject());
-        ev::registerGlobal("bro", broP.get());
-    }
-    ev::Persistent kernelP(ev::getProperty(broP.get(), "kernel"));
-    if (!ev::isObject(kernelP.get())) {
-        kernelP.set(ev::createObject());
-        broP.set(ev::setProperty(broP.get(), "kernel", kernelP.get()));
-    }
-    return kernelP.get();
-}
-
-} // namespace
-
 void installKernel() {
     g_moduleClass.install("KernelModule", 0, nullptr, decorateModule, /*global=*/false);
     g_kernelClass.install("Kernel", 0, nullptr, decorateKernel, /*global=*/false);
     g_bufferClass.install("KernelBuffer", 0, nullptr, decorateBuffer, /*global=*/false);
+    g_fnClass.install("KernelFn", 0, nullptr, decorateFnClass, /*global=*/false);
     ev::Persistent kernelObj(ensureBroKernel());
     ev::ObjectBuilder b(kernelObj.get());
     b.set("available", true);
@@ -687,6 +477,7 @@ void installKernel() {
     });
     b.def("compile", 2, js_compile);
     if (t_device) b.def("createBuffer", 1, js_createBuffer);
+    decorateBroKernelExtras(b);
 }
 
 void setGpuDevice(std::shared_ptr<GpuDevice> device) {

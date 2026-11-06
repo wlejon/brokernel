@@ -41,6 +41,8 @@ add_library(brokernel STATIC
     src/sema_const.cpp
     src/sema_check.cpp
     src/sema_builtins.cpp
+    src/sema_ad.cpp
+    src/sema_quad.cpp
     src/lowering_mir.cpp
     src/lowering_expr.cpp
     src/lowering_math.cpp

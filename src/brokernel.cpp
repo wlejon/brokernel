@@ -188,6 +188,9 @@ bool CompiledKernel::gpu_launch(
         }
         vk_args.emplace_back(return_address);
     }
+    if (probes_compiled && stage == Stage::Compute && !probes.empty()) {
+        vk_args.emplace_back(uint64_t(0));
+    }
 
     for (int i = 0; i < 3; ++i) out.local_size[i] = std::max(1u, local_size[i]);
     out.groups[0] = (w + out.local_size[0] - 1) / out.local_size[0];
@@ -331,6 +334,14 @@ bool CompiledKernel::dispatch_gpu(
 
         GpuLaunch launch;
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
+        if (probes_compiled && stage == Stage::Compute && !probes.empty() && !launch.args.empty()) {
+            const int32_t inactive_target[4] = {-1, -1, -1, 0};
+            BoundBuffer pbb;
+            pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pbb.dev_buf.upload(inactive_target, 16);
+            launch.args.back() = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pbb));
+        }
 
         brass::gpu::VulkanDispatch disp;
         for (int i = 0; i < 3; ++i) {
@@ -560,6 +571,146 @@ ParityReport CompiledKernel::compare_cpu_gpu(
     return rep;
 }
 
+bool CompiledKernel::probe_gpu(
+    int32_t gx, int32_t gy, int32_t gz,
+    GridShape shape,
+    std::span<const KernelArg> args,
+    std::vector<ProbeSample>& out,
+    std::string* err) const {
+    out.clear();
+    if (!probes_compiled && !probes.empty() && build_probed_variant && gpu_cache_) {
+        std::shared_ptr<const CompiledKernel> pv;
+        {
+            std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+            if (!gpu_cache_->probed_variant) {
+                gpu_cache_->probed_variant = build_probed_variant();
+            }
+            pv = gpu_cache_->probed_variant;
+        }
+        if (pv) return pv->probe_gpu(gx, gy, gz, shape, args, out, err);
+    }
+    if (spirv.words.empty()) {
+        if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
+        return false;
+    }
+    if (!brass::gpu::vulkan_available()) {
+        if (err) *err = "no Vulkan compute device available";
+        return false;
+    }
+    try {
+        std::string vk_err;
+        const brass::gpu::VulkanModule* vk_module = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+            if (!gpu_cache_->module) {
+                auto loaded = brass::gpu::VulkanModule::load(spirv, &vk_err);
+                if (!loaded.valid()) {
+                    if (err) *err = vk_err.empty() ? "failed to load Vulkan module" : vk_err;
+                    return false;
+                }
+                gpu_cache_->module = std::make_unique<brass::gpu::VulkanModule>(std::move(loaded));
+            }
+            vk_module = gpu_cache_->module.get();
+        }
+        const brass::gpu::VulkanModule& vk = *vk_module;
+
+        std::vector<brass::gpu::VulkanBuffer> temp_buffers;
+        std::vector<KernelArg> dev_args(args.begin(), args.end());
+        size_t arg_idx = 0;
+        for (size_t p_i = 0; p_i < params.size(); ++p_i) {
+            const auto& p = params[p_i];
+            if (is_bound_param(p.role)) continue;
+            const size_t i = arg_idx++;
+            if (i >= dev_args.size()) break;
+            if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
+            const KernelArg& a = dev_args[i];
+            if (a.kind() == KernelArg::Kind::Device) continue;
+            if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
+                if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
+                return false;
+            }
+            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
+            auto dbuf = brass::gpu::VulkanBuffer::alloc(bytes);
+            if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
+                dbuf.upload(a.buffer_ptr(), a.buffer_bytes());
+            } else {
+                dbuf.zero();
+            }
+            dev_args[i] = KernelArg::device(dbuf.device_address(), a.buffer_bytes(), bytes);
+            temp_buffers.push_back(std::move(dbuf));
+        }
+
+        uint64_t return_address = 0;
+        if (const size_t ret_bytes = gpu_return_bytes(shape)) {
+            auto rbuf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_bytes, 16));
+            rbuf.zero();
+            return_address = rbuf.device_address();
+            temp_buffers.push_back(std::move(rbuf));
+        }
+
+        uint32_t max_idx = 0;
+        for (const auto& p : probes) max_idx = std::max(max_idx, p.index + 1);
+        size_t probe_words = 4 + static_cast<size_t>(max_idx) * 5;
+        std::vector<uint32_t> host_probe(probe_words, 0);
+        host_probe[0] = static_cast<uint32_t>(gx);
+        host_probe[1] = static_cast<uint32_t>(gy);
+        host_probe[2] = static_cast<uint32_t>(gz);
+        auto probe_buf = brass::gpu::VulkanBuffer::alloc(probe_words * sizeof(uint32_t));
+        probe_buf.upload(host_probe.data(), probe_words * sizeof(uint32_t));
+
+        GpuLaunch launch;
+        if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
+        if (probes_compiled && stage == Stage::Compute && !probes.empty() && !launch.args.empty()) {
+            launch.args.back() = brass::gpu::VulkanArg(probe_buf.device_address());
+        }
+
+        brass::gpu::VulkanDispatch disp;
+        for (int i = 0; i < 3; ++i) {
+            disp.grid[i] = launch.groups[i];
+            disp.block[i] = launch.local_size[i];
+        }
+        if (!vk.launch(disp, launch.args, &vk_err)) {
+            if (err) *err = vk_err;
+            return false;
+        }
+
+        probe_buf.download(host_probe.data(), probe_words * sizeof(uint32_t));
+        out.reserve(probes.size());
+        for (const auto& p : probes) {
+            ProbeSample s;
+            s.name = p.name;
+            s.type = p.type;
+            s.lanes = p.type.is_vector() ? p.type.dimension : 1;
+            size_t base = 4 + static_cast<size_t>(p.index) * 5;
+            if (base + 5 <= host_probe.size()) {
+                float hit_f = 0.0f;
+                std::memcpy(&hit_f, &host_probe[base], sizeof(float));
+                s.hit = (hit_f != 0.0f);
+                for (int i = 0; i < 4; ++i) {
+                    std::memcpy(&s.values[i], &host_probe[base + 1 + i], sizeof(float));
+                }
+            }
+            out.push_back(std::move(s));
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (err) *err = std::string("Vulkan probe error: ") + ex.what();
+        return false;
+    }
+}
+
+CompileResult CompileResult::with_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const {
+    Compiler compiler;
+    for (const auto& sp : search_paths) compiler.add_search_path(sp);
+    for (const auto& [mname, msrc] : loaded_modules) compiler.register_module(mname, msrc);
+    if (module_resolver) compiler.set_module_resolver(module_resolver);
+    CompileOptions new_opts = options;
+    for (const auto& [k, v] : overrides) {
+        new_opts.knob_overrides[k] = v;
+    }
+    return compiler.compile_source(source, file_name, new_opts);
+}
+
 // ---------------------------------------------------------------------------
 // Compiler Implementation
 // ---------------------------------------------------------------------------
@@ -579,6 +730,11 @@ CompileResult Compiler::compile_source(
     std::string file_name,
     const CompileOptions& opts) {
     CompileResult res;
+    res.source = std::string(source);
+    res.file_name = file_name;
+    res.options = opts;
+    res.search_paths = modules_.search_paths();
+    res.module_resolver = modules_.resolver();
 
     auto ast = parse_source(source, file_name, res.diagnostics);
     if (!ast || res.diagnostics.has_errors()) {
@@ -592,14 +748,21 @@ CompileResult Compiler::compile_source(
         if (p.has_parent_path()) root_dir = p.parent_path();
     }
 
-    auto checked = check_module(*ast, modules_, res.diagnostics, root_dir, opts.entry_name);
+    auto checked = check_module(*ast, modules_, res.diagnostics, root_dir, opts.entry_name,
+                                opts.knob_overrides.empty() ? nullptr : &opts.knob_overrides);
+    res.loaded_modules = modules_.custom_modules();
     if (!checked || res.diagnostics.has_errors()) {
         res.ok = false;
         return res;
     }
+    checked->enable_probes = opts.enable_probes;
+    checked->enable_fragment_probes = opts.enable_fragment_probes;
 
     res.module_name = checked->module_name;
     res.types = checked->types;
+    res.constants = checked->exported_constants;
+    res.probes = checked->probes;
+    res.exported_functions = checked->exported_functions;
     for (const auto& [key, index] : checked->global_index) {
         const CheckedParam& g = checked->globals[index];
         if (g.role == ParamRole::Shared) continue;
@@ -620,13 +783,13 @@ CompileResult Compiler::compile_source(
 
     std::vector<const CheckedFunction*> targets;
     for (const auto& fn : checked->functions) {
-        if (fn.module_name != checked->module_name) continue;
         if (!opts.entry_name.empty()) {
             if (fn.name == opts.entry_name || fn.source_name == opts.entry_name) {
                 targets.push_back(&fn);
             }
             continue;
         }
+        if (fn.module_name != checked->module_name) continue;
         if (opts.compile_all_functions || !any_explicit_kernel || fn.is_entry_kernel) {
             targets.push_back(&fn);
         }
@@ -666,6 +829,8 @@ CompileResult Compiler::compile_source(
 
         CompiledKernel ck;
         ck.name = fn->source_name;
+        ck.is_entry_kernel = fn->is_entry_kernel;
+        ck.is_pub = fn->is_pub;
         ck.stage = fn->stage;
         ck.grid_dim = fn->grid_dim;
         for (int i = 0; i < 3; ++i) {
@@ -674,6 +839,27 @@ CompileResult Compiler::compile_source(
         }
         ck.params = lowered.param_infos;
         ck.block_bindings = lowered.block_bindings;
+        ck.probes = fn->probes;
+        ck.probes_compiled = opts.enable_probes && !fn->probes.empty();
+        if (!opts.enable_probes && !fn->probes.empty()) {
+            std::string src_copy = res.source;
+            std::string fname_copy = res.file_name;
+            CompileOptions popts = opts;
+            popts.enable_probes = true;
+            popts.entry_name = ck.name;
+            auto mods_copy = res.loaded_modules;
+            auto sp_copy = res.search_paths;
+            auto res_copy = res.module_resolver;
+            ck.build_probed_variant = [src_copy, fname_copy, popts, mods_copy, sp_copy, res_copy]() -> std::shared_ptr<const CompiledKernel> {
+                Compiler c;
+                for (const auto& sp : sp_copy) c.add_search_path(sp);
+                for (const auto& [mn, ms] : mods_copy) c.register_module(mn, ms);
+                if (res_copy) c.set_module_resolver(res_copy);
+                auto pres = c.compile_source(src_copy, fname_copy, popts);
+                if (!pres.ok || pres.kernels.empty()) return nullptr;
+                return std::make_shared<CompiledKernel>(std::move(pres.kernels.front()));
+            };
+        }
         ck.uses_barriers_or_shared = lowered.uses_barriers_or_shared;
         ck.cpu_shared_bytes = lowered.cpu_shared_bytes;
         ck.return_type = fn->return_type;

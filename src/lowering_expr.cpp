@@ -79,6 +79,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
         }
         case Expr::Kind::BoolLit:
             return {e->bool_val ? b.true_value() : b.build_iconst_i32(0)};
+        case Expr::Kind::StringLit:
+            return {};
         case Expr::Kind::Ident: {
             if (auto v = try_shared_read(e)) return *v;
             if (e->global_index >= 0) return global_value(e);
@@ -568,6 +570,11 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList sv = lower_expr(e->args[0].get());
                 uint32_t count = mod.types.flat_leaf_count(e->resolved_type);
                 return ValueList(count, sv[0]);
+            }
+            if (n == "probe") {
+                ValueList vals = lower_expr(e->args[1].get());
+                emit_probe(static_cast<uint32_t>(e->args[0]->int_val), e->resolved_type, vals);
+                return vals;
             }
             // 3. Scalar casts f32(x), f64(x), i32(x), u32(x), i64(x), u64(x), bool(x)
             if (n == "f32" || n == "f64" || n == "i32" || n == "u32" || n == "i64" || n == "u64" || n == "bool") {

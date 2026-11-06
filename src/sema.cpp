@@ -34,91 +34,151 @@ const CheckedFunction* CheckedModule::find_function(std::string_view name) const
     return nullptr;
 }
 
-TypeExprPtr clone_type_expr(const TypeExpr* t) {
-    if (!t) return nullptr;
-    auto c = std::make_unique<TypeExpr>();
-    c->span = t->span;
-    c->name = t->name;
-    c->args.reserve(t->args.size());
-    for (const auto& a : t->args) {
-        GenericArg ga;
-        ga.span = a.span;
-        ga.type_arg = clone_type_expr(a.type_arg.get());
-        ga.int_arg = a.int_arg;
-        ga.ident_or_const_name = a.ident_or_const_name;
-        c->args.push_back(std::move(ga));
-    }
-    return c;
-}
-
-ExprPtr clone_expr(const Expr* e) {
-    if (!e) return nullptr;
-    auto c = std::make_unique<Expr>();
-    c->kind = e->kind;
-    c->span = e->span;
-    c->resolved_type = e->resolved_type;
-    c->int_val = e->int_val;
-    c->float_val = e->float_val;
-    c->bool_val = e->bool_val;
-    c->literal_suffix = e->literal_suffix;
-    c->name = e->name;
-    c->path = e->path;
-    c->global_index = e->global_index;
-    c->unary_op = e->unary_op;
-    c->binary_op = e->binary_op;
-    c->lhs = clone_expr(e->lhs.get());
-    c->rhs = clone_expr(e->rhs.get());
-    c->cond = clone_expr(e->cond.get());
-    for (const auto& ga : e->generic_args) {
-        GenericArg copy;
-        copy.span = ga.span;
-        copy.type_arg = clone_type_expr(ga.type_arg.get());
-        copy.int_arg = ga.int_arg;
-        copy.ident_or_const_name = ga.ident_or_const_name;
-        c->generic_args.push_back(std::move(copy));
-    }
-    for (const auto& arg : e->args) {
-        c->args.push_back(clone_expr(arg.get()));
-    }
-    for (const auto& f : e->fields) {
-        FieldInit fi;
-        fi.span = f.span;
-        fi.name = f.name;
-        fi.value = clone_expr(f.value.get());
-        c->fields.push_back(std::move(fi));
-    }
-    c->target_type = clone_type_expr(e->target_type.get());
-    return c;
-}
-
-StmtPtr clone_stmt(const Stmt* s) {
-    if (!s) return nullptr;
-    auto c = std::make_unique<Stmt>();
-    c->kind = s->kind;
-    c->span = s->span;
-    c->attributes = s->attributes;
-    c->var_name = s->var_name;
-    c->var_type = clone_type_expr(s->var_type.get());
-    c->init_expr = clone_expr(s->init_expr.get());
-    c->resolved_var_type = s->resolved_var_type;
-    c->is_shared = s->is_shared;
-    c->assign_target = clone_expr(s->assign_target.get());
-    c->assign_value = clone_expr(s->assign_value.get());
-    c->compound_op = s->compound_op;
-    c->cond = clone_expr(s->cond.get());
-    for (const auto& b : s->body) c->body.push_back(clone_stmt(b.get()));
-    for (const auto& eb : s->else_body) c->else_body.push_back(clone_stmt(eb.get()));
-    c->inclusive_range = s->inclusive_range;
-    c->range_start = clone_expr(s->range_start.get());
-    c->range_end = clone_expr(s->range_end.get());
-    c->range_step = clone_expr(s->range_step.get());
-    c->for_init = clone_stmt(s->for_init.get());
-    c->for_step = clone_stmt(s->for_step.get());
-    c->expr = clone_expr(s->expr.get());
-    return c;
-}
-
 namespace detail {
+
+bool SemaContext::symbol_exists_in_module(
+    const std::string& mod_name,
+    const std::string& sym,
+    std::string* resolved_mod_out,
+    std::string* resolved_sym_out,
+    std::set<std::string>& visited) const {
+    if (!visited.insert(mod_name).second) return false;
+    auto it = modules.find(mod_name);
+    if (it == modules.end() || !it->second.ast) return false;
+    const auto& scope = it->second;
+    const ModuleAst* ast = scope.ast;
+    for (const auto& fn : ast->functions) {
+        if (fn.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            if (resolved_sym_out) *resolved_sym_out = sym;
+            return true;
+        }
+    }
+    for (const auto& st : ast->structs) {
+        if (st.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            if (resolved_sym_out) *resolved_sym_out = sym;
+            return true;
+        }
+    }
+    for (const auto& c : ast->consts) {
+        if (c.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            if (resolved_sym_out) *resolved_sym_out = sym;
+            return true;
+        }
+    }
+    for (const auto& r : ast->bindings) {
+        if (r.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            if (resolved_sym_out) *resolved_sym_out = sym;
+            return true;
+        }
+    }
+    auto pit = scope.pub_imported_symbols.find(sym);
+    if (pit != scope.pub_imported_symbols.end()) {
+        if (resolved_mod_out) *resolved_mod_out = pit->second.first;
+        if (resolved_sym_out) *resolved_sym_out = pit->second.second;
+        return true;
+    }
+    for (const auto& wmod : scope.pub_wildcard_modules) {
+        if (symbol_exists_in_module(wmod, sym, resolved_mod_out, resolved_sym_out, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const FnDecl* SemaContext::find_fn_in_module(
+    const std::string& mod_name,
+    const std::string& sym,
+    std::string* resolved_mod_out,
+    std::set<std::string>& visited) const {
+    if (!visited.insert(mod_name).second) return nullptr;
+    auto it = modules.find(mod_name);
+    if (it == modules.end() || !it->second.ast) return nullptr;
+    const auto& scope = it->second;
+    for (const auto& fn : scope.ast->functions) {
+        if (fn.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            return &fn;
+        }
+    }
+    auto pit = scope.pub_imported_symbols.find(sym);
+    if (pit != scope.pub_imported_symbols.end()) {
+        return find_fn_in_module(pit->second.first, pit->second.second, resolved_mod_out, visited);
+    }
+    for (const auto& wmod : scope.pub_wildcard_modules) {
+        if (const FnDecl* fn = find_fn_in_module(wmod, sym, resolved_mod_out, visited)) return fn;
+    }
+    return nullptr;
+}
+
+const StructDecl* SemaContext::find_struct_in_module(
+    const std::string& mod_name,
+    const std::string& sym,
+    std::string* resolved_mod_out,
+    std::set<std::string>& visited) const {
+    if (!visited.insert(mod_name).second) return nullptr;
+    auto it = modules.find(mod_name);
+    if (it == modules.end() || !it->second.ast) return nullptr;
+    const auto& scope = it->second;
+    for (const auto& st : scope.ast->structs) {
+        if (st.name == sym) {
+            if (resolved_mod_out) *resolved_mod_out = mod_name;
+            return &st;
+        }
+    }
+    auto pit = scope.pub_imported_symbols.find(sym);
+    if (pit != scope.pub_imported_symbols.end()) {
+        return find_struct_in_module(pit->second.first, pit->second.second, resolved_mod_out, visited);
+    }
+    for (const auto& wmod : scope.pub_wildcard_modules) {
+        if (const StructDecl* st = find_struct_in_module(wmod, sym, resolved_mod_out, visited)) return st;
+    }
+    return nullptr;
+}
+
+std::optional<ConstValue> SemaContext::find_const_in_module(
+    const std::string& mod_name,
+    const std::string& sym,
+    std::set<std::string>& visited) const {
+    if (!visited.insert(mod_name).second) return std::nullopt;
+    auto cit = out->constants.find(mod_name + "::" + sym);
+    if (cit != out->constants.end()) return cit->second;
+    auto it = modules.find(mod_name);
+    if (it == modules.end()) return std::nullopt;
+    const auto& scope = it->second;
+    auto pit = scope.pub_imported_symbols.find(sym);
+    if (pit != scope.pub_imported_symbols.end()) {
+        return find_const_in_module(pit->second.first, pit->second.second, visited);
+    }
+    for (const auto& wmod : scope.pub_wildcard_modules) {
+        if (auto cv = find_const_in_module(wmod, sym, visited)) return cv;
+    }
+    return std::nullopt;
+}
+
+int32_t SemaContext::find_global_in_module(
+    const std::string& mod_name,
+    const std::string& sym,
+    std::set<std::string>& visited) const {
+    if (!visited.insert(mod_name).second) return -1;
+    auto git = out->global_index.find(mod_name + "::" + sym);
+    if (git != out->global_index.end()) return static_cast<int32_t>(git->second);
+    auto it = modules.find(mod_name);
+    if (it == modules.end()) return -1;
+    const auto& scope = it->second;
+    auto pit = scope.pub_imported_symbols.find(sym);
+    if (pit != scope.pub_imported_symbols.end()) {
+        return find_global_in_module(pit->second.first, pit->second.second, visited);
+    }
+    for (const auto& wmod : scope.pub_wildcard_modules) {
+        int32_t g = find_global_in_module(wmod, sym, visited);
+        if (g >= 0) return g;
+    }
+    return -1;
+}
 
 bool SemaContext::load_and_index_module(
     const ModuleAst& ast,
@@ -171,32 +231,24 @@ bool SemaContext::load_and_index_module(
 
         if (imp.wildcard) {
             cur_scope.wildcard_modules.push_back(target_canon);
+            if (imp.is_pub) {
+                cur_scope.pub_wildcard_modules.push_back(target_canon);
+            }
+        } else if (imp.is_pub && imp.symbols.empty() && imp.alias.empty()) {
+            cur_scope.wildcard_modules.push_back(target_canon);
+            cur_scope.pub_wildcard_modules.push_back(target_canon);
         }
         for (const auto& sym : imp.symbols) {
-            // Verify symbol exists in imported module
-            bool exists = false;
-            for (const auto& fn : imported->functions) {
-                if (fn.name == sym) { exists = true; break; }
-            }
-            if (!exists) {
-                for (const auto& st : imported->structs) {
-                    if (st.name == sym) { exists = true; break; }
-                }
-            }
-            if (!exists) {
-                for (const auto& c : imported->consts) {
-                    if (c.name == sym) { exists = true; break; }
-                }
-            }
-            if (!exists) {
-                for (const auto& r : imported->bindings) {
-                    if (r.name == sym) { exists = true; break; }
-                }
-            }
-            if (!exists) {
+            std::string orig_mod;
+            std::string orig_sym;
+            std::set<std::string> visited;
+            if (!symbol_exists_in_module(target_canon, sym, &orig_mod, &orig_sym, visited)) {
                 diags.error(imp.span, "symbol '" + sym + "' not found in module '" + target_canon + "'");
             } else {
-                cur_scope.imported_symbols[sym] = {target_canon, sym};
+                cur_scope.imported_symbols[sym] = {orig_mod, orig_sym};
+                if (imp.is_pub) {
+                    cur_scope.pub_imported_symbols[sym] = {orig_mod, orig_sym};
+                }
             }
         }
     }
@@ -216,7 +268,6 @@ const FnDecl* SemaContext::find_fn_decl(
     const auto& scope = mod_it->second;
 
     if (!path.empty()) {
-        // Path like `noise::fbm` or `std::noise::fbm`
         std::vector<std::string> mod_parts(path.begin(), path.end() - 1);
         const std::string& fn_name = path.back();
         std::string mod_key = ModuleRegistry::format_module_path(mod_parts);
@@ -230,15 +281,8 @@ const FnDecl* SemaContext::find_fn_decl(
             if (single_it != scope.module_aliases.end()) target_mod = single_it->second;
         }
         if (target_mod.empty()) return nullptr;
-        auto tmod_it = modules.find(target_mod);
-        if (tmod_it == modules.end() || !tmod_it->second.ast) return nullptr;
-        for (const auto& fn : tmod_it->second.ast->functions) {
-            if (fn.name == fn_name) {
-                if (resolved_mod_out) *resolved_mod_out = target_mod;
-                return &fn;
-            }
-        }
-        return nullptr;
+        std::set<std::string> visited;
+        return find_fn_in_module(target_mod, fn_name, resolved_mod_out, visited);
     }
 
     // 1. Current module
@@ -253,26 +297,16 @@ const FnDecl* SemaContext::find_fn_decl(
     // 2. Selective imports
     auto sym_it = scope.imported_symbols.find(name);
     if (sym_it != scope.imported_symbols.end()) {
-        auto tmod_it = modules.find(sym_it->second.first);
-        if (tmod_it != modules.end() && tmod_it->second.ast) {
-            for (const auto& fn : tmod_it->second.ast->functions) {
-                if (fn.name == sym_it->second.second) {
-                    if (resolved_mod_out) *resolved_mod_out = sym_it->second.first;
-                    return &fn;
-                }
-            }
+        std::set<std::string> visited;
+        if (const FnDecl* fn = find_fn_in_module(sym_it->second.first, sym_it->second.second, resolved_mod_out, visited)) {
+            return fn;
         }
     }
     // 3. Wildcard imports
     for (const auto& wmod : scope.wildcard_modules) {
-        auto tmod_it = modules.find(wmod);
-        if (tmod_it != modules.end() && tmod_it->second.ast) {
-            for (const auto& fn : tmod_it->second.ast->functions) {
-                if (fn.name == name) {
-                    if (resolved_mod_out) *resolved_mod_out = wmod;
-                    return &fn;
-                }
-            }
+        std::set<std::string> visited;
+        if (const FnDecl* fn = find_fn_in_module(wmod, name, resolved_mod_out, visited)) {
+            return fn;
         }
     }
     return nullptr;
@@ -286,22 +320,14 @@ const StructDecl* SemaContext::find_struct_decl(
     if (mod_it == modules.end()) return nullptr;
     const auto& scope = mod_it->second;
 
-    // Check if `name` has `::`
     auto pos = name.rfind("::");
     if (pos != std::string::npos) {
         std::string mod_prefix = name.substr(0, pos);
         std::string st_name = name.substr(pos + 2);
         auto alias_it = scope.module_aliases.find(mod_prefix);
         if (alias_it != scope.module_aliases.end()) {
-            auto tmod_it = modules.find(alias_it->second);
-            if (tmod_it != modules.end() && tmod_it->second.ast) {
-                for (const auto& st : tmod_it->second.ast->structs) {
-                    if (st.name == st_name) {
-                        if (resolved_mod_out) *resolved_mod_out = alias_it->second;
-                        return &st;
-                    }
-                }
-            }
+            std::set<std::string> visited;
+            return find_struct_in_module(alias_it->second, st_name, resolved_mod_out, visited);
         }
         return nullptr;
     }
@@ -316,25 +342,15 @@ const StructDecl* SemaContext::find_struct_decl(
     }
     auto sym_it = scope.imported_symbols.find(name);
     if (sym_it != scope.imported_symbols.end()) {
-        auto tmod_it = modules.find(sym_it->second.first);
-        if (tmod_it != modules.end() && tmod_it->second.ast) {
-            for (const auto& st : tmod_it->second.ast->structs) {
-                if (st.name == sym_it->second.second) {
-                    if (resolved_mod_out) *resolved_mod_out = sym_it->second.first;
-                    return &st;
-                }
-            }
+        std::set<std::string> visited;
+        if (const StructDecl* st = find_struct_in_module(sym_it->second.first, sym_it->second.second, resolved_mod_out, visited)) {
+            return st;
         }
     }
     for (const auto& wmod : scope.wildcard_modules) {
-        auto tmod_it = modules.find(wmod);
-        if (tmod_it != modules.end() && tmod_it->second.ast) {
-            for (const auto& st : tmod_it->second.ast->structs) {
-                if (st.name == name) {
-                    if (resolved_mod_out) *resolved_mod_out = wmod;
-                    return &st;
-                }
-            }
+        std::set<std::string> visited;
+        if (const StructDecl* st = find_struct_in_module(wmod, name, resolved_mod_out, visited)) {
+            return st;
         }
     }
     return nullptr;
@@ -347,7 +363,6 @@ std::optional<ConstValue> SemaContext::find_const(
     const GenericEnv& genv,
     const std::vector<std::unordered_map<std::string, LocalVar>>& scopes) const {
     if (path.empty()) {
-        // 1. Local scopes (innermost to outermost)
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
             auto vit = it->find(name);
             if (vit != it->end()) {
@@ -355,11 +370,9 @@ std::optional<ConstValue> SemaContext::find_const(
                 return std::nullopt;
             }
         }
-        // 2. Generic const params
         auto git = genv.const_params.find(name);
         if (git != genv.const_params.end()) return git->second;
 
-        // 3. Module-qualified or unqualified constants
         auto c_it = out->constants.find(current_mod + "::" + name);
         if (c_it != out->constants.end()) return c_it->second;
 
@@ -368,12 +381,12 @@ std::optional<ConstValue> SemaContext::find_const(
             const auto& mscope = mod_it->second;
             auto sym_it = mscope.imported_symbols.find(name);
             if (sym_it != mscope.imported_symbols.end()) {
-                auto cit2 = out->constants.find(sym_it->second.first + "::" + sym_it->second.second);
-                if (cit2 != out->constants.end()) return cit2->second;
+                std::set<std::string> visited;
+                if (auto cv = find_const_in_module(sym_it->second.first, sym_it->second.second, visited)) return cv;
             }
             for (const auto& wmod : mscope.wildcard_modules) {
-                auto cit3 = out->constants.find(wmod + "::" + name);
-                if (cit3 != out->constants.end()) return cit3->second;
+                std::set<std::string> visited;
+                if (auto cv = find_const_in_module(wmod, name, visited)) return cv;
             }
         }
         auto plain_it = out->constants.find(name);
@@ -395,28 +408,26 @@ std::optional<ConstValue> SemaContext::find_const(
         if (single_it != mscope.module_aliases.end()) target_mod = single_it->second;
     }
     if (target_mod.empty()) return std::nullopt;
-    auto cit = out->constants.find(target_mod + "::" + path.back());
-    if (cit != out->constants.end()) return cit->second;
-    return std::nullopt;
+    std::set<std::string> visited;
+    return find_const_in_module(target_mod, path.back(), visited);
 }
 
 int32_t SemaContext::find_global(const std::string& current_mod, const std::vector<std::string>& path,
                                  const std::string& name) const {
-    auto at = [&](const std::string& mod, const std::string& sym) -> int32_t {
-        auto it = out->global_index.find(mod + "::" + sym);
-        return it == out->global_index.end() ? -1 : static_cast<int32_t>(it->second);
-    };
     auto mod_it = modules.find(current_mod);
     if (mod_it == modules.end()) return -1;
     const auto& mscope = mod_it->second;
     if (path.empty()) {
-        if (int32_t g = at(current_mod, name); g >= 0) return g;
+        std::set<std::string> v0;
+        if (int32_t g = find_global_in_module(current_mod, name, v0); g >= 0) return g;
         auto sym_it = mscope.imported_symbols.find(name);
         if (sym_it != mscope.imported_symbols.end()) {
-            if (int32_t g = at(sym_it->second.first, sym_it->second.second); g >= 0) return g;
+            std::set<std::string> visited;
+            if (int32_t g = find_global_in_module(sym_it->second.first, sym_it->second.second, visited); g >= 0) return g;
         }
         for (const auto& wmod : mscope.wildcard_modules) {
-            if (int32_t g = at(wmod, name); g >= 0) return g;
+            std::set<std::string> visited;
+            if (int32_t g = find_global_in_module(wmod, name, visited); g >= 0) return g;
         }
         return -1;
     }
@@ -424,7 +435,8 @@ int32_t SemaContext::find_global(const std::string& current_mod, const std::vect
     auto alias_it = mscope.module_aliases.find(ModuleRegistry::format_module_path(mod_parts));
     if (alias_it == mscope.module_aliases.end() && mod_parts.size() == 1) alias_it = mscope.module_aliases.find(mod_parts[0]);
     if (alias_it == mscope.module_aliases.end()) return -1;
-    return at(alias_it->second, path.back());
+    std::set<std::string> visited;
+    return find_global_in_module(alias_it->second, path.back(), visited);
 }
 
 static std::optional<int64_t> resolve_generic_int_arg(
@@ -788,94 +800,6 @@ Type SemaContext::resolve_type(
     return Type::void_type();
 }
 
-// A sampler's methods filter (sample*, at the fragment's implicit LOD, an
-// explicit lod, or gradients; the _offset forms add constant texels each
-// dimension), compare to a reference (a shadow sampler), fetch a texel,
-// gather four, and give the size and the mip count; an image loads and
-// stores texels. Coordinates are f32 for filtering and i32 for texels, a
-// layer after a texture array's dimensions.
-Type FnCheckState::check_texture_method(Expr* e, const Type& recv_t) {
-    const std::string& m = e->name;
-    const bool image = recv_t.is_image();
-    const bool cube = recv_t.image_cube();
-    const bool shadow = recv_t.image_shadow();
-    const Type elem = recv_t.element_type();
-    const uint32_t n = recv_t.image_coords();
-    const Type fcoord = Type::vec(ScalarKind::F32, n);
-    const Type icoord = Type::vec(ScalarKind::I32, n);
-    const Type space = Type::vec(ScalarKind::F32, recv_t.dimension);   // a gradient
-    const Type offset = Type::vec(ScalarKind::I32, recv_t.dimension);
-    const Type size = Type::vec(ScalarKind::I32, (cube ? 2 : recv_t.dimension) + (recv_t.image_arrayed() ? 1 : 0));
-
-    auto done = [&](const Type& t) {
-        e->resolved_type = t;
-        return t;
-    };
-    // A texture's filtering methods take the sampler they go through first.
-    const bool through = recv_t.image_separate() && m != "size" && m != "levels" && m != "fetch";
-    // `m(params...)`: each argument checked against its parameter.
-    auto takes = [&](std::initializer_list<Type> params, const char* shape) {
-        if (e->args.size() != params.size() + (through ? 1 : 0)) {
-            ctx.diags.error(e->span, recv_t.to_string() + "." + m + " expects (" + (through ? "sampler, " : "") +
-                                         shape + ")");
-            for (auto& a : e->args) check_expr(a.get());
-            return;
-        }
-        size_t i = 0;
-        if (through) {
-            Expr* s = e->args[i++].get();
-            Type st = check_expr(s);
-            if (!st.is_sampler() || !st.sampler_only()) {
-                ctx.diags.error(s->span, recv_t.to_string() + "." + m + " samples through a 'sampler', got '" +
-                                             st.to_string() + "'");
-            }
-        }
-        for (const Type& t : params) {
-            Expr* a = e->args[i++].get();
-            check_expr(a, t);
-            check_assignable(a, t, ctx.diags, a->span);
-        }
-    };
-    auto no_cube = [&] {
-        if (cube) ctx.diags.error(e->span, recv_t.to_string() + "." + m + ": a cube has no texel offsets or fetches");
-    };
-
-    if (image) {
-        if (m == "load") {
-            if (!can_Read(recv_t.access)) ctx.diags.error(e->span, "cannot load from write-only image");
-            takes({icoord}, "coordinates");
-            return done(elem);
-        }
-        if (m == "store") {
-            if (!can_Write(recv_t.access)) ctx.diags.error(e->span, "cannot store to read-only image");
-            takes({icoord, elem}, "coordinates, texel");
-            return done(Type::void_type());
-        }
-        if (m == "size") { takes({}, ""); return done(Type::vec(ScalarKind::I32, n)); }
-    } else {
-        if (m == "size") { takes({Type::i32()}, "lod"); return done(size); }
-        if (m == "levels") { takes({}, ""); return done(Type::i32()); }
-        if (shadow) {
-            if (m == "compare") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::f32()); }
-            if (m == "compare_lod") { takes({fcoord, Type::f32(), Type::f32()}, "coordinates, reference, lod"); return done(Type::f32()); }
-            if (m == "gather") { takes({fcoord, Type::f32()}, "coordinates, reference"); return done(Type::vec(ScalarKind::F32, 4)); }
-            if (m == "fetch") { no_cube(); takes({icoord, Type::i32()}, "texel coordinates, lod"); return done(elem); }
-        } else {
-            if (m == "sample") { takes({fcoord}, "coordinates"); return done(elem); }
-            if (m == "sample_offset") { no_cube(); takes({fcoord, offset}, "coordinates, offset"); return done(elem); }
-            if (m == "sample_lod") { takes({fcoord, Type::f32()}, "coordinates, lod"); return done(elem); }
-            if (m == "sample_lod_offset") { no_cube(); takes({fcoord, Type::f32(), offset}, "coordinates, lod, offset"); return done(elem); }
-            if (m == "sample_grad") { takes({fcoord, space, space}, "coordinates, dx, dy"); return done(elem); }
-            if (m == "sample_grad_offset") { no_cube(); takes({fcoord, space, space, offset}, "coordinates, dx, dy, offset"); return done(elem); }
-            if (m == "fetch") { no_cube(); takes({icoord, Type::i32()}, "texel coordinates, lod"); return done(elem); }
-            if (m == "gather") { takes({fcoord, Type::i32()}, "coordinates, component"); return done(Type::vec(elem.scalar, 4)); }
-        }
-    }
-    for (auto& a : e->args) check_expr(a.get());
-    ctx.diags.error(e->span, "type '" + recv_t.to_string() + "' has no method '" + m + "'");
-    return done(Type::void_type());
-}
-
 } // namespace detail
 
 std::unique_ptr<CheckedModule> check_module(
@@ -883,7 +807,8 @@ std::unique_ptr<CheckedModule> check_module(
     ModuleRegistry& registry,
     DiagnosticBag& diags,
     const std::filesystem::path& root_dir,
-    std::string_view entry_name) {
+    std::string_view entry_name,
+    const std::unordered_map<std::string, ConstValue>* knob_overrides) {
     detail::SemaContext ctx(registry, diags, root_dir);
     std::string root_name = !root_ast.module_name.empty() ? root_ast.module_name : "root";
     ctx.out->module_name = root_name;
@@ -908,6 +833,13 @@ std::unique_ptr<CheckedModule> check_module(
                 Type expected = ctx.resolve_type(const_decl.type.get(), mod_name, empty_env);
                 cv = detail::convert_const_value(cv, expected, ctx.out->types);
             }
+            if (const_decl.is_knob && knob_overrides) {
+                auto oit = knob_overrides->find(mod_name + "::" + const_decl.name);
+                if (oit == knob_overrides->end()) oit = knob_overrides->find(const_decl.name);
+                if (oit != knob_overrides->end()) {
+                    cv = detail::convert_const_value(oit->second, cv.type, ctx.out->types);
+                }
+            }
             ctx.out->constants[mod_name + "::" + const_decl.name] = cv;
             if (mod_name == root_name) {
                 ctx.out->constants[const_decl.name] = cv;
@@ -922,10 +854,63 @@ std::unique_ptr<CheckedModule> check_module(
             ctx.resolve_type(&te, mod_name, empty_env);
         }
     }
+
+    // Collect exported constants (`pub const`, `@knob const`, and re-exported `pub const`s)
+    // and exported functions (`pub fn`).
+    {
+        std::set<std::string> seen_consts;
+        std::set<std::string> visited_mods;
+        auto add_const_info = [&](const std::string& exported_name, const std::string& mod_name, const ConstDecl& cd) {
+            if (!seen_consts.insert(exported_name).second) return;
+            auto cit = ctx.out->constants.find(mod_name + "::" + cd.name);
+            if (cit == ctx.out->constants.end()) return;
+            ctx.out->exported_constants.push_back(ConstInfo{
+                exported_name, mod_name, cit->second.type, cit->second, cd.is_knob});
+        };
+        std::function<void(const std::string&)> collect_mod_exports = [&](const std::string& mname) {
+            if (!visited_mods.insert(mname).second) return;
+            auto mit = ctx.modules.find(mname);
+            if (mit == ctx.modules.end() || !mit->second.ast) return;
+            const auto& mscope = mit->second;
+            for (const auto& cd : mscope.ast->consts) {
+                if (cd.is_pub || cd.is_knob) {
+                    add_const_info(cd.name, mname, cd);
+                }
+            }
+            for (const auto& [local_sym, target] : mscope.pub_imported_symbols) {
+                auto tmit = ctx.modules.find(target.first);
+                if (tmit != ctx.modules.end() && tmit->second.ast) {
+                    for (const auto& cd : tmit->second.ast->consts) {
+                        if (cd.name == target.second) {
+                            add_const_info(local_sym, target.first, cd);
+                        }
+                    }
+                }
+            }
+            for (const auto& wmod : mscope.pub_wildcard_modules) {
+                collect_mod_exports(wmod);
+            }
+        };
+        collect_mod_exports(root_name);
+        // Also expose any `@knob` from imported modules
+        for (const auto& mod_name : ctx.module_order) {
+            const ModuleAst* ast = ctx.modules[mod_name].ast;
+            if (!ast) continue;
+            for (const auto& cd : ast->consts) {
+                if (cd.is_knob) add_const_info(cd.name, mod_name, cd);
+            }
+        }
+    }
+
     ctx.resolve_globals();
 
-    // Type-check all non-generic functions in the root module (or just entry_name when specified)
+    // Type-check all non-generic functions in the root module (or just entry_name when specified),
+    // plus any re-exported non-generic functions when entry_name is requested.
+    std::set<std::string> seen_fns;
     for (const auto& fn : root_ast.functions) {
+        if (fn.is_pub && !fn.is_entry_kernel() && fn.generic_params.empty()) {
+            ctx.out->exported_functions.push_back(fn.name);
+        }
         if (!entry_name.empty() && fn.name != entry_name) continue;
         if (!fn.generic_params.empty()) {
             if (fn.is_entry_kernel() || !entry_name.empty()) {
@@ -933,7 +918,47 @@ std::unique_ptr<CheckedModule> check_module(
             }
             continue;
         }
+        seen_fns.insert(fn.name);
         ctx.instantiate_function(fn, root_name, empty_env, fn.span, fn.is_entry_kernel());
+    }
+    // Check re-exported functions from root module's `pub import`s
+    {
+        std::set<std::string> visited_fn_mods;
+        std::function<void(const std::string&)> collect_reexported_fns = [&](const std::string& mname) {
+            if (!visited_fn_mods.insert(mname).second) return;
+            auto mit = ctx.modules.find(mname);
+            if (mit == ctx.modules.end() || !mit->second.ast) return;
+            const auto& mscope = mit->second;
+            if (mname != root_name) {
+                for (const auto& fn : mscope.ast->functions) {
+                    if (!seen_fns.insert(fn.name).second) continue;
+                    if (fn.is_pub && !fn.is_entry_kernel() && fn.generic_params.empty()) {
+                        ctx.out->exported_functions.push_back(fn.name);
+                    }
+                    if (!entry_name.empty() && fn.name == entry_name && fn.generic_params.empty()) {
+                        ctx.instantiate_function(fn, mname, empty_env, fn.span, fn.is_entry_kernel());
+                    }
+                }
+            }
+            for (const auto& [local_sym, target] : mscope.pub_imported_symbols) {
+                std::string rmod;
+                std::set<std::string> v;
+                if (const FnDecl* fn = ctx.find_fn_in_module(target.first, target.second, &rmod, v)) {
+                    if (seen_fns.insert(local_sym).second) {
+                        if (!fn->is_entry_kernel() && fn->generic_params.empty()) {
+                            ctx.out->exported_functions.push_back(local_sym);
+                        }
+                        if (!entry_name.empty() && local_sym == entry_name && fn->generic_params.empty()) {
+                            ctx.instantiate_function(*fn, rmod, empty_env, fn->span, fn->is_entry_kernel());
+                        }
+                    }
+                }
+            }
+            for (const auto& wmod : mscope.pub_wildcard_modules) {
+                collect_reexported_fns(wmod);
+            }
+        };
+        collect_reexported_fns(root_name);
     }
 
     return std::move(ctx.out);
