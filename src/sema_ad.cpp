@@ -420,7 +420,7 @@ struct AdSynthesizer {
             return make_call(jvp_name, std::move(jvp_args), t, sp);
         }
 
-        if (n == "probe" && e->args.size() == 2) {
+        if ((n == "probe" || n == "__probe") && e->args.size() == 2) {
             return diff_expr(e->args[1].get());
         }
         if (n == "__splat" && e->args.size() == 1) {

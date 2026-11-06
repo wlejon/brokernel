@@ -254,7 +254,7 @@ Type FnCheckState::check_ad_or_quadrature_call(Expr* e, std::optional<Type> expe
     const SourceSpan& sp = e->span;
 
     // 1. Named probe: probe("label", val)
-    if (n == "probe") {
+    if (n == "probe" || n == "__probe") {
         if (e->args.size() != 2 || e->args[0]->kind != Expr::Kind::StringLit) {
             ctx.diags.error(sp, "'probe(\"label\", expr)' expects a string literal label and a value expression");
             if (e->args.size() >= 2) return check_expr(e->args[1].get(), expected);
@@ -292,6 +292,10 @@ Type FnCheckState::check_ad_or_quadrature_call(Expr* e, std::optional<Type> expe
         e->args[0]->int_val = static_cast<int64_t>(probe_idx);
         e->args[0]->resolved_type = Type::i32();
         e->resolved_type = vt;
+        // Lowering finds user functions by name before builtins, so a
+        // checked probe takes a name no module can declare: a function
+        // called probe (tiles::probe) would otherwise be inlined in its place.
+        e->name = "__probe";
         return vt;
     }
 

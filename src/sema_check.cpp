@@ -611,7 +611,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return target;
         }
         case Expr::Kind::Call: {
-            if (e->path.empty() && e->name == "probe" && e->args.size() == 2 &&
+            if (e->path.empty() && (e->name == "probe" || e->name == "__probe") && e->args.size() == 2 &&
                 e->args[0] && e->args[0]->kind == Expr::Kind::StringLit) {
                 return check_ad_or_quadrature_call(e, expected);
             }

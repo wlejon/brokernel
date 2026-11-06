@@ -275,6 +275,34 @@ static void test_probes() {
     const auto* fk = fres.find_kernel("fs_main");
     assert(fk != nullptr);
     assert(!fk->spirv.words.empty());
+
+    // A user function named probe (tiles::probe is one) stays a different
+    // function from the builtin: the probe beside a call of it is the
+    // builtin's, and the call reads its buffer argument.
+    const char* clash_src = R"(
+        fn probe(table: read_buffer<f32>, i: i32) -> f32 {
+            return table[i] * 2.0;
+        }
+        @kernel @grid(1)
+        fn k_clash(g: grid<1>, table: read_buffer<f32>, out: write_store<f32>) {
+            let v = probe(table, g.x() as i32);
+            out[g.x()] = probe("v", v);
+        }
+    )";
+    auto cres = compile_source(clash_src, "probe_clash.bk");
+    if (!cres.ok) std::cerr << "probe beside a user fn named probe failed:\n" << cres.error_message() << "\n";
+    assert(cres.ok);
+    const auto* ck = cres.find_kernel("k_clash");
+    assert(ck != nullptr && ck->probes.size() == 1);
+    std::vector<float> table{1.0f, 2.0f, 3.0f};
+    std::vector<float> clash_out(3, 0.0f);
+    std::vector<ProbeSample> clash_samples;
+    bool cok = ck->probe_cpu(1, 0, 0, GridShape(3, 1, 1),
+                             {KernelArg::store(table), KernelArg::store(clash_out)},
+                             clash_samples, &err);
+    if (!cok) std::cerr << "probe_cpu error: " << err << "\n";
+    assert(cok && clash_samples.size() == 1);
+    assert(clash_samples[0].hit && std::abs(clash_samples[0].values[0] - 4.0f) < 1e-5f);
 }
 
 static void test_grad_forward_ad() {

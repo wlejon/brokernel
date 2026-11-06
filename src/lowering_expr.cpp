@@ -571,7 +571,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 uint32_t count = mod.types.flat_leaf_count(e->resolved_type);
                 return ValueList(count, sv[0]);
             }
-            if (n == "probe") {
+            if (n == "__probe") {
                 ValueList vals = lower_expr(e->args[1].get());
                 emit_probe(static_cast<uint32_t>(e->args[0]->int_val), e->resolved_type, vals);
                 return vals;
