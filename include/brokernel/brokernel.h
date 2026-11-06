@@ -262,6 +262,13 @@ public:
     std::vector<KernelParamInfo> all_mir_params; // Includes implicit GridDim and ReturnStore
     std::vector<KernelParamInfo> block_bindings; // Descriptor-bound uniform<T> / buffer<T> used by the kernel
     std::vector<ProbeInfo> probes;
+    // The GPU build's MIR instructions by the source function they came
+    // from (every call is inlined, so the SPIR-V has one function): `self`
+    // counts what a function's own body built, `total` adds what the
+    // functions it called built inside it. Largest total first; the entry
+    // function's total is the stage's whole count.
+    struct FunctionCost { std::string name; uint32_t self = 0; uint32_t total = 0; };
+    std::vector<FunctionCost> function_costs;
     bool probes_compiled = false;
     std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
     Type return_type = Type::void_type();

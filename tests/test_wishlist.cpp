@@ -305,6 +305,42 @@ static void test_probes() {
     assert(clash_samples[0].hit && std::abs(clash_samples[0].values[0] - 4.0f) < 1e-5f);
 }
 
+static void test_function_costs() {
+    // Every call is inlined; the cost report still splits the stage by the
+    // source function each instruction came from.
+    const char* src = R"(
+        fn inner(x: f32) -> f32 {
+            return sin(x) * cos(x * 3.0) + sqrt(abs(x) + 1.0);
+        }
+        fn outer(x: f32) -> f32 {
+            return inner(x) * inner(x + 1.0) + x * 0.5;
+        }
+        @kernel @grid(1)
+        fn k_costs(g: grid<1>, out: write_store<f32>) {
+            out[g.x()] = outer(g.x() as f32);
+        }
+    )";
+    auto res = compile_source(src, "costs.bk");
+    if (!res.ok) std::cerr << "test_function_costs failed:\n" << res.error_message() << "\n";
+    assert(res.ok);
+    const auto* k = res.find_kernel("k_costs");
+    assert(k != nullptr);
+    const CompiledKernel::FunctionCost *entry = nullptr, *outer = nullptr, *inner = nullptr;
+    for (const auto& c : k->function_costs) {
+        if (c.name == "k_costs") entry = &c;
+        if (c.name == "outer") outer = &c;
+        if (c.name == "inner") inner = &c;
+    }
+    assert(entry && outer && inner);
+    assert(k->function_costs.front().name == "k_costs");   // the entry's total is everything
+    assert(inner->self > 0 && inner->total == inner->self);
+    assert(outer->total == outer->self + inner->total);
+    assert(entry->total >= outer->total + entry->self);
+    uint32_t selfs = 0;
+    for (const auto& c : k->function_costs) selfs += c.self;
+    assert(selfs == entry->total);
+}
+
 static void test_grad_forward_ad() {
     const char* src = R"(
         struct WaveCfg {
@@ -482,6 +518,7 @@ int main() {
     test_constants_and_struct_layout();
     test_knobs();
     test_probes();
+    test_function_costs();
     test_grad_forward_ad();
     test_quadrature_expect_moments_cell();
     std::cout << "All wishlist tests passed!\n";

@@ -22,6 +22,23 @@ ValueList MirBodyLowerer::lower_inlined_call(
     std::set<std::string> callee_assigned;
     for (const auto& st : callee.body) collect_assigned_names(st.get(), callee_assigned);
     push_scope();
+    // What the callee's body builds carries an inlined scope naming it, so
+    // a stage's cost can be split by the source function it came from
+    // (CompiledKernel::function_costs).
+    brass::Builder& bld = kb.builder();
+    const brass::DebugLoc saved_loc = bld.current_loc();
+    if (brass::Module* m = bld.current_module()) {
+        brass::DebugContext& dc = m->debug_context();
+        const uint32_t file = dc.get_or_add_file(callee.module_name.empty() ? std::string("kernel.bk") : callee.module_name + ".bk");
+        // Named as the source calls it: `mesh::finish_surface`, not the
+        // mangled `mesh__finish_surface` (an imported function's name is
+        // prefixed by its module; one of the kernel's own module is not).
+        std::string shown = callee.source_name.empty() ? callee.name : callee.source_name;
+        if (!callee.module_name.empty() && callee.name.rfind(callee.module_name + "__", 0) == 0)
+            shown = callee.module_name + "::" + shown;
+        const uint32_t scope = dc.record_inlined_scope(shown, saved_loc, saved_loc.inlined_at_id);
+        bld.set_current_loc(brass::DebugLoc(file, 1, 0, scope));
+    }
     active_return_type = callee.return_type;
     active_fn_name = callee.name;
     has_returned_var_id = alloc_var("__callee_has_ret", {b.build_iconst_i32(0)});
@@ -59,6 +76,7 @@ ValueList MirBodyLowerer::lower_inlined_call(
     ret_val_var_id = saved_ret_val;
     active_return_type = saved_ret_type;
     active_fn_name = std::move(saved_fn_name);
+    bld.set_current_loc(saved_loc);
     return result;
 }
 ValueList MirBodyLowerer::lower_expr(const Expr* e) {

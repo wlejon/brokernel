@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 namespace brokernel {
 
@@ -17,6 +18,44 @@ const char* version() {
 }
 
 namespace {
+
+// The function's instructions by the inlined scope each carries (lowering
+// stamps every inlined call's body with one naming the callee), as self and
+// total counts per source function, largest total first.
+std::vector<CompiledKernel::FunctionCost> function_costs(const brass::Function& fn, const brass::DebugContext& dc,
+                                                         const std::string& entry) {
+    std::unordered_map<std::string, CompiledKernel::FunctionCost> by;
+    auto at = [&](const std::string& n) -> CompiledKernel::FunctionCost& {
+        auto& c = by[n];
+        c.name = n;
+        return c;
+    };
+    std::vector<std::string> chain;
+    for (const brass::BasicBlock* bb : fn.blocks()) {
+        for (const brass::Instruction* inst : *bb) {
+            chain.clear();
+            for (uint32_t id = inst->loc().inlined_at_id; id != 0;) {
+                const brass::InlinedScope* s = dc.get_inlined_scope(id);
+                if (!s) break;
+                chain.push_back(s->callee_name);
+                id = s->parent_inlined_at_id;
+            }
+            chain.push_back(entry);
+            at(chain.front()).self += 1;
+            // A function counts once however often it recurs up the chain.
+            for (size_t i = 0; i < chain.size(); ++i) {
+                if (std::find(chain.begin(), chain.begin() + i, chain[i]) == chain.begin() + i) at(chain[i]).total += 1;
+            }
+        }
+    }
+    std::vector<CompiledKernel::FunctionCost> out;
+    out.reserve(by.size());
+    for (auto& [n, c] : by) out.push_back(std::move(c));
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return a.total != b.total ? a.total > b.total : a.name < b.name;
+    });
+    return out;
+}
 
 size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
     size_t c = 0;
@@ -885,6 +924,7 @@ CompileResult Compiler::compile_source(
                 spv_opts.spirv_version = opts.spirv_version;
 
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
+                ck.function_costs = function_costs(*lowered.gpu_function, lowered.gpu_module->debug_context(), ck.name);
                 if (opts.emit_spirv_disassembly) {
                     ck.spirv_disassembly = brass::target::SpirvTarget::dump_function(*lowered.gpu_function, spv_opts);
                 }

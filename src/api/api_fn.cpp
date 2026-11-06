@@ -321,7 +321,23 @@ Value js_kernelStats(Value self, std::span<const Value>) {
     out.set("stores", static_cast<double>(stores));
     out.set("branches", static_cast<double>(branches));
     out.set("loops", static_cast<double>(loops));
-    out.set("functions", static_cast<double>(functions));
+    // Source functions by what each built (all of it is inlined, so the
+    // SPIR-V has one function): self, total with its callees, and total's
+    // share of the stage.
+    (void)functions;
+    const auto& costs = h->kernel->function_costs;
+    const double whole = costs.empty() ? 0.0 : static_cast<double>(costs.front().total);
+    ev::Persistent fnArr(ev::makeArray(static_cast<uint32_t>(costs.size())));
+    for (size_t fi = 0; fi < costs.size(); ++fi) {
+        ev::ObjectBuilder fb;
+        fb.set("name", costs[fi].name);
+        fb.set("self", static_cast<double>(costs[fi].self));
+        fb.set("total", static_cast<double>(costs[fi].total));
+        fb.set("share", whole > 0.0 ? costs[fi].total / whole : 0.0);
+        ev::Persistent fv(fb.get());
+        fnArr.set(ev::setElement(fnArr.get(), static_cast<uint32_t>(fi), fv.get()));
+    }
+    out.set("functions", fnArr.get());
 
     std::vector<ExecutableStats> execs;
     if (h->program) execs = h->program->executableStats();
