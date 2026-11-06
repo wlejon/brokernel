@@ -32,6 +32,10 @@ public:
     void set_resolver(ModuleResolver resolver);
     const ModuleResolver& resolver() const noexcept { return resolver_; }
 
+    /// Process-wide default resolver fallback (used when no per-compiler resolver is set).
+    static void set_default_resolver(ModuleResolver resolver);
+    static std::optional<std::string> resolve_default(std::string_view name);
+
     /// Returns all non-builtin modules currently registered in memory.
     std::unordered_map<std::string, std::string> custom_modules() const;
     const std::vector<std::filesystem::path>& search_paths() const noexcept { return search_paths_; }

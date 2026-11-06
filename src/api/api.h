@@ -59,10 +59,23 @@ public:
     virtual void destroy() {}
 };
 
+/// Driver-level executable statistics for a compiled pipeline stage.
+struct ExecutableStatEntry {
+    std::string name;
+    double value = 0.0;
+};
+struct ExecutableStats {
+    std::string name;
+    std::string description;
+    uint32_t subgroupSize = 0;
+    std::vector<ExecutableStatEntry> statistics;
+};
+
 /// A compiled kernel as the host's pipeline (GpuDevice::createProgram).
 class GpuProgram {
 public:
     virtual ~GpuProgram() = default;
+    virtual std::vector<ExecutableStats> executableStats() { return {}; }
 };
 
 /// The host's GPU device: what bro.kernel's GPU half runs on. Its work runs

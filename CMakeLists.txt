@@ -78,6 +78,7 @@ if(BROKERNEL_BUILD_BENCH)
         bench/bench_hillclimb_common.cpp
         bench/bench_hillclimb_glsl_noise.cpp
         bench/bench_hillclimb_stencil.cpp
+        bench/bench_hillclimb_shipped.cpp
         tests/no_dialogs.cpp
     )
     target_link_libraries(bench_hillclimb PRIVATE brokernel FastNoise)

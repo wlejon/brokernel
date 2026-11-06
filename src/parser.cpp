@@ -350,6 +350,11 @@ private:
             ParamDecl p;
             p.attributes = parse_attributes();
             p.span = peek().span;
+            if (check(TokenKind::Ident) &&
+                (peek().text == "inout" || peek().text == "out" || peek().text == "mut") &&
+                pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].kind == TokenKind::Ident) {
+                advance();
+            }
             p.name = consume(TokenKind::Ident, "parameter name").text;
             consume(TokenKind::Colon, "':' after parameter name");
             p.type = parse_type();

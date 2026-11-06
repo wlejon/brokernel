@@ -611,15 +611,19 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             return target;
         }
         case Expr::Kind::Call: {
-            if (e->path.empty() &&
-                (e->name == "probe" || e->name == "grad" || e->name == "expect" ||
-                 e->name == "moments" || e->name == "cell_expect")) {
+            if (e->path.empty() && e->name == "probe" && e->args.size() == 2 &&
+                e->args[0] && e->args[0]->kind == Expr::Kind::StringLit) {
                 return check_ad_or_quadrature_call(e, expected);
             }
             std::string callee_mod;
             const FnDecl* fdecl = ctx.find_fn_decl(fn.module_name, e->path, e->name, &callee_mod);
             if (fdecl) {
                 return check_user_call(e, *fdecl, callee_mod);
+            }
+            if (e->path.empty() &&
+                (e->name == "probe" || e->name == "grad" || e->name == "expect" ||
+                 e->name == "moments" || e->name == "cell_expect")) {
+                return check_ad_or_quadrature_call(e, expected);
             }
             if (!e->path.empty()) {
                 ctx.diags.error(e->span, "unknown function '" + ModuleRegistry::format_module_path(e->path) + "'");
@@ -916,7 +920,11 @@ const CheckedFunction* SemaContext::instantiate_function(
         FnCheckState state{*this, cfn, genv, {}, 0};
         state.push_scope();
         for (size_t i = 0; i < cfn.params.size(); ++i) {
-            state.scopes.back()[cfn.params[i].name] = LocalVar{cfn.params[i].name, cfn.params[i].type, false, false, false, {}, static_cast<int>(i)};
+            const bool is_val_param = cfn.params[i].role == ParamRole::Scalar ||
+                                      cfn.params[i].role == ParamRole::Vector ||
+                                      cfn.params[i].role == ParamRole::Struct ||
+                                      cfn.params[i].role == ParamRole::Array;
+            state.scopes.back()[cfn.params[i].name] = LocalVar{cfn.params[i].name, cfn.params[i].type, is_val_param, false, false, {}, static_cast<int>(i)};
         }
         for (const auto& [cname, cval] : genv.const_params) {
             state.scopes.back()[cname] = LocalVar{cname, cval.type, false, true, false, cval, -1};

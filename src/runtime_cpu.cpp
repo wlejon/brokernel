@@ -501,6 +501,9 @@ bool CompiledKernel::dispatch_cpu(
     std::span<const KernelArg> args,
     void* return_store_out,
     std::string* err) const {
+    if (!uses_barriers_or_shared && shape.total_points() == 1) {
+        return eval_grid_point_cpu(0, 0, 0, shape, args, return_store_out, err);
+    }
     if (cpu_grid_fn().is_valid()) {
         std::vector<uint64_t> slots;
         if (!pack_cpu_args(*this, args, shape, slots, err)) return false;
@@ -628,6 +631,7 @@ bool CompiledKernel::dispatch_cpu(
                             const uint32_t gx = wx * lsz[0] + lx;
                             const uint32_t gy = wy * lsz[1] + ly;
                             const uint32_t gz = wz * lsz[2] + lz;
+                            if (gx >= w || gy >= h || gz >= d) continue;
                             CpuPointContext ctx{
                                 static_cast<int32_t>(gx), static_cast<int32_t>(gy), static_cast<int32_t>(gz),
                                 static_cast<int32_t>(w), static_cast<int32_t>(h), static_cast<int32_t>(d),

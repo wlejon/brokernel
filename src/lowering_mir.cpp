@@ -880,7 +880,7 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         b.build_ret_void();
     }
-    if (fn.uses_barriers_or_shared || (fn.grid_dim == 0 && fn.return_type.is_void())) return out;
+    if (fn.uses_barriers_or_shared || (fn.grid_dim == 0 && fn.return_type.is_void()) || !fn.uses_grid_coords) return out;
     for (uint32_t lanes : {8u, 4u}) {
         if (!brass::host_has_avx2()) break;
         VectorPlan plan;

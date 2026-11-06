@@ -141,13 +141,20 @@ std::string planet_fields_source() {
 int main(int argc, char** argv) {
     bool write_golden = false;
     bool check_golden = false;
+    bool shipped_only = false;
     fs::path golden_path = fs::path(BROKERNEL_SOURCE_DIR) / "bench" / "goldens.windows.json";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--write-golden") write_golden = true;
         else if (arg == "--check-golden") check_golden = true;
+        else if (arg == "--shipped") shipped_only = true;
         else if (arg == "--golden" && i + 1 < argc) golden_path = argv[++i];
+    }
+
+    if (shipped_only) {
+        run_shipped_shaders_bench();
+        return 0;
     }
 
     if (!brass::gpu::vulkan_available()) {
@@ -650,6 +657,8 @@ int main(int argc, char** argv) {
                 std::max(capstone.cpu_max_abs, capstone.gpu_max_abs));
     std::printf("  Total Harness Wall Time  : %.2f s\n", total_sec);
     std::printf("============================================================================================================================\n");
+
+    run_shipped_shaders_bench();
 
     if (write_golden) {
         write_golden_json(golden_path, all_rows, parity_passed, parity_total, geomean_cpu, geomean_gpu,

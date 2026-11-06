@@ -2,6 +2,7 @@
 #include "stdlib_noise_parts.h"
 
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 namespace brokernel {
@@ -234,10 +235,31 @@ pub fn aces_tonemap<T>(x: vec3<T>) -> vec3<T> {
 }
 )BK";
 
+std::mutex g_default_resolver_mu;
+ModuleRegistry::ModuleResolver g_default_resolver;
+
 } // namespace
+
+void ModuleRegistry::set_default_resolver(ModuleResolver resolver) {
+    std::lock_guard<std::mutex> lock(g_default_resolver_mu);
+    g_default_resolver = std::move(resolver);
+}
+
+std::optional<std::string> ModuleRegistry::resolve_default(std::string_view name) {
+    ModuleResolver fn;
+    {
+        std::lock_guard<std::mutex> lock(g_default_resolver_mu);
+        fn = g_default_resolver;
+    }
+    return fn ? fn(name) : std::nullopt;
+}
 
 ModuleRegistry::ModuleRegistry() {
     register_builtin_modules();
+    {
+        std::lock_guard<std::mutex> lock(g_default_resolver_mu);
+        resolver_ = g_default_resolver;
+    }
 }
 
 void ModuleRegistry::register_builtin_modules() {

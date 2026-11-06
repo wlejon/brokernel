@@ -464,6 +464,9 @@ GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
 }
 
 void installKernel() {
+    ModuleRegistry::set_default_resolver([](std::string_view name) {
+        return resolveRegisteredModule(name);
+    });
     g_moduleClass.install("KernelModule", 0, nullptr, decorateModule, /*global=*/false);
     g_kernelClass.install("Kernel", 0, nullptr, decorateKernel, /*global=*/false);
     g_bufferClass.install("KernelBuffer", 0, nullptr, decorateBuffer, /*global=*/false);

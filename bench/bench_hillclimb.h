@@ -148,3 +148,4 @@ extern const char* kBkNoiseSuiteSource;
 
 std::string make_glsl_noise_shader(int dim, const std::string& expr);
 std::vector<BenchRow> run_stencil_tier();
+void run_shipped_shaders_bench();

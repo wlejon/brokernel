@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -13,8 +15,10 @@ namespace brokernel::api {
 
 namespace {
 
-thread_local std::unordered_map<std::string, std::string> t_registeredModules;
+std::mutex g_registeredModulesMu;
+std::unordered_map<std::string, std::string> g_registeredModules;
 thread_local ev::Persistent t_moduleResolver;
+thread_local bool t_hasModuleResolver = false;
 
 std::string normalizeModuleKey(std::string_view name) {
     std::string out;
@@ -278,6 +282,62 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
     return self;
 }
 
+Value js_kernelStats(Value self, std::span<const Value>) {
+    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    if (!h || !h->kernel) return ev::throwTypeError("Kernel.stats: invalid receiver");
+    const auto& words = h->kernel->spirv.words;
+    uint32_t instructions = 0, arithmetic = 0, samples = 0, loads = 0, stores = 0, branches = 0, loops = 0, functions = 0;
+    if (words.size() >= 5 && words[0] == 0x07230203u) {
+        size_t i = 5;
+        while (i < words.size()) {
+            const uint32_t word0 = words[i];
+            const uint16_t wc = static_cast<uint16_t>(word0 >> 16);
+            const uint16_t op = static_cast<uint16_t>(word0 & 0xFFFFu);
+            if (wc == 0 || i + wc > words.size()) break;
+            ++instructions;
+            else if (op == 54) ++functions;
+            else if (op == 61 || op == 227) ++loads;
+            else if (op == 62 || op == 228 || op == 99) ++stores;
+            else if (op >= 87 && op <= 98) ++samples;
+            else if ((op >= 126 && op <= 175) || (op >= 179 && op <= 209) || op == 12) ++arithmetic;
+            else if (op == 246) ++loops;
+            else if (op >= 249 && op <= 251) ++branches;
+            i += wc;
+        }
+    }
+    ev::ObjectBuilder out;
+    out.set("spirvBytes", static_cast<double>(words.size() * 4));
+    out.set("instructions", static_cast<double>(instructions));
+    out.set("arithmetic", static_cast<double>(arithmetic));
+    out.set("samples", static_cast<double>(samples));
+    out.set("loads", static_cast<double>(loads));
+    out.set("stores", static_cast<double>(stores));
+    out.set("branches", static_cast<double>(branches));
+    out.set("loops", static_cast<double>(loops));
+    out.set("functions", static_cast<double>(functions));
+
+    std::vector<ExecutableStats> execs;
+    if (h->program) execs = h->program->executableStats();
+    ev::Persistent execArr(ev::makeArray(static_cast<uint32_t>(execs.size())));
+    for (size_t ei = 0; ei < execs.size(); ++ei) {
+        ev::ObjectBuilder eb;
+        eb.set("name", execs[ei].name);
+        eb.set("description", execs[ei].description);
+        eb.set("subgroupSize", static_cast<double>(execs[ei].subgroup_size));
+        ev::ObjectBuilder sb;
+        for (const auto& st : execs[ei].stats) {
+            if (st.is_bool) sb.set(st.name, st.value != 0.0);
+            else sb.set(st.name, st.value);
+        }
+        ev::Persistent sv(sb.get());
+        eb.set("statistics", sv.get());
+        ev::Persistent evObj(eb.get());
+        execArr.set(ev::setElement(execArr.get(), static_cast<uint32_t>(ei), evObj.get()));
+    }
+    out.set("executables", execArr.get());
+    return out.get();
+}
+
 // ---------------------------------------------------------------------------
 // KernelFn (`mod.fn(name)`)
 // ---------------------------------------------------------------------------
@@ -309,7 +369,7 @@ bool buildPointKernelForFn(FnHandle& h, std::string* err) {
     for (const auto& [mn, ms] : h.module_result->loaded_modules) compiler.register_module(mn, ms);
     if (h.module_result->module_resolver) compiler.set_module_resolver(h.module_result->module_resolver);
 
-    CompileOptions opts = h.module_result->compile_options;
+    CompileOptions opts = h.module_result->options;
     opts.entry_name = h.fn_name;
     opts.emit_spirv = false;
     opts.compile_cpu = true;
@@ -386,7 +446,7 @@ const BatchVariant* getOrBuildBatchVariant(FnHandle& h, uint64_t batch_mask, boo
     for (const auto& [mn, ms] : h.module_result->loaded_modules) compiler.register_module(mn, ms);
     if (h.module_result->module_resolver) compiler.set_module_resolver(h.module_result->module_resolver);
 
-    CompileOptions opts = h.module_result->compile_options;
+    CompileOptions opts = h.module_result->options;
     opts.entry_name = wrapper_name;
     opts.emit_spirv = need_gpu;
     opts.compile_cpu = !need_gpu;
@@ -554,13 +614,16 @@ Value js_fnKnobs(Value self, std::span<const Value> args) {
 
 std::optional<std::string> resolveRegisteredModule(std::string_view name) {
     const std::string exact(name);
-    if (auto it = t_registeredModules.find(exact); it != t_registeredModules.end()) return it->second;
     const std::string norm = normalizeModuleKey(name);
-    if (auto it = t_registeredModules.find(norm); it != t_registeredModules.end()) return it->second;
     const std::string canon = canonicalModuleName(name);
-    if (auto it = t_registeredModules.find(canon); it != t_registeredModules.end()) return it->second;
+    {
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        if (auto it = g_registeredModules.find(exact); it != g_registeredModules.end()) return it->second;
+        if (auto it = g_registeredModules.find(norm); it != g_registeredModules.end()) return it->second;
+        if (auto it = g_registeredModules.find(canon); it != g_registeredModules.end()) return it->second;
+    }
 
-    if (ev::isFunction(t_moduleResolver.get())) {
+    if (t_hasModuleResolver && ev::isFunction(t_moduleResolver.get())) {
         ev::Persistent fn(t_moduleResolver.get());
         auto tryCall = [&](const std::string& argStr) -> std::optional<std::string> {
             ev::Persistent arg(ev::fromUtf8(argStr));
@@ -570,9 +633,16 @@ std::optional<std::string> resolveRegisteredModule(std::string_view name) {
             if (ev::isString(res.value)) return ev::toUtf8(res.value);
             return std::nullopt;
         };
-        if (auto r = tryCall(canon)) return r;
+        auto cacheAndReturn = [&](std::string src) -> std::optional<std::string> {
+            std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+            g_registeredModules[exact] = src;
+            g_registeredModules[norm] = src;
+            g_registeredModules[canon] = src;
+            return src;
+        };
+        if (auto r = tryCall(canon)) return cacheAndReturn(std::move(*r));
         if (norm != canon) {
-            if (auto r = tryCall(norm)) return r;
+            if (auto r = tryCall(norm)) return cacheAndReturn(std::move(*r));
         }
     }
     return std::nullopt;
@@ -600,6 +670,7 @@ void decorateFnClass(ev::ObjectBuilder& b) {
 void decorateKernelExtras(ev::ObjectBuilder& b) {
     b.def("probe", 0, js_kernelProbe);
     b.def("knobs", 1, js_kernelKnobs);
+    b.def("stats", 0, js_kernelStats);
 }
 
 void decorateModuleExtras(ev::ObjectBuilder& b) {
@@ -717,12 +788,14 @@ void decorateBroKernelExtras(ev::ObjectBuilder& b) {
     b.def("resolve", 1, [](Value, std::span<const Value> args) -> Value {
         if (args.empty() || ev::isNull(args[0]) || ev::isUndefined(args[0])) {
             t_moduleResolver.reset();
+            t_hasModuleResolver = false;
             return ev::undefined();
         }
         if (!ev::isFunction(args[0])) {
             return ev::throwTypeError("bro.kernel.resolve: expected a resolver function or null");
         }
         t_moduleResolver.set(args[0]);
+        t_hasModuleResolver = true;
         return ev::undefined();
     });
     b.def("registerModule", 2, [](Value, std::span<const Value> args) -> Value {
@@ -731,13 +804,15 @@ void decorateBroKernelExtras(ev::ObjectBuilder& b) {
         }
         const std::string name = ev::toUtf8(args[0]);
         const std::string source = ev::toUtf8(args[1]);
-        t_registeredModules[name] = source;
-        t_registeredModules[normalizeModuleKey(name)] = source;
-        t_registeredModules[canonicalModuleName(name)] = source;
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        g_registeredModules[name] = source;
+        g_registeredModules[normalizeModuleKey(name)] = source;
+        g_registeredModules[canonicalModuleName(name)] = source;
         return ev::undefined();
     });
     b.def("clearModules", 0, [](Value, std::span<const Value>) -> Value {
-        t_registeredModules.clear();
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        g_registeredModules.clear();
         return ev::undefined();
     });
 }
@@ -747,8 +822,11 @@ void configureCompilerModulesAndOptions(
     Compiler& compiler,
     std::string& file,
     CompileOptions& compile_opts) {
-    for (const auto& [name, src] : t_registeredModules) {
-        compiler.register_module(name, src);
+    {
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        for (const auto& [name, src] : g_registeredModules) {
+            compiler.register_module(name, src);
+        }
     }
     compiler.set_module_resolver([](std::string_view name) {
         return resolveRegisteredModule(name);
