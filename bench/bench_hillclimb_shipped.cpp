@@ -70,7 +70,7 @@ std::string expand_debug_views(const std::string& src) {
 
 void register_planet_modules(Compiler& c, const fs::path& planet_dir, const fs::path& bro_dir) {
     c.register_module("tiles", read_file_str(bro_dir / "src" / "tilecache" / "tiles.bk"));
-    for (const char* name : {"ground", "relief", "rivers", "anchor", "climate", "dendry", "dendry_grid", "dendry_field",
+    for (const char* name : {"ground", "surface", "ground_detail", "relief", "rivers", "anchor", "climate", "dendry", "dendry_grid", "dendry_field",
                              "clouds", "cloud_field", "cloud_lighting", "trees", "tree_crown", "grass", "grass_floor", "sun"}) {
         fs::path p = planet_dir / (std::string(name) + ".bk");
         if (fs::exists(p)) {
