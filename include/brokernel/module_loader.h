@@ -38,6 +38,8 @@ public:
 
     /// Returns all non-builtin modules currently registered in memory.
     std::unordered_map<std::string, std::string> custom_modules() const;
+    /// The non-builtin modules a compile parsed: what it imported, directly or not.
+    std::vector<std::string> imported_modules() const;
     const std::vector<std::filesystem::path>& search_paths() const noexcept { return search_paths_; }
 
     /// Adds a directory to search when resolving `import foo;` or `import "foo.bk";`.

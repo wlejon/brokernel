@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace brokernel::api {
@@ -24,15 +25,39 @@ extern ev::HostClass g_kernelClass;
 extern ev::HostClass g_bufferClass;
 extern ev::HostClass g_fnClass;
 
-struct ModuleHandle {
+// A compiled module as its handles share it: bro.kernel.reload() replaces
+// `result` and counts `generation` up, and every Kernel and KernelFn taken
+// from it follows at its next use.
+struct ModuleCell {
     std::shared_ptr<const CompileResult> result;
+    uint64_t generation = 0;
 };
+
+struct ModuleHandle {
+    std::shared_ptr<ModuleCell> cell;
+};
+
+// A new module's cell, listed for bro.kernel.reload().
+std::shared_ptr<ModuleCell> makeModuleCell(std::shared_ptr<const CompileResult> result);
+// This thread's modules still held by a handle.
+std::vector<std::shared_ptr<ModuleCell>> liveModuleCells();
 
 struct KernelHandle {
     std::shared_ptr<const CompileResult> module_result;
     std::shared_ptr<const CompiledKernel> kernel;
     std::shared_ptr<GpuProgram> program;
+    std::shared_ptr<ModuleCell> owner;   // the module it came from
+    uint64_t generation = 0;             // the owner's, as last followed
+    std::unordered_map<std::string, ConstValue> knobs;   // its own (Kernel.knobs)
 };
+
+// The Kernel behind `self`, moved onto its module's current compile first.
+KernelHandle* kernelHandle(Value self);
+
+// Drops `p` on a thread of its own: a compile replaced by a reload, whose
+// teardown (millions of small blocks, made on the thread that compiled it)
+// takes seconds that a frame must not wait for.
+void releaseLater(std::shared_ptr<const void> p);
 
 struct BufferHandle {
     std::shared_ptr<GpuBuffer> buffer;
@@ -201,6 +226,9 @@ void decorateFnClass(ev::ObjectBuilder& b);
 void decorateModuleExtras(ev::ObjectBuilder& b);
 void decorateKernelExtras(ev::ObjectBuilder& b);
 void decorateBroKernelExtras(ev::ObjectBuilder& b);
+void decorateReload(ev::ObjectBuilder& b);   // bro.kernel.reload (api_reload.cpp)
+// Registered and resolved modules of these names take the new sources.
+void updateRegisteredSources(const std::unordered_map<std::string, std::string>& sources);
 void configureCompilerModulesAndOptions(
     std::span<const Value> args,
     Compiler& compiler,

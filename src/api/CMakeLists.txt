@@ -1,6 +1,7 @@
 add_library(brokernel_api STATIC
     api.cpp
     api_fn.cpp
+    api_reload.cpp
 )
 
 target_include_directories(brokernel_api PUBLIC

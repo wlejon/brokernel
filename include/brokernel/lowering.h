@@ -66,10 +66,23 @@ struct LoweredKernelMir {
 };
 
 /// Lowers a single checked function `fn` (and any helper functions it calls from `mod`)
-/// into brass MIR functions for both GPU (SpirvTarget / PtxTarget) and CPU (KernelJit).
+/// into a brass MIR function for the GPU (SpirvTarget / PtxTarget), and its
+/// parameters and bindings.
 LoweredKernelMir lower_kernel_to_mir(
     const CheckedModule& mod,
     const CheckedFunction& fn,
+    DiagnosticBag& diags);
+
+/// Whether `fn` has CPU functions (a compute kernel that samples no texture).
+bool has_cpu_lowering(const CheckedFunction& fn);
+
+/// Lowers `fn`'s CPU point and grid functions (for KernelJit) into `out`,
+/// whose `block_bindings` lower_kernel_to_mir filled: on its own, so a kernel
+/// only ever dispatched on the GPU never lowers them.
+void lower_kernel_cpu_to_mir(
+    const CheckedModule& mod,
+    const CheckedFunction& fn,
+    LoweredKernelMir& out,
     DiagnosticBag& diags);
 
 } // namespace brokernel

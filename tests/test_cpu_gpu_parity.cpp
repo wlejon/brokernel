@@ -275,8 +275,8 @@ static void test_vector_grid_lanes() {
     const auto* k64 = res.find_kernel("k_f64");
     assert(k32 && k64);
     if (brass::host_has_avx2()) {
-        assert(k32->cpu_grid_lanes == 8);
-        assert(k64->cpu_grid_lanes == 4);
+        assert(k32->cpu_grid_lanes() == 8);
+        assert(k64->cpu_grid_lanes() == 4);
     }
     const uint32_t W = 37, H = 5;
     std::vector<float> src_v(W * H);
@@ -329,8 +329,8 @@ static void test_vector_stencil_edges() {
     assert(res.ok);
     const auto* k = res.find_kernel("k_reach");
     assert(k && k->stencil_halo[0] == 3);
-    if (brass::host_has_avx2() && k->cpu_grid_lanes != 8) {
-        std::cerr << "k_reach runs " << k->cpu_grid_lanes << " lanes\n";
+    if (brass::host_has_avx2() && k->cpu_grid_lanes() != 8) {
+        std::cerr << "k_reach runs " << k->cpu_grid_lanes() << " lanes\n";
         assert(false);
     }
     const uint32_t H = 3;
@@ -394,8 +394,8 @@ static void test_store_bounds() {
     assert(k->find_param("out_a")->grid_cover_dim == 1);
     assert(k->find_param("table")->grid_cover_dim == 0);
     assert(k->find_param("scatter")->grid_cover_dim == 0);
-    if (brass::host_has_avx2() && k->cpu_grid_lanes != 8) {
-        std::cerr << "k_bounds runs " << k->cpu_grid_lanes << " lanes\n";
+    if (brass::host_has_avx2() && k->cpu_grid_lanes() != 8) {
+        std::cerr << "k_bounds runs " << k->cpu_grid_lanes() << " lanes\n";
         assert(false);
     }
     std::vector<float> table(10);
@@ -509,7 +509,7 @@ static void test_vector_bool_masks() {
     const auto* k = res.find_kernel("k_bool_masks");
     assert(k != nullptr);
     if (brass::host_has_avx2()) {
-        assert(k->cpu_grid_lanes == 8);
+        assert(k->cpu_grid_lanes() == 8);
     }
 
     // Width 29 exercises 3 full 8-wide AVX2 groups (0..23) plus a 5-lane scalar tail (24..28).
@@ -608,7 +608,7 @@ static void test_assignment_targets_parity() {
     const auto* k = res.find_kernel("k_assign_targets");
     assert(k != nullptr);
     if (brass::host_has_avx2()) {
-        assert(k->cpu_grid_lanes == 8);
+        assert(k->cpu_grid_lanes() == 8);
     }
 
     const uint32_t W = 29;
@@ -698,7 +698,7 @@ static void test_atomics_parity() {
     const auto* k = res.find_kernel("k_atomics");
     assert(k != nullptr);
     if (brass::host_has_avx2()) {
-        assert(k->cpu_grid_lanes == 8);
+        assert(k->cpu_grid_lanes() == 8);
     }
 
     const uint32_t W = 29;
@@ -806,7 +806,7 @@ static void test_lowering_quirks_parity() {
     const auto* k = res.find_kernel("k_lowering_quirks");
     assert(k != nullptr);
     if (brass::host_has_avx2()) {
-        assert(k->cpu_grid_lanes == 8);
+        assert(k->cpu_grid_lanes() == 8);
     }
 
     const uint32_t W = 29; // 3 full AVX2 vector groups (24) + 5 scalar tail
@@ -902,7 +902,7 @@ static void test_vector_and_matrix_constants_parity() {
     const auto* k = res.find_kernel("k_vec_mat_consts");
     assert(k != nullptr);
     if (brass::host_has_avx2()) {
-        assert(k->cpu_grid_lanes == 8);
+        assert(k->cpu_grid_lanes() == 8);
     }
 
     const uint32_t W = 29;

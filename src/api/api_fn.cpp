@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace brokernel::api {
@@ -214,7 +215,7 @@ bool probeOnDevice(
 }
 
 Value js_kernelProbe(Value self, std::span<const Value> args) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    KernelHandle* h = kernelHandle(self);
     if (!h || !h->kernel) return ev::throwTypeError("Kernel.probe: invalid receiver");
     const CompiledKernel& k = *h->kernel;
 
@@ -267,7 +268,7 @@ Value js_kernelProbe(Value self, std::span<const Value> args) {
 }
 
 Value js_kernelKnobs(Value self, std::span<const Value> args) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    KernelHandle* h = kernelHandle(self);
     if (!h || !h->kernel || !h->module_result) {
         return ev::throwTypeError("Kernel.knobs: invalid receiver");
     }
@@ -275,6 +276,7 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
     auto overrides = parseKnobOverrides(args[0], "Kernel.knobs");
     auto next_res = std::make_shared<CompileResult>(h->module_result->with_knobs(overrides));
     if (!next_res->ok) throwCompileError(*next_res);
+    for (const auto& [k, v] : overrides) h->knobs[k] = v;
     const CompiledKernel* nk = next_res->find_kernel(h->kernel->name);
     if (!nk) return ev::throwError("Kernel.knobs: kernel '" + h->kernel->name + "' not found after recompilation");
     h->module_result = next_res;
@@ -290,7 +292,7 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
 }
 
 Value js_kernelStats(Value self, std::span<const Value>) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    KernelHandle* h = kernelHandle(self);
     if (!h || !h->kernel) return ev::throwTypeError("Kernel.stats: invalid receiver");
     const auto& words = h->kernel->spirv.words;
     uint32_t instructions = 0, arithmetic = 0, samples = 0, loads = 0, stores = 0, branches = 0, loops = 0, functions = 0;
@@ -376,7 +378,37 @@ struct FnHandle {
     std::shared_ptr<const CompileResult> point_result;
     const CompiledKernel* point_kernel = nullptr;
     std::unordered_map<uint64_t, BatchVariant> batch_variants;
+    std::shared_ptr<ModuleCell> owner;   // the module it came from
+    uint64_t generation = 0;             // the owner's, as last followed
+    std::unordered_map<std::string, ConstValue> knobs;   // its own (KernelFn.knobs)
 };
+
+bool buildPointKernelForFn(FnHandle& h, std::string* err);
+
+// The KernelFn behind `self`, moved onto its module's current compile first
+// (as kernelHandle does for a Kernel).
+FnHandle* fnHandle(Value self) {
+    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    if (!h || !h->owner || h->owner->generation == h->generation) return h;
+    h->generation = h->owner->generation;
+    std::shared_ptr<const CompileResult> res = h->owner->result;
+    if (!h->knobs.empty()) {
+        auto own = std::make_shared<CompileResult>(res->with_knobs(h->knobs));
+        if (!own->ok) return h;
+        res = std::move(own);
+    }
+    FnHandle next;
+    next.module_result = res;
+    next.fn_name = h->fn_name;
+    std::string err;
+    if (!buildPointKernelForFn(next, &err)) return h;
+    releaseLater(std::exchange(h->module_result, std::move(next.module_result)));
+    releaseLater(std::exchange(h->point_result, std::move(next.point_result)));
+    h->point_kernel = next.point_kernel;
+    for (auto& [_, bv] : h->batch_variants) releaseLater(std::move(bv.result));
+    h->batch_variants.clear();
+    return h;
+}
 
 bool buildPointKernelForFn(FnHandle& h, std::string* err) {
     if (const CompiledKernel* existing = h.module_result->find_kernel(h.fn_name)) {
@@ -498,7 +530,7 @@ const BatchVariant* getOrBuildBatchVariant(FnHandle& h, uint64_t batch_mask, boo
 }
 
 Value js_fnEval(Value self, std::span<const Value> args) {
-    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    FnHandle* h = fnHandle(self);
     if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.eval: invalid receiver");
     const CompiledKernel& k = *h->point_kernel;
     if (!k.cpu_point_fn().is_valid()) {
@@ -514,7 +546,7 @@ Value js_fnEval(Value self, std::span<const Value> args) {
 }
 
 Value js_fnProbe(Value self, std::span<const Value> args) {
-    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    FnHandle* h = fnHandle(self);
     if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.probe: invalid receiver");
     const CompiledKernel& k = *h->point_kernel;
     ArgPack pack(k, args, "KernelFn.probe");
@@ -527,7 +559,7 @@ Value js_fnProbe(Value self, std::span<const Value> args) {
 }
 
 Value js_fnRun(Value self, std::span<const Value> args) {
-    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    FnHandle* h = fnHandle(self);
     if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.run: invalid receiver");
     if (args.empty()) return ev::throwTypeError("KernelFn.run: first argument must be the count");
     const GridShape shape = shapeArg(args[0], *h->point_kernel, "KernelFn.run");
@@ -578,7 +610,7 @@ Value js_fnRun(Value self, std::span<const Value> args) {
 }
 
 Value js_fnDispatch(Value self, std::span<const Value> args) {
-    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    FnHandle* h = fnHandle(self);
     if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.dispatch: invalid receiver");
     GpuDevice* dev = currentDevice();
     if (!dev) return ev::throwError("KernelFn.dispatch: this realm has no GPU device (bro.kernel.gpu is false)");
@@ -619,12 +651,13 @@ Value js_fnDispatch(Value self, std::span<const Value> args) {
 }
 
 Value js_fnKnobs(Value self, std::span<const Value> args) {
-    auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+    FnHandle* h = fnHandle(self);
     if (!h || !h->module_result) return ev::throwTypeError("KernelFn.knobs: invalid receiver");
     if (args.empty()) return self;
     auto overrides = parseKnobOverrides(args[0], "KernelFn.knobs");
     auto next_res = std::make_shared<CompileResult>(h->module_result->with_knobs(overrides));
     if (!next_res->ok) throwCompileError(*next_res);
+    for (const auto& [k, v] : overrides) h->knobs[k] = v;
     h->module_result = std::move(next_res);
     h->batch_variants.clear();
     std::string err;
@@ -633,6 +666,17 @@ Value js_fnKnobs(Value self, std::span<const Value> args) {
 }
 
 } // namespace
+
+void updateRegisteredSources(const std::unordered_map<std::string, std::string>& sources) {
+    std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+    for (const auto& [k, src] : sources) {
+        for (auto* table : {&g_registeredModules, &g_resolverFallback}) {
+            for (const std::string& key : {k, normalizeModuleKey(k), canonicalModuleName(k)}) {
+                if (auto it = table->find(key); it != table->end()) it->second = src;
+            }
+        }
+    }
+}
 
 std::optional<std::string> resolveRegisteredModule(std::string_view name) {
     const std::string exact(name);
@@ -696,11 +740,11 @@ void decorateFnClass(ev::ObjectBuilder& b) {
     b.def("dispatch", 1, js_fnDispatch);
     b.def("knobs", 1, js_fnKnobs);
     b.accessor("name", [](Value self, std::span<const Value>) -> Value {
-        auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+        FnHandle* h = fnHandle(self);
         return h ? ev::fromUtf8(h->fn_name) : ev::undefined();
     });
     b.accessor("returns", [](Value self, std::span<const Value>) -> Value {
-        auto* h = static_cast<FnHandle*>(g_fnClass.unwrap(self));
+        FnHandle* h = fnHandle(self);
         if (!h || !h->point_kernel) return ev::undefined();
         return h->point_kernel->has_return_value()
                    ? ev::fromUtf8(h->point_kernel->return_type.to_string())
@@ -717,19 +761,34 @@ void decorateKernelExtras(ev::ObjectBuilder& b) {
 void decorateModuleExtras(ev::ObjectBuilder& b) {
     b.accessor("consts", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::undefined();
+        if (!h || !h->cell->result) return ev::undefined();
         ev::ObjectBuilder obj;
-        for (const auto& c : h->result->constants) {
+        for (const auto& c : h->cell->result->constants) {
             ev::Persistent val(constValueToJs(c.value));
             obj.set(c.name, val.get());
         }
         return obj.get();
     });
+    b.accessor("file", [](Value self, std::span<const Value>) -> Value {
+        auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
+        return h ? ev::fromUtf8(h->cell->result->file_name) : ev::undefined();
+    });
+    b.accessor("imports", [](Value self, std::span<const Value>) -> Value {
+        auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
+        if (!h) return ev::undefined();
+        const auto& names = h->cell->result->imports;
+        ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(names.size())));
+        for (size_t i = 0; i < names.size(); ++i) {
+            ev::Persistent s(ev::fromUtf8(names[i]));
+            arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), s.get()));
+        }
+        return arr.get();
+    });
     b.accessor("knobs", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::undefined();
+        if (!h || !h->cell->result) return ev::undefined();
         ev::ObjectBuilder obj;
-        for (const auto& c : h->result->constants) {
+        for (const auto& c : h->cell->result->constants) {
             if (!c.is_knob) continue;
             ev::Persistent val(constValueToJs(c.value));
             obj.set(c.name, val.get());
@@ -738,25 +797,25 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
     });
     b.def("withKnobs", 1, [](Value self, std::span<const Value> args) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::throwTypeError("KernelModule.withKnobs: invalid receiver");
+        if (!h || !h->cell->result) return ev::throwTypeError("KernelModule.withKnobs: invalid receiver");
         std::unordered_map<std::string, ConstValue> overrides;
         if (!args.empty() && !ev::isUndefined(args[0]) && !ev::isNull(args[0])) {
             overrides = parseKnobOverrides(args[0], "KernelModule.withKnobs");
         }
-        auto next_res = std::make_shared<CompileResult>(h->result->with_knobs(overrides));
+        auto next_res = std::make_shared<CompileResult>(h->cell->result->with_knobs(overrides));
         if (!next_res->ok) throwCompileError(*next_res);
         auto next_handle = std::make_unique<ModuleHandle>();
-        next_handle->result = std::move(next_res);
+        next_handle->cell = makeModuleCell(std::move(next_res));
         return g_moduleClass.createInstance(std::move(next_handle));
     });
     b.def("structLayout", 1, [](Value self, std::span<const Value> args) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::throwTypeError("KernelModule.structLayout: invalid receiver");
+        if (!h || !h->cell->result) return ev::throwTypeError("KernelModule.structLayout: invalid receiver");
         if (args.empty() || !ev::isString(args[0])) {
             return ev::throwTypeError("KernelModule.structLayout: requires a struct name string");
         }
         const std::string name = ev::toUtf8(args[0]);
-        const TypeRegistry& types = h->result->types;
+        const TypeRegistry& types = h->cell->result->types;
         const StructDef* sdef = types.find_struct(name);
         if (!sdef) {
             for (const auto& st : types.structs()) {
@@ -799,8 +858,8 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
     });
     b.accessor("functions", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::undefined();
-        const auto& fns = h->result->exported_functions;
+        if (!h || !h->cell->result) return ev::undefined();
+        const auto& fns = h->cell->result->exported_functions;
         ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(fns.size())));
         for (size_t i = 0; i < fns.size(); ++i) {
             ev::Persistent s(ev::fromUtf8(fns[i]));
@@ -810,12 +869,14 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
     });
     b.def("fn", 1, [](Value self, std::span<const Value> args) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-        if (!h || !h->result) return ev::throwTypeError("KernelModule.fn: invalid receiver");
+        if (!h || !h->cell->result) return ev::throwTypeError("KernelModule.fn: invalid receiver");
         if (args.empty() || !ev::isString(args[0])) {
             return ev::throwTypeError("KernelModule.fn: requires a function name string");
         }
         auto fn_handle = std::make_unique<FnHandle>();
-        fn_handle->module_result = h->result;
+        fn_handle->module_result = h->cell->result;
+        fn_handle->owner = h->cell;
+        fn_handle->generation = h->cell->generation;
         fn_handle->fn_name = ev::toUtf8(args[0]);
         std::string err;
         if (!buildPointKernelForFn(*fn_handle, &err)) {
@@ -851,6 +912,7 @@ void decorateBroKernelExtras(ev::ObjectBuilder& b) {
         g_registeredModules[canonicalModuleName(name)] = source;
         return ev::undefined();
     });
+    decorateReload(b);
     b.def("clearModules", 0, [](Value, std::span<const Value>) -> Value {
         std::lock_guard<std::mutex> lock(g_registeredModulesMu);
         g_registeredModules.clear();

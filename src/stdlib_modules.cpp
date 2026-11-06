@@ -316,6 +316,15 @@ std::unordered_map<std::string, std::string> ModuleRegistry::custom_modules() co
     return out;
 }
 
+std::vector<std::string> ModuleRegistry::imported_modules() const {
+    std::vector<std::string> out;
+    for (const auto& [k, e] : modules_) {
+        if (e.ast && !e.path.starts_with("<builtin:")) out.push_back(k);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 std::string ModuleRegistry::format_module_path(const std::vector<std::string>& path) {
     std::string out;
     for (size_t i = 0; i < path.size(); ++i) {

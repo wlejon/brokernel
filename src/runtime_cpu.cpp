@@ -282,11 +282,15 @@ const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::
     if (!cpu) return nullptr;
     std::call_once(cpu->once, [&] {
         try {
-            if (cpu->point) {
+            if (cpu->lower) {
+                cpu->lower(*cpu);
+                cpu->lower = nullptr;   // and the checked module it held
+            }
+            if (cpu->point && cpu->error.empty()) {
                 brass::codegen::KernelJit jit_point(cpu->options);
                 cpu->point_fn = jit_point.compile(*cpu->point);
             }
-            if (cpu->grid) {
+            if (cpu->grid && cpu->error.empty()) {
                 brass::codegen::KernelJit jit_grid(cpu->options);
                 cpu->grid_fn = jit_grid.compile(*cpu->grid);
             }
@@ -363,6 +367,16 @@ const std::string& CompiledKernel::cpu_error() const {
     return cpu ? cpu->error : kNoError;
 }
 
+uint32_t CompiledKernel::cpu_grid_lanes() const {
+    const CpuBuild* cpu = cpu_build(cpu_);
+    return cpu ? cpu->grid_lanes : 1;
+}
+
+uint32_t CompiledKernel::cpu_shared_bytes() const {
+    const CpuBuild* cpu = cpu_build(cpu_);
+    return cpu ? cpu->shared_bytes : 0;
+}
+
 bool CompiledKernel::eval_grid_point_cpu(
     int32_t gx, int32_t gy, int32_t gz,
     GridShape shape,
@@ -388,7 +402,7 @@ bool CompiledKernel::eval_grid_point_cpu(
     const int32_t lx = static_cast<int32_t>(std::max(1u, local_size[0]));
     const int32_t ly = static_cast<int32_t>(std::max(1u, local_size[1]));
     const int32_t lz = static_cast<int32_t>(std::max(1u, local_size[2]));
-    std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes, 64), 0);
+    std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes(), 64), 0);
     CpuPointContext ctx{
         gx, gy, gz, gw, gh, gd,
         gx % lx, gy % ly, gz % lz,
@@ -521,7 +535,7 @@ bool CompiledKernel::dispatch_cpu(
         std::vector<uint64_t> scratch_ret;
         void* ret_ptr = return_store_out;
         if (!ret_ptr) {
-            scratch_ret.resize((std::max<size_t>(return_byte_size, 8) * cpu_grid_lanes + 7) / 8);
+            scratch_ret.resize((std::max<size_t>(return_byte_size, 8) * cpu_grid_lanes() + 7) / 8);
             ret_ptr = scratch_ret.data();
         }
 
@@ -555,7 +569,7 @@ bool CompiledKernel::dispatch_cpu(
     const size_t wg_size = size_t(lsz[0]) * lsz[1] * lsz[2];
     const size_t ret_stride = std::max<size_t>(return_byte_size, 4);
     alignas(16) uint8_t scratch_ret[256] = {};
-    std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes, 64), 0);
+    std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes(), 64), 0);
 
     using PointFn = void (*)(const uint64_t*, const void*, void*);
     auto fn_ptr = cpu_point_fn().as<PointFn>();

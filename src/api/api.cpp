@@ -1,9 +1,13 @@
 #include "api_internal.h"
 
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace brokernel::api {
@@ -28,8 +32,10 @@ void collectAndReclaim() {
     if (t_device) t_device->reclaim();
 }
 
+thread_local std::vector<std::weak_ptr<ModuleCell>> t_moduleCells;
+
 const CompiledKernel* unwrapKernel(Value self) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    KernelHandle* h = kernelHandle(self);
     return h ? h->kernel.get() : nullptr;
 }
 
@@ -115,7 +121,7 @@ Value js_run(Value self, std::span<const Value> args) {
 // after every dispatch so far. Its stores are KernelBuffers; a kernel that
 // returns a value returns a new KernelBuffer of one value per cell.
 Value js_dispatch(Value self, std::span<const Value> args) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    KernelHandle* h = kernelHandle(self);
     if (!h) return ev::throwTypeError("Kernel.dispatch: invalid receiver");
     const CompiledKernel& k = *h->kernel;
     if (!t_device || !t_device->available()) {
@@ -280,7 +286,7 @@ void decorateKernel(ev::ObjectBuilder& b) {
     });
     b.accessor("cpuLanes", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);
-        return k ? ev::fromDouble(k->cpu_grid_lanes) : ev::undefined();
+        return k ? ev::fromDouble(k->cpu_grid_lanes()) : ev::undefined();
     });
     b.accessor("params", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);
@@ -301,7 +307,7 @@ void decorateKernel(ev::ObjectBuilder& b) {
 
 const CompileResult* unwrapModule(Value self) {
     auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
-    return h ? h->result.get() : nullptr;
+    return h ? h->cell->result.get() : nullptr;
 }
 
 void decorateModule(ev::ObjectBuilder& b) {
@@ -309,11 +315,14 @@ void decorateModule(ev::ObjectBuilder& b) {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
         if (!h) return ev::throwTypeError("KernelModule.kernel: invalid receiver");
         const std::string name = !args.empty() && ev::isString(args[0]) ? ev::toUtf8(args[0]) : "";
-        const CompiledKernel* k = h->result->find_kernel(name);
+        const std::shared_ptr<const CompileResult>& result = h->cell->result;
+        const CompiledKernel* k = result->find_kernel(name);
         if (!k) return ev::throwError("KernelModule.kernel: no kernel '" + name + "'");
         auto handle = std::make_unique<KernelHandle>();
-        handle->module_result = h->result;
-        handle->kernel = std::shared_ptr<const CompiledKernel>(h->result, k);
+        handle->module_result = result;
+        handle->kernel = std::shared_ptr<const CompiledKernel>(result, k);
+        handle->owner = h->cell;
+        handle->generation = h->cell->generation;
         if (k->grid_dim > 0 && !k->spirv.words.empty() && t_device && t_device->available()) {
             std::string err;
             handle->program = t_device->createProgram(*k, &err);
@@ -343,7 +352,7 @@ Value js_compile(Value, std::span<const Value> args) {
     auto result = std::make_shared<CompileResult>(compiler.compile_source(source, file, compile_opts));
     if (!result->ok) throwCompileError(*result);
     auto handle = std::make_unique<ModuleHandle>();
-    handle->result = std::move(result);
+    handle->cell = makeModuleCell(std::move(result));
     return g_moduleClass.createInstance(std::move(handle));
 }
 
@@ -367,6 +376,100 @@ Value ensureBroKernel() {
 
 GpuDevice* currentDevice() {
     return (t_device && t_device->available()) ? t_device.get() : nullptr;
+}
+
+std::shared_ptr<ModuleCell> makeModuleCell(std::shared_ptr<const CompileResult> result) {
+    auto cell = std::make_shared<ModuleCell>();
+    cell->result = std::move(result);
+    std::erase_if(t_moduleCells, [](const std::weak_ptr<ModuleCell>& w) { return w.expired(); });
+    t_moduleCells.push_back(cell);
+    return cell;
+}
+
+std::vector<std::shared_ptr<ModuleCell>> liveModuleCells() {
+    std::vector<std::shared_ptr<ModuleCell>> out;
+    for (const auto& w : t_moduleCells) {
+        if (auto c = w.lock()) out.push_back(std::move(c));
+    }
+    return out;
+}
+
+namespace {
+
+// One thread that drops what releaseLater hands it, joined at exit (before
+// the compiler's registries it was started after are destroyed).
+class Releaser {
+public:
+    ~Releaser() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+    void push(std::shared_ptr<const void> p) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            queue_.push_back(std::move(p));
+            if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mu_);
+        for (;;) {
+            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+            if (queue_.empty()) return;
+            std::vector<std::shared_ptr<const void>> batch;
+            batch.swap(queue_);
+            lock.unlock();
+            batch.clear();
+            lock.lock();
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<std::shared_ptr<const void>> queue_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+} // namespace
+
+void releaseLater(std::shared_ptr<const void> p) {
+    if (!p) return;
+    static Releaser releaser;
+    releaser.push(std::move(p));
+}
+
+KernelHandle* kernelHandle(Value self) {
+    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(self));
+    if (!h || !h->owner || h->owner->generation == h->generation) return h;
+    // Its module was reloaded: the same kernel of the new compile, with the
+    // knobs this kernel set on itself. A kernel the new source no longer
+    // has, or a compile of its knobs that fails, stays as it was.
+    h->generation = h->owner->generation;
+    std::shared_ptr<const CompileResult> res = h->owner->result;
+    if (!h->knobs.empty()) {
+        auto own = std::make_shared<CompileResult>(res->with_knobs(h->knobs));
+        if (!own->ok) return h;
+        res = std::move(own);
+    }
+    const CompiledKernel* nk = res->find_kernel(h->kernel->name);
+    if (!nk) return h;
+    releaseLater(std::exchange(h->module_result, res));
+    releaseLater(std::exchange(h->kernel, std::shared_ptr<const CompiledKernel>(res, nk)));
+    h->program.reset();
+    if (nk->grid_dim > 0 && !nk->spirv.words.empty()) {
+        if (GpuDevice* dev = currentDevice()) {
+            std::string err;
+            h->program = dev->createProgram(*nk, &err);
+        }
+    }
+    return h;
 }
 
 std::shared_ptr<GpuBuffer> allocateBuffer(size_t bytes, std::string* err) {
@@ -489,7 +592,7 @@ void setGpuDevice(std::shared_ptr<GpuDevice> device) {
 }
 
 std::shared_ptr<const CompiledKernel> kernelOf(Value v) {
-    auto* h = static_cast<KernelHandle*>(g_kernelClass.unwrap(v));
+    KernelHandle* h = kernelHandle(v);
     return h ? h->kernel : nullptr;
 }
 

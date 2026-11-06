@@ -605,7 +605,6 @@ LoweredKernelMir lower_kernel_to_mir(
     DiagnosticBag& diags) {
     LoweredKernelMir out;
     out.gpu_module = std::make_unique<brass::Module>(fn.name + "_gpu");
-    out.cpu_module = std::make_unique<brass::Module>(fn.name + "_cpu");
     // -----------------------------------------------------------------------
     // 1. Build GPU MIR Function (`gpu_function`)
     // -----------------------------------------------------------------------
@@ -787,8 +786,21 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         b.build_ret_void();
     }
+    return out;
+}
+
+bool has_cpu_lowering(const CheckedFunction& fn) {
+    return fn.stage == Stage::Compute && !fn.uses_textures;
+}
+
+void lower_kernel_cpu_to_mir(
+    const CheckedModule& mod,
+    const CheckedFunction& fn,
+    LoweredKernelMir& out,
+    DiagnosticBag& diags) {
     // 2. Build CPU Point & Grid MIR Functions (`cpu_point_function`, `cpu_grid_function`)
-    if (fn.stage != Stage::Compute || fn.uses_textures) return out;
+    if (!has_cpu_lowering(fn)) return;
+    out.cpu_module = std::make_unique<brass::Module>(fn.name + "_cpu");
     out.cpu_point_function = out.cpu_module->create_function(
         fn.name + "_cpu_point", brass::Type::void_type(),
         {brass::Type::ptr(), brass::Type::ptr(), brass::Type::ptr()});
@@ -880,7 +892,7 @@ LoweredKernelMir lower_kernel_to_mir(
         }
         b.build_ret_void();
     }
-    if (fn.uses_barriers_or_shared || (fn.grid_dim == 0 && fn.return_type.is_void()) || !fn.uses_grid_coords) return out;
+    if (fn.uses_barriers_or_shared || (fn.grid_dim == 0 && fn.return_type.is_void()) || !fn.uses_grid_coords) return;
     for (uint32_t lanes : {8u, 4u}) {
         if (!brass::host_has_avx2()) break;
         VectorPlan plan;
@@ -914,6 +926,5 @@ LoweredKernelMir lower_kernel_to_mir(
     if (!out.cpu_grid_function) {
         out.cpu_grid_function = build_cpu_grid(*out.cpu_module, mod, fn, out.block_bindings, diags, 0, nullptr);
     }
-    return out;
 }
 } // namespace brokernel

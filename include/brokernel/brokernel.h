@@ -269,6 +269,10 @@ public:
     // function's total is the stage's whole count.
     struct FunctionCost { std::string name; uint32_t self = 0; uint32_t total = 0; };
     std::vector<FunctionCost> function_costs;
+    // The code compiled, hashed: its SPIR-V, or for a kernel with no GPU
+    // build its lowered CPU functions (before they are built). Two compiles
+    // with one hash are the same kernel (bro.kernel.reload's `kernels`).
+    uint64_t code_hash = 0;
     bool probes_compiled = false;
     std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
     Type return_type = Type::void_type();
@@ -279,7 +283,6 @@ public:
     bool cpu_only = false;               // @cpu: no GPU build
     bool uses_grid_coords = false;
     bool uses_barriers_or_shared = false;
-    uint32_t cpu_shared_bytes = 0;
     int32_t max_stencil_radius = 0;
     int32_t stencil_halo[3] = {0, 0, 0};
 
@@ -288,24 +291,31 @@ public:
     std::string ptx;
     bool spirv_equivalent = false;
 
-    // The CPU builds: the point function and the grid function, compiled the
-    // first time either is asked for (most kernels only ever run on the GPU,
-    // and the native code is most of a compile). Invalid when the kernel has
-    // no CPU build or its compilation failed (cpu_error() says why).
+    // The CPU builds: the point function and the grid function, lowered and
+    // compiled the first time either is asked for (most kernels only ever run
+    // on the GPU, and the CPU functions, the grid's vectorized over lanes,
+    // are most of a compile). Invalid when the kernel has no CPU build or its
+    // lowering or compilation failed (cpu_error() says why).
     const brass::codegen::KernelFunction& cpu_point_fn() const;
     const brass::codegen::KernelFunction& cpu_grid_fn() const;
     const std::string& cpu_error() const;
     bool has_cpu_build() const noexcept { return cpu_ != nullptr; }
     // Cells the grid function computes per step along x: 8 or 4 (AVX2
-    // lanes), or 1 when it runs one cell at a time.
-    uint32_t cpu_grid_lanes = 1;
+    // lanes), or 1 when it runs one cell at a time (the CPU build is made).
+    uint32_t cpu_grid_lanes() const;
+    // Workgroup shared memory a CPU run needs (the CPU build is made).
+    uint32_t cpu_shared_bytes() const;
 
-    // The lowered CPU functions and their builds once made (compile_source).
+    // The CPU functions: `lower` makes them (the module the kernel was
+    // checked in held by it), then they are built once (compile_source).
     struct CpuBuild {
         std::once_flag once;
+        std::function<void(CpuBuild&)> lower;
         std::unique_ptr<brass::Module> module;
         brass::Function* point = nullptr;
         brass::Function* grid = nullptr;
+        uint32_t grid_lanes = 1;
+        uint32_t shared_bytes = 0;
         brass::codegen::KernelOptions options;
         brass::codegen::KernelFunction point_fn;
         brass::codegen::KernelFunction grid_fn;
@@ -532,6 +542,7 @@ struct CompileResult {
     std::string file_name = "kernel.bk";
     CompileOptions options;
     std::unordered_map<std::string, std::string> loaded_modules;
+    std::vector<std::string> imports;      // the modules it imported, directly or not (sorted)
     std::vector<std::filesystem::path> search_paths;
     ModuleRegistry::ModuleResolver module_resolver;
 
@@ -543,6 +554,15 @@ struct CompileResult {
 
     /// Recompiles the module with updated `@knob` overrides without editing source text.
     CompileResult with_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const;
+
+    /// True when `key` is this module's file or a module it imported.
+    bool depends_on(const std::string& key) const;
+    /// Recompiles with new sources, keyed by module name or by the root's
+    /// file name; every other module keeps the source it had. Without
+    /// `use_resolver` a module it did not hold yet is not found (a compile
+    /// off the thread the resolver runs JS on).
+    CompileResult with_sources(const std::unordered_map<std::string, std::string>& sources,
+                               bool use_resolver = true) const;
 };
 
 /// Stateful compiler holding a ModuleRegistry (standard library + custom modules + search paths).
