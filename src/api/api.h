@@ -124,4 +124,7 @@ bronze::Value bufferValue(std::shared_ptr<GpuBuffer> buffer);
 /// modules (`bro.kernel.registerModule`) or JS resolver (`bro.kernel.resolve`).
 std::optional<std::string> resolveRegisteredModule(std::string_view name);
 
+/// Registers a built-in host module (e.g. "tiles") that persists across clearModules().
+void registerHostModule(std::string_view name, std::string_view source);
+
 } // namespace brokernel::api

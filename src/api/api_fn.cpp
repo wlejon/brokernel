@@ -17,6 +17,8 @@ namespace {
 
 std::mutex g_registeredModulesMu;
 std::unordered_map<std::string, std::string> g_registeredModules;
+std::unordered_map<std::string, std::string> g_resolverFallback;
+std::unordered_map<std::string, std::string> g_hostModules;
 thread_local ev::Persistent t_moduleResolver;
 thread_local bool t_hasModuleResolver = false;
 
@@ -61,7 +63,12 @@ Value constValueToJs(const ConstValue& cv) {
 ConstValue jsToConstValue(Value v, const std::string& what) {
     if (ev::isBool(v)) return ConstValue::from_bool(ev::toBool(v));
     if (ev::isNumber(v)) return ConstValue::from_f64(ev::toDouble(v));
-    if (ev::isBigInt(v)) return ConstValue::from_int(ev::toInt64(v), Type::scalar_of(ScalarKind::I64));
+    if (ev::isBigInt(v)) {
+        ConstValue c;
+        c.type = Type::i64();
+        c.int_val = ev::toInt64(v);
+        return c;
+    }
     if (ev::isObject(v)) {
         const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
         if (n >= 1) {
@@ -295,7 +302,7 @@ Value js_kernelStats(Value self, std::span<const Value>) {
             const uint16_t op = static_cast<uint16_t>(word0 & 0xFFFFu);
             if (wc == 0 || i + wc > words.size()) break;
             ++instructions;
-            else if (op == 54) ++functions;
+            if (op == 54) ++functions;
             else if (op == 61 || op == 227) ++loads;
             else if (op == 62 || op == 228 || op == 99) ++stores;
             else if (op >= 87 && op <= 98) ++samples;
@@ -323,11 +330,10 @@ Value js_kernelStats(Value self, std::span<const Value>) {
         ev::ObjectBuilder eb;
         eb.set("name", execs[ei].name);
         eb.set("description", execs[ei].description);
-        eb.set("subgroupSize", static_cast<double>(execs[ei].subgroup_size));
+        eb.set("subgroupSize", static_cast<double>(execs[ei].subgroupSize));
         ev::ObjectBuilder sb;
-        for (const auto& st : execs[ei].stats) {
-            if (st.is_bool) sb.set(st.name, st.value != 0.0);
-            else sb.set(st.name, st.value);
+        for (const auto& st : execs[ei].statistics) {
+            sb.set(st.name, st.value);
         }
         ev::Persistent sv(sb.get());
         eb.set("statistics", sv.get());
@@ -635,17 +641,36 @@ std::optional<std::string> resolveRegisteredModule(std::string_view name) {
         };
         auto cacheAndReturn = [&](std::string src) -> std::optional<std::string> {
             std::lock_guard<std::mutex> lock(g_registeredModulesMu);
-            g_registeredModules[exact] = src;
-            g_registeredModules[norm] = src;
-            g_registeredModules[canon] = src;
+            g_resolverFallback[exact] = src;
+            g_resolverFallback[norm] = src;
+            g_resolverFallback[canon] = src;
             return src;
         };
         if (auto r = tryCall(canon)) return cacheAndReturn(std::move(*r));
         if (norm != canon) {
             if (auto r = tryCall(norm)) return cacheAndReturn(std::move(*r));
         }
+    } else {
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        if (auto it = g_resolverFallback.find(exact); it != g_resolverFallback.end()) return it->second;
+        if (auto it = g_resolverFallback.find(norm); it != g_resolverFallback.end()) return it->second;
+        if (auto it = g_resolverFallback.find(canon); it != g_resolverFallback.end()) return it->second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+        if (auto it = g_hostModules.find(exact); it != g_hostModules.end()) return it->second;
+        if (auto it = g_hostModules.find(norm); it != g_hostModules.end()) return it->second;
+        if (auto it = g_hostModules.find(canon); it != g_hostModules.end()) return it->second;
     }
     return std::nullopt;
+}
+
+void registerHostModule(std::string_view name, std::string_view source) {
+    const std::string src(source);
+    std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+    g_hostModules[std::string(name)] = src;
+    g_hostModules[normalizeModuleKey(name)] = src;
+    g_hostModules[canonicalModuleName(name)] = src;
 }
 
 void decorateFnClass(ev::ObjectBuilder& b) {
@@ -727,7 +752,7 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
             }
         }
         if (!sdef) return ev::null();
-        const Type st_type = Type::struct_of(sdef->id);
+        const Type st_type = Type::make_struct(sdef->id, sdef->name);
         const auto l140 = types.block_layout(st_type, true);
         const auto l430 = types.block_layout(st_type, false);
 
@@ -787,7 +812,7 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
 void decorateBroKernelExtras(ev::ObjectBuilder& b) {
     b.def("resolve", 1, [](Value, std::span<const Value> args) -> Value {
         if (args.empty() || ev::isNull(args[0]) || ev::isUndefined(args[0])) {
-            t_moduleResolver.reset();
+            t_moduleResolver.set(ev::undefined());
             t_hasModuleResolver = false;
             return ev::undefined();
         }
