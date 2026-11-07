@@ -28,7 +28,10 @@ endif()
 
 add_library(brokernel STATIC
     src/brokernel.cpp
+    src/compile_cache.cpp
+    src/compile_cache_store.cpp
     src/compile_result.cpp
+    src/compile_result_io.cpp
     src/kernel_report.cpp
     src/runtime_cpu.cpp
     src/diagnostics.cpp

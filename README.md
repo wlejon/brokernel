@@ -119,12 +119,43 @@ rapid world iteration by a coding agent:
 
 Source files use the `.bk` extension.
 
+## Compile cache
+
+`Compiler::compile_source` (and everything built on it: `compile_file`,
+`with_knobs`, `with_sources`, probed variants, `bro.kernel.compile`) loads a
+result from disk when `brokernel::set_compile_cache({dir, max_bytes})` names a
+directory (`include/brokernel/compile_cache.h`; off by default, and per
+compiler with `Compiler::set_use_compile_cache(false)`).
+
+- **Key:** the compiler build (the binary holding brokernel's code: path,
+  size, mtime; or `CompileCacheConfig::build_stamp`), brokernel's version, the
+  host's AVX2/FMA, the source, its file name and every `CompileOptions` field
+  (knob overrides in any order). An entry also records each module the compile
+  read (the import as asked, where it resolved, a hash of its source); a lookup
+  resolves each again as the compiler would now, without parsing, and a changed
+  or missing module is a miss. Only successful compiles are stored.
+- **A hit is the compile:** every `CompileResult` and `CompiledKernel` field
+  (SPIR-V, reflection, types, constants, probes, costs, hashes, diagnostics),
+  with source, options, modules, search paths and resolver from the compiler.
+  A kernel's CPU build is lowered on its first CPU run by compiling the source
+  again for that kernel (a `@cpu` kernel's too), and its probed variant when
+  first asked for. `CompileResult::cache_status` (`Off` / `Hit` / `Miss`) and
+  `cache_note` (why it missed) say which; `compile_cache_stats()` counts them.
+- **Store:** one `<key>.bkc` file per entry, written to a temporary file and
+  renamed, so threads and processes share a directory; a header with a format
+  version and checksum makes a truncated, damaged or foreign entry a miss. A hit
+  touches its mtime; a store that takes the directory past `max_bytes` (whole
+  4 KiB units) has a background thread delete the least recently used entries
+  down to 7/8 of it, and `flush_compile_cache()` waits for that trim. Deleting
+  the directory is always safe.
+
 ## Layout
 
 | Path | What |
 |------|------|
 | `include/brokernel/brokernel.h` | public C++ API: `compile_source` / `compile_file` / `Compiler`, `CompileResult` (`with_knobs`, `constants`, `probes`), `CompiledKernel` (CPU/GPU dispatch, point eval, `probe_cpu`, `probe_gpu`, `compare_cpu_gpu`) |
 | `include/brokernel/{ast,types,sema,lowering,module_loader,diagnostics}.h` | compiler stages and `ModuleRegistry` |
+| `include/brokernel/compile_cache.h`, `src/compile_cache*.cpp`, `src/compile_result_io.cpp` | the on-disk compile cache: configuration and lookup around `compile_source`, the entry files and their trim, a result's byte encoding |
 | `src/lexer.cpp`, `src/parser.cpp` | source to AST (`import` / `use`, `pub import`, `@knob`, `probe`) |
 | `src/sema*.cpp`, `src/types.cpp` | name resolution, re-exports, generics, type checking, forward-mode AD (`src/sema_ad.cpp`), quadrature (`expect`, `moments`, `cell_expect`) |
 | `src/lowering_*.cpp` | AST to brass MIR: GPU SPIR-V entry points, CPU point/grid functions, and CPU/GPU/fragment probes |

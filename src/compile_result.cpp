@@ -1,10 +1,46 @@
 // A compile made again from what it was compiled from: with other knobs, or
 // with new sources for some of its modules.
 #include "brokernel/brokernel.h"
+#include "compile_internal.h"
+
+#include <brass/target/host_cpu.hpp>
 
 #include <algorithm>
 
 namespace brokernel {
+
+namespace detail {
+
+std::function<std::shared_ptr<const CompiledKernel>()> probed_variant_builder(const CompileResult& res,
+                                                                              const std::string& kernel) {
+    CompileOptions popts = res.options;
+    popts.enable_probes = true;
+    popts.entry_name = kernel;
+    return [src = res.source, fname = res.file_name, popts, mods = res.loaded_modules, sps = res.search_paths,
+            resolver = res.module_resolver]() -> std::shared_ptr<const CompiledKernel> {
+        Compiler c;
+        for (const auto& sp : sps) c.add_search_path(sp);
+        for (const auto& [mn, ms] : mods) c.register_module(mn, ms);
+        if (resolver) c.set_module_resolver(resolver);
+        auto pres = c.compile_source(src, fname, popts);
+        if (!pres.ok || pres.kernels.empty()) return nullptr;
+        return std::make_shared<CompiledKernel>(std::move(pres.kernels.front()));
+    };
+}
+
+std::shared_ptr<CompiledKernel::CpuBuild> new_cpu_build(const CompileOptions& opts) {
+    auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
+    cpu->options.opt_level = opts.opt_level;
+    cpu->options.enable_optimizations = (opts.opt_level > 0);
+    // Fast math fuses multiply-adds where the host has FMA.
+    cpu->options.enable_fma = brass::host_has_fma();
+    cpu->options.enable_parallel = false;
+    cpu->options.enable_superopt = false;
+    cpu->options.enable_smt_guard_elim = false;
+    return cpu;
+}
+
+} // namespace detail
 
 CompileResult CompileResult::with_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const {
     Compiler compiler;

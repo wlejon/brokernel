@@ -1,4 +1,5 @@
 #include "brokernel/brokernel.h"
+#include "compile_internal.h"
 #include "kernel_report.h"
 
 #include <brass/target/host_cpu.hpp>
@@ -715,7 +716,7 @@ void Compiler::add_search_path(std::filesystem::path dir) {
     modules_.add_search_path(std::move(dir));
 }
 
-CompileResult Compiler::compile_source(
+CompileResult Compiler::compile_uncached(
     std::string_view source,
     std::string file_name,
     const CompileOptions& opts) {
@@ -833,25 +834,7 @@ CompileResult Compiler::compile_source(
         ck.block_bindings = lowered.block_bindings;
         ck.probes = fn->probes;
         ck.probes_compiled = opts.enable_probes && !fn->probes.empty();
-        if (!opts.enable_probes && !fn->probes.empty()) {
-            std::string src_copy = res.source;
-            std::string fname_copy = res.file_name;
-            CompileOptions popts = opts;
-            popts.enable_probes = true;
-            popts.entry_name = ck.name;
-            auto mods_copy = res.loaded_modules;
-            auto sp_copy = res.search_paths;
-            auto res_copy = res.module_resolver;
-            ck.build_probed_variant = [src_copy, fname_copy, popts, mods_copy, sp_copy, res_copy]() -> std::shared_ptr<const CompiledKernel> {
-                Compiler c;
-                for (const auto& sp : sp_copy) c.add_search_path(sp);
-                for (const auto& [mn, ms] : mods_copy) c.register_module(mn, ms);
-                if (res_copy) c.set_module_resolver(res_copy);
-                auto pres = c.compile_source(src_copy, fname_copy, popts);
-                if (!pres.ok || pres.kernels.empty()) return nullptr;
-                return std::make_shared<CompiledKernel>(std::move(pres.kernels.front()));
-            };
-        }
+        if (!opts.enable_probes && !fn->probes.empty()) ck.build_probed_variant = detail::probed_variant_builder(res, ck.name);
         ck.uses_barriers_or_shared = lowered.uses_barriers_or_shared;
         ck.return_type = fn->return_type;
         ck.return_leaf_kinds = checked->types.flatten_scalars(fn->return_type);
@@ -903,14 +886,7 @@ CompileResult Compiler::compile_source(
             }
 
             if (opts.compile_cpu && has_cpu_lowering(*fn)) {
-                auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
-                cpu->options.opt_level = opts.opt_level;
-                cpu->options.enable_optimizations = (opts.opt_level > 0);
-                // Fast math fuses multiply-adds where the host has FMA.
-                cpu->options.enable_fma = brass::host_has_fma();
-                cpu->options.enable_parallel = false;
-                cpu->options.enable_superopt = false;
-                cpu->options.enable_smt_guard_elim = false;
+                auto cpu = detail::new_cpu_build(opts);
                 // The CPU functions from the checked module, into the build.
                 auto lower = [checked, fn, bindings = lowered.block_bindings](CompiledKernel::CpuBuild& b,
                                                                              DiagnosticBag& diags) {

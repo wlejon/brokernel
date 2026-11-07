@@ -3,6 +3,7 @@
 // SPIR-V for the GPU and to native code for the CPU. See README.md.
 
 #include "brokernel/ast.h"
+#include "brokernel/compile_cache.h"
 #include "brokernel/diagnostics.h"
 #include "brokernel/lowering.h"
 #include "brokernel/module_loader.h"
@@ -546,6 +547,12 @@ struct CompileResult {
     std::vector<std::filesystem::path> search_paths;
     ModuleRegistry::ModuleResolver module_resolver;
 
+    // Diagnostic, not content: whether it came from the compile cache
+    // (compile_cache.h), and for a miss a short reason ("no entry",
+    // "module changed: world::fields", ...).
+    CacheStatus cache_status = CacheStatus::Off;
+    std::string cache_note;
+
     const CompiledKernel* find_kernel(std::string_view name) const noexcept;
     const CompiledKernel* default_kernel() const noexcept {
         return kernels.empty() ? nullptr : &kernels.front();
@@ -579,6 +586,7 @@ public:
         modules_.set_resolver(std::move(resolver));
     }
 
+    // Through the compile cache when one is set (compile_cache.h).
     CompileResult compile_source(
         std::string_view source,
         std::string file_name = "kernel.bk",
@@ -588,8 +596,15 @@ public:
         const std::filesystem::path& path,
         const CompileOptions& opts = {});
 
+    /// Whether this compiler's compiles go through the compile cache (on by
+    /// default; it is used only when set_compile_cache names a directory).
+    void set_use_compile_cache(bool on) noexcept { use_cache_ = on; }
+
 private:
+    CompileResult compile_uncached(std::string_view source, std::string file_name, const CompileOptions& opts);
+
     ModuleRegistry modules_;
+    bool use_cache_ = true;
 };
 
 /// Convenience one-shot compilation functions.

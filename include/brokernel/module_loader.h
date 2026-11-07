@@ -59,6 +59,28 @@ public:
     /// Formats a module path vector like `{"std", "noise"}` to `"std::noise"`.
     static std::string format_module_path(const std::vector<std::string>& path);
 
+    /// An import as load_module was asked for it: the name or path, and the
+    /// directory of the file importing it.
+    struct ModuleRequest {
+        std::string name;
+        std::filesystem::path importing_dir;
+        bool operator==(const ModuleRequest& o) const { return name == o.name && importing_dir == o.importing_dir; }
+    };
+    /// Records each distinct request load_module receives until
+    /// take_requests (the compile cache's record of what a compile read).
+    void record_requests() { recording_ = true; requests_.clear(); }
+    std::vector<ModuleRequest> take_requests();
+
+    /// What load_module(name, ..., importing_dir) would load, found (and
+    /// registered) as it finds it, but not parsed; nullopt when not found.
+    /// The pointers stay valid until the module is registered again.
+    struct Resolved {
+        std::string key;
+        const std::string* path = nullptr;
+        const std::string* source = nullptr;
+    };
+    std::optional<Resolved> resolve(std::string_view name, const std::filesystem::path& importing_dir);
+
 private:
     struct Entry {
         std::string name;
@@ -73,6 +95,8 @@ private:
     std::unordered_map<std::string, std::string> aliases_; // e.g. "std::noise" -> "noise"
     std::vector<std::filesystem::path> search_paths_;
     ModuleResolver resolver_;
+    bool recording_ = false;
+    std::vector<ModuleRequest> requests_;
 
     void register_builtin_modules();
     Entry* find_or_discover(std::string_view key, const std::filesystem::path& importing_dir);

@@ -403,6 +403,18 @@ ModuleRegistry::Entry* ModuleRegistry::find_or_discover(
     return nullptr;
 }
 
+std::vector<ModuleRegistry::ModuleRequest> ModuleRegistry::take_requests() {
+    recording_ = false;
+    return std::move(requests_);
+}
+
+std::optional<ModuleRegistry::Resolved> ModuleRegistry::resolve(std::string_view name,
+                                                                 const std::filesystem::path& importing_dir) {
+    Entry* entry = find_or_discover(name, importing_dir);
+    if (!entry) return std::nullopt;
+    return Resolved{entry->name, &entry->path, &entry->source};
+}
+
 bool ModuleRegistry::has_module(std::string_view name) const {
     std::string k(name);
     if (aliases_.count(k)) k = aliases_.at(k);
@@ -414,6 +426,10 @@ const ModuleAst* ModuleRegistry::load_module(
     const SourceSpan& import_site,
     DiagnosticBag& diags,
     const std::filesystem::path& importing_file_dir) {
+    if (recording_) {
+        ModuleRequest req{std::string(name_or_path), importing_file_dir};
+        if (std::find(requests_.begin(), requests_.end(), req) == requests_.end()) requests_.push_back(std::move(req));
+    }
     Entry* entry = find_or_discover(name_or_path, importing_file_dir);
     if (!entry) {
         diags.error(import_site, "module '" + std::string(name_or_path) + "' not found");
