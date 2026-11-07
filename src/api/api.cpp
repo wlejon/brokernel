@@ -342,6 +342,8 @@ void decorateModule(ev::ObjectBuilder& b) {
     decorateModuleExtras(b);
 }
 
+} // namespace
+
 Value js_compile(Value, std::span<const Value> args) {
     if (args.empty() || !ev::isString(args[0])) return ev::throwTypeError("bro.kernel.compile: the source is a string");
     const std::string source = ev::toUtf8(args[0]);
@@ -349,12 +351,16 @@ Value js_compile(Value, std::span<const Value> args) {
     Compiler compiler;
     CompileOptions compile_opts;
     configureCompilerModulesAndOptions(args, compiler, file, compile_opts);
-    auto result = std::make_shared<CompileResult>(compiler.compile_source(source, file, compile_opts));
+    auto result = compileOff([&] {
+        CompileResult r = compiler.compile_source(source, file, compile_opts);
+        prebuildCpuOnlyKernels(r);
+        return r;
+    });
     if (!result->ok) throwCompileError(*result);
-    auto handle = std::make_unique<ModuleHandle>();
-    handle->cell = makeModuleCell(std::move(result));
-    return g_moduleClass.createInstance(std::move(handle));
+    return makeModuleValue(std::move(result));
 }
+
+namespace {
 
 Value ensureBroKernel() {
     ev::Persistent broP;
@@ -454,7 +460,7 @@ KernelHandle* kernelHandle(Value self) {
     h->generation = h->owner->generation;
     std::shared_ptr<const CompileResult> res = h->owner->result;
     if (!h->knobs.empty()) {
-        auto own = std::make_shared<CompileResult>(res->with_knobs(h->knobs));
+        auto own = compileOff([&] { return res->with_knobs(h->knobs); });
         if (!own->ok) return h;
         res = std::move(own);
     }
@@ -539,7 +545,18 @@ GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
     return s;
 }
 
+Value makeModuleValue(std::shared_ptr<const CompileResult> result) {
+    auto handle = std::make_unique<ModuleHandle>();
+    handle->cell = makeModuleCell(std::move(result));
+    return g_moduleClass.createInstance(std::move(handle));
+}
+
 [[noreturn]] void throwCompileError(const CompileResult& r) {
+    ev::Persistent err(makeCompileError(r));
+    ev::throwValue(err.get());
+}
+
+Value makeCompileError(const CompileResult& r) {
     ev::Persistent list(ev::makeArray(static_cast<uint32_t>(r.diagnostics.items().size())));
     uint32_t i = 0;
     for (const Diagnostic& d : r.diagnostics.items()) {
@@ -561,9 +578,12 @@ GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
         auto made = ev::construct(c.get(), std::span<const Value>(&arg, 1));
         if (!made.thrown) err.set(made.value);
     }
-    if (!ev::isObject(err.get())) ev::throwError("bro.kernel.compile: " + r.error_message());
+    if (!ev::isObject(err.get())) {
+        err.set(ev::createObject());
+        err.set(ev::setProperty(err.get(), "message", ev::fromUtf8("bro.kernel.compile: " + r.error_message())));
+    }
     err.set(ev::setProperty(err.get(), "diagnostics", list.get()));
-    ev::throwValue(err.get());
+    return err.get();
 }
 
 void installKernel() {
@@ -582,6 +602,8 @@ void installKernel() {
         return ev::fromBool(t_device && t_device->available());
     });
     b.def("compile", 2, js_compile);
+    decorateAsync(b);
+    installAsyncRealmHook();
     if (t_device) b.def("createBuffer", 1, js_createBuffer);
     decorateBroKernelExtras(b);
 }

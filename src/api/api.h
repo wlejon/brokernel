@@ -22,6 +22,22 @@
 // A store argument of dispatch() is a KernelBuffer, bounded like a typed
 // array is on the CPU. kernelOf() / bufferOf() hand the host the compiled
 // kernel and the buffer behind a Kernel or KernelBuffer object.
+//
+// Compiling off the page thread:
+//
+//   const mod = await bro.kernel.compileAsync(source, { file, modules });
+//
+// compileAsync takes compile()'s arguments and returns a Promise of the same
+// KernelModule, rejected with the same Error (its `.diagnostics`) where
+// compile() would throw. On a thread with a wait pump (setThreadWaitPump) it
+// starts the compile on a worker at once, so an app can start all its
+// compiles together; the promises settle at the host's settleAsyncCompiles().
+// On a thread with no pump it compiles at once and returns a settled promise.
+// With a pump, compile() and the other compiles the API makes (withKnobs,
+// knobs(), fn(), reload()) also run on a worker while the thread waits,
+// pumping. Either way bro.kernel.resolve's function runs on this thread
+// alone: a worker asks it for a module the registered, resolved and host
+// modules do not hold.
 
 #include <cstddef>
 #include <cstdint>
@@ -126,5 +142,28 @@ std::optional<std::string> resolveRegisteredModule(std::string_view name);
 
 /// Registers a built-in host module (e.g. "tiles") that persists across clearModules().
 void registerHostModule(std::string_view name, std::string_view source);
+
+/// What the current thread runs while it waits for a compile worker: called
+/// every `intervalMs` (and when the worker asks it for a module) until the
+/// worker is done. The host's pump lets the OS process its window's messages;
+/// it must not run script. With one set, this thread's compiles run on
+/// workers (see the header comment); null removes it.
+using WaitPump = void (*)();
+void setThreadWaitPump(WaitPump pump, int intervalMs);
+
+/// On the thread that called compileAsync, once a frame: answers its
+/// in-flight compiles' module requests and settles the finished ones'
+/// promises, each in the realm that called compileAsync. With `waitAll` it
+/// waits (pumping) until every compile of this thread has finished and is
+/// settled, so a promise settles at the first call after compileAsync
+/// (deterministic for headless runs). The promises' reactions run at the
+/// host's next microtask checkpoint.
+void settleAsyncCompiles(bool waitAll);
+
+/// Drops this thread's pending compileAsync jobs (their promises never
+/// settle) and joins their workers. A realm destroyed with jobs pending drops
+/// its own the same way; their workers are joined here or by a later
+/// settleAsyncCompiles.
+void shutdownKernelAsync();
 
 } // namespace brokernel::api

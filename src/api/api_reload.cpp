@@ -71,22 +71,27 @@ Value js_reload(Value, std::span<const Value> args) {
     }
     // The modules compile together, a thread each, from the sources they
     // hold (the resolver runs JS, on this thread alone); one that needs a
-    // module it did not hold (a new import) compiles again here with it.
+    // module it did not hold (a new import) compiles again with the resolver.
+    // All of it off this thread when it has a wait pump (runCompileWork).
     {
-        std::vector<std::thread> threads;
         std::vector<std::shared_ptr<CompileResult>> results(next.size());
+        runCompileWork([&] {
+            std::vector<std::thread> threads;
+            for (size_t i = 0; i < next.size(); ++i) {
+                threads.emplace_back([&, i] {
+                    try {
+                        results[i] = std::make_shared<CompileResult>(next[i].cell->result->with_sources(sources, false));
+                    } catch (...) {
+                        results[i] = std::make_shared<CompileResult>();   // not ok: compiled again below
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+            for (size_t i = 0; i < next.size(); ++i) {
+                if (!results[i]->ok) results[i] = std::make_shared<CompileResult>(next[i].cell->result->with_sources(sources));
+            }
+        });
         for (size_t i = 0; i < next.size(); ++i) {
-            threads.emplace_back([&, i] {
-                try {
-                    results[i] = std::make_shared<CompileResult>(next[i].cell->result->with_sources(sources, false));
-                } catch (...) {
-                    results[i] = std::make_shared<CompileResult>();   // not ok: compiled again on this thread
-                }
-            });
-        }
-        for (auto& t : threads) t.join();
-        for (size_t i = 0; i < next.size(); ++i) {
-            if (!results[i]->ok) results[i] = std::make_shared<CompileResult>(next[i].cell->result->with_sources(sources));
             if (!results[i]->ok) throwCompileError(*results[i]);
             next[i].result = std::move(results[i]);
         }

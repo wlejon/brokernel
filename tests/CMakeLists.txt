@@ -26,3 +26,13 @@ brokernel_add_test(test_fastnoise2_parity)
 target_link_libraries(test_fastnoise2_parity PRIVATE FastNoise)
 brokernel_add_test(test_wishlist)
 brokernel_add_test(test_compile_cache)
+# The bro.kernel binding, in a build with BROKERNEL_ENABLE_API.
+if(TARGET brokernel_api)
+    brokernel_add_test(test_kernel_api)
+    target_link_libraries(test_kernel_api PRIVATE brokernel_api)
+    if(WIN32)
+        add_custom_command(TARGET test_kernel_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:test_kernel_api> $<TARGET_FILE_DIR:test_kernel_api>
+            COMMAND_EXPAND_LISTS)
+    endif()
+endif()

@@ -8,6 +8,7 @@
 #include "embed/embed_typed_array.h"
 
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -220,7 +221,52 @@ struct HeldArgs {
 
 Value decodeLeaves(const CompiledKernel& k, const uint8_t* raw);
 GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what);
+// The Error a failed compile throws (its message and `.diagnostics`).
+Value makeCompileError(const CompileResult& r);
 [[noreturn]] void throwCompileError(const CompileResult& r);
+// bro.kernel.compile(source, opts).
+Value js_compile(Value self, std::span<const Value> args);
+// A KernelModule object over `result`, in the current realm.
+Value makeModuleValue(std::shared_ptr<const CompileResult> result);
+
+// --- Compiling off the page thread (api_async.cpp) ---------------------------
+//
+// runCompileWork runs `work` on a worker thread while this thread waits in
+// steps of its wait pump's interval, calling the pump between steps and
+// answering the worker's module requests (the JS resolver runs here, never on
+// the worker); inline when this thread has no pump, or is itself a worker.
+// `work` touches no JS value or realm: it compiles. A JS resolver that throws
+// is not asked again (the worker's requests answer nothing), and its exception
+// is rethrown here once the worker is done.
+void runCompileWork(const std::function<void()>& work);
+
+// `compile()` (a CompileResult) through runCompileWork.
+template <typename F>
+std::shared_ptr<CompileResult> compileOff(F&& compile) {
+    std::shared_ptr<CompileResult> out;
+    runCompileWork([&] { out = std::make_shared<CompileResult>(compile()); });
+    return out;
+}
+
+// On a compile worker: the module source as this thread's owner would resolve
+// it (the global tables here, the JS resolver there).
+bool onCompileWorker();
+std::optional<std::string> workerResolve(std::string_view name);
+// On a compile worker, the CPU builds of `r`'s @cpu kernels, made now rather
+// than at their first run on the page thread (a cache hit lowers them then).
+void prebuildCpuOnlyKernels(const CompileResult& r);
+
+// The module tables (api_modules.cpp). resolveFromTables reads the registered
+// and resolved modules (and the host's with `withHostModules`) with no JS;
+// resolveWithJs is resolveRegisteredModule on the owning thread, a resolver's
+// throw left in `thrown` (`threw`) rather than raised.
+bool threadHasJsResolver();
+std::optional<std::string> resolveFromTables(std::string_view name, bool withHostModules);
+std::optional<std::string> resolveWithJs(std::string_view name, ev::Persistent& thrown, bool& threw);
+void registerModulesInto(Compiler& compiler);
+void decorateModuleRegistry(ev::ObjectBuilder& b);   // resolve, registerModule, clearModules
+void decorateAsync(ev::ObjectBuilder& b);            // compileAsync
+void installAsyncRealmHook();
 
 void decorateFnClass(ev::ObjectBuilder& b);
 void decorateModuleExtras(ev::ObjectBuilder& b);
