@@ -259,6 +259,9 @@ void prebuildCpuOnlyKernels(const CompileResult& r);
 // Waits (pumped, as a compile does) for `k`'s CPU build, making it if no
 // thread has begun it.
 void ensureCpuBuilt(const CompiledKernel& k);
+// module.cpuReady(): a promise settled (settleAsyncCompiles) once `r`'s @cpu
+// kernels' CPU builds are made, begun now if none was.
+Value cpuReadyPromise(const CompileResult& r);
 
 // The module tables (api_modules.cpp). resolveFromTables reads the registered
 // and resolved modules (and the host's with `withHostModules`) with no JS;

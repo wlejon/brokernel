@@ -291,15 +291,96 @@ void joinPrebuilds(bool finishedOnly) {
     for (auto& p : join) p.thread.join();
 }
 
-} // namespace
+using CpuBuilds = std::vector<std::shared_ptr<CompiledKernel::CpuBuild>>;
 
-void prebuildCpuOnlyKernels(const CompileResult& r) {
-    if (!t_channel) return;
-    std::vector<std::shared_ptr<CompiledKernel::CpuBuild>> builds;
+// `r`'s @cpu kernels' builds not made yet.
+CpuBuilds unbuiltCpuOnly(const CompileResult& r) {
+    CpuBuilds builds;
     for (const auto& k : r.kernels) {
         if (k.cpu_only && k.has_cpu_build() && !k.cpu_built()) builds.push_back(k.cpu_);
     }
-    if (builds.empty()) return;
+    return builds;
+}
+
+bool allBuilt(const CpuBuilds& builds) {
+    return std::all_of(builds.begin(), builds.end(), [](const auto& b) { return b->ready.load(std::memory_order_acquire); });
+}
+
+// The builds made on a thread of their own (one a build another thread has
+// begun waits for it there).
+void startCpuBuilds(CpuBuilds builds);
+
+// --- cpuReady ------------------------------------------------------------------
+
+// A module's cpuReady() promise, settled by settleAsyncCompiles once its
+// builds are made.
+struct CpuWait {
+    ev::Realm* realm = nullptr;
+    ev::Persistent promise;
+    CpuBuilds builds;
+};
+thread_local std::vector<std::unique_ptr<CpuWait>> t_cpuWaits;
+
+// The ready ones out of the list, then resolved in their realms (which runs
+// JS); with waitAll, waits (pumped) until none is left.
+void settleCpuWaits(bool waitAll) {
+    uint64_t seen = wakeEvents();
+    while (!t_cpuWaits.empty()) {
+        std::vector<std::unique_ptr<CpuWait>> ready;
+        for (auto it = t_cpuWaits.begin(); it != t_cpuWaits.end();) {
+            if (allBuilt((*it)->builds)) {
+                ready.push_back(std::move(*it));
+                it = t_cpuWaits.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto& w : ready) {
+            if (!w->realm) continue;
+            ev::RealmScope scope(w->realm);
+            ev::Persistent p(w->promise.get());
+            w->promise.set(ev::undefined());
+            ev::resolvePromise(p.get(), ev::undefined());
+        }
+        if (!waitAll || t_cpuWaits.empty()) break;
+        waitStep(seen);
+    }
+}
+
+} // namespace
+
+// module.cpuReady() -> Promise<undefined>: once the module's @cpu kernels'
+// CPU builds are made (begun now if none was), so their first eval or run
+// does not wait in a frame.
+Value cpuReadyPromise(const CompileResult& r) {
+    ev::Persistent promise(ev::createPromise());
+    CpuBuilds builds = unbuiltCpuOnly(r);
+    if (builds.empty()) {
+        ev::resolvePromise(promise.get(), ev::undefined());
+        return promise.get();
+    }
+    if (!t_pump || t_channel) {
+        // No pump: made now, the promise settled already.
+        for (const auto& b : builds) {
+            CompiledKernel k;
+            k.cpu_ = b;
+            (void)k.cpu_error();
+        }
+        ev::resolvePromise(promise.get(), ev::undefined());
+        return promise.get();
+    }
+    startCpuBuilds(builds);
+    auto w = std::make_unique<CpuWait>();
+    w->realm = ev::currentRealm();
+    w->promise.set(promise.get());
+    w->builds = std::move(builds);
+    t_cpuWaits.push_back(std::move(w));
+    return promise.get();
+}
+
+namespace {
+
+void startCpuBuilds(CpuBuilds builds) {
     joinPrebuilds(/*finishedOnly=*/true);
     auto done = std::make_shared<std::atomic<bool>>(false);
     std::thread t([builds = std::move(builds), done] {
@@ -316,6 +397,14 @@ void prebuildCpuOnlyKernels(const CompileResult& r) {
     });
     std::lock_guard<std::mutex> lock(g_prebuildMu);
     g_prebuilds.push_back({std::move(t), std::move(done)});
+}
+
+} // namespace
+
+void prebuildCpuOnlyKernels(const CompileResult& r) {
+    if (!t_channel) return;
+    CpuBuilds builds = unbuiltCpuOnly(r);
+    if (!builds.empty()) startCpuBuilds(std::move(builds));
 }
 
 void ensureCpuBuilt(const CompiledKernel& k) {
@@ -363,6 +452,13 @@ void decorateAsync(ev::ObjectBuilder& b) {
 
 void installAsyncRealmHook() {
     ev::addRealmDestroyHook(onRealmDestroyed);
+    ev::addRealmDestroyHook([](ev::Realm* realm) {
+        for (auto& w : t_cpuWaits) {
+            if (w->realm != realm) continue;
+            w->realm = nullptr;
+            w->promise.set(ev::undefined());
+        }
+    });
 }
 
 void setThreadWaitPump(WaitPump pump, int intervalMs) {
@@ -371,6 +467,7 @@ void setThreadWaitPump(WaitPump pump, int intervalMs) {
 }
 
 void settleAsyncCompiles(bool waitAll) {
+    settleCpuWaits(waitAll);
     if (t_jobs.empty()) return;
     uint64_t seen = wakeEvents();
     for (;;) {
@@ -407,6 +504,7 @@ void shutdownKernelAsync() {
     for (auto& j : jobs) {
         if (j->w.thread.joinable()) j->w.thread.join();
     }
+    t_cpuWaits.clear();
     joinPrebuilds(/*finishedOnly=*/false);
 }
 

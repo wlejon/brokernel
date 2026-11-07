@@ -343,6 +343,11 @@ void decorateModule(ev::ObjectBuilder& b) {
         }
         return arr.get();
     });
+    b.def("cpuReady", 0, [](Value self, std::span<const Value>) -> Value {
+        const CompileResult* r = unwrapModule(self);
+        if (!r) return ev::throwTypeError("KernelModule.cpuReady: invalid receiver");
+        return cpuReadyPromise(*r);
+    });
     decorateModuleExtras(b);
 }
 

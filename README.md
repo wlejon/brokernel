@@ -144,7 +144,8 @@ compiler with `Compiler::set_use_compile_cache(false)`).
   again for that kernel (a `@cpu` kernel's too), and its probed variant when
   first asked for. Through the JS API with a wait pump, a `@cpu` kernel's CPU
   build begins on a thread of its own as its compile ends, and its first
-  `eval` / `run` waits for it pumped. One KernelJit compile makes a kernel's
+  `eval` / `run` waits for it pumped; `module.cpuReady()` is a promise
+  settled once every one is built, the frames going on. One KernelJit compile makes a kernel's
   point and grid functions both (they share a module). `CompileResult::cache_status` (`Off` / `Hit` / `Miss`) and
   `cache_note` (why it missed) say which; `compile_cache_stats()` counts them.
 - **Store:** one `<key>.bkc` file per entry, written to a temporary file and
@@ -166,7 +167,7 @@ compiler with `Compiler::set_use_compile_cache(false)`).
 | `src/sema*.cpp`, `src/types.cpp` | name resolution, re-exports, generics, type checking, forward-mode AD (`src/sema_ad.cpp`), quadrature (`expect`, `moments`, `cell_expect`) |
 | `src/lowering_*.cpp` | AST to brass MIR: GPU SPIR-V entry points, CPU point/grid functions, and CPU/GPU/fragment probes |
 | `src/stdlib_*.cpp` | built-in modules `std::math`, `std::noise`, `std::filter`, `std::sphere`, `std::color` |
-| `src/api/api.h`, `src/api/api*.cpp` | bronze JS bindings (`bro.kernel`): `compile`, `compileAsync` (off-thread compiles under a host wait pump, `api_async.cpp`), `resolve`, `registerModule`, `KernelModule` (`kernel`, `fn`, `consts`, `knobs`, `withKnobs`, `structLayout`), `Kernel` (`eval`, `run`, `dispatch`, `probe`, `knobs`), `KernelBuffer` |
+| `src/api/api.h`, `src/api/api*.cpp` | bronze JS bindings (`bro.kernel`): `compile`, `compileAsync` (off-thread compiles under a host wait pump, `api_async.cpp`), `resolve`, `registerModule`, `KernelModule` (`kernel`, `fn`, `cpuReady`, `consts`, `knobs`, `withKnobs`, `structLayout`), `Kernel` (`eval`, `run`, `dispatch`, `probe`, `knobs`), `KernelBuffer` |
 | `tests/` | unit and parity tests for lexer/parser, sema, modules/generics, SPIR-V stages, CPU/GPU parity, math, FastNoise2 parity, and agent wishlist features (`test_wishlist.cpp`) |
 | `bench/bench_hillclimb*.cpp` | parity and speed harness for `std::noise`, 2D stencils, and planetary `f64` height fields against FastNoise2 and `glslc` |
 

@@ -217,6 +217,34 @@ void test_cpu_prebuild() {
     ev::drainMicrotasks();
     CHECK(out.settled == 1 && out.fulfilled);
     CHECK(evalF(out.value.get(), 3.0) == 28.0);
+
+    // cpuReady(): a promise settled once the builds are made, a frame's
+    // settle away; for a module whose builds were never begun (compiled with
+    // no pump, no worker to begin them) it begins them.
+    auto awaitReady = [](Value mod) {
+        ev::Persistent m(mod);
+        auto p = callMethod(m.get(), "cpuReady", {});
+        CHECK(!p.thrown);
+        Outcome ready;
+        ev::Persistent pv(p.value);
+        observe(pv.get(), ready);
+        settleAsyncCompiles(true);
+        ev::drainMicrotasks();
+        CHECK(ready.settled == 1 && ready.fulfilled);
+    };
+    auto fresh = compileJs("compile", cpuSource(10));
+    CHECK(!fresh.thrown);
+    ev::Persistent freshMod(fresh.value);
+    awaitReady(freshMod.get());
+    CHECK(evalF(freshMod.get(), 2.0) == 21.0);
+    setThreadWaitPump(nullptr, 0);
+    auto unbegun = compileJs("compile", cpuSource(11));
+    CHECK(!unbegun.thrown);
+    ev::Persistent unbegunMod(unbegun.value);
+    setThreadWaitPump(countingPump, 1);
+    awaitReady(unbegunMod.get());
+    CHECK(evalF(unbegunMod.get(), 2.0) == 23.0);
+    awaitReady(unbegunMod.get());   // made already: settled at once
     setThreadWaitPump(nullptr, 0);
     std::cout << "  @cpu builds beside the compile: ok\n";
 }
