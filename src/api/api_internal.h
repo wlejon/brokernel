@@ -252,9 +252,13 @@ std::shared_ptr<CompileResult> compileOff(F&& compile) {
 // it (the global tables here, the JS resolver there).
 bool onCompileWorker();
 std::optional<std::string> workerResolve(std::string_view name);
-// On a compile worker, the CPU builds of `r`'s @cpu kernels, made now rather
-// than at their first run on the page thread (a cache hit lowers them then).
+// On a compile worker, the CPU builds of `r`'s @cpu kernels begun on a thread
+// of their own, so the compile does not wait for them and their first run on
+// the page thread finds them made or waits for them pumped (ensureCpuBuilt).
 void prebuildCpuOnlyKernels(const CompileResult& r);
+// Waits (pumped, as a compile does) for `k`'s CPU build, making it if no
+// thread has begun it.
+void ensureCpuBuilt(const CompiledKernel& k);
 
 // The module tables (api_modules.cpp). resolveFromTables reads the registered
 // and resolved modules (and the host's with `withHostModules`) with no JS;

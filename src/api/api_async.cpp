@@ -10,9 +10,11 @@
 #include "api_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <iterator>
 #include <mutex>
 #include <thread>
 
@@ -264,11 +266,61 @@ std::optional<std::string> workerResolve(std::string_view name) {
     return std::move(ch->reply);
 }
 
+namespace {
+
+// The @cpu kernels' CPU builds made on threads of their own, so the compile
+// that gave them is done without waiting for them; a first run waits
+// (ensureCpuBuilt). Joined by shutdownKernelAsync.
+struct Prebuild {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done;
+};
+std::mutex g_prebuildMu;
+std::vector<Prebuild> g_prebuilds;
+
+void joinPrebuilds(bool finishedOnly) {
+    std::vector<Prebuild> join;
+    {
+        std::lock_guard<std::mutex> lock(g_prebuildMu);
+        auto keep = std::partition(g_prebuilds.begin(), g_prebuilds.end(), [&](const Prebuild& p) {
+            return finishedOnly && !p.done->load(std::memory_order_acquire);
+        });
+        std::move(keep, g_prebuilds.end(), std::back_inserter(join));
+        g_prebuilds.erase(keep, g_prebuilds.end());
+    }
+    for (auto& p : join) p.thread.join();
+}
+
+} // namespace
+
 void prebuildCpuOnlyKernels(const CompileResult& r) {
     if (!t_channel) return;
+    std::vector<std::shared_ptr<CompiledKernel::CpuBuild>> builds;
     for (const auto& k : r.kernels) {
-        if (k.cpu_only && k.has_cpu_build()) (void)k.cpu_point_fn();
+        if (k.cpu_only && k.has_cpu_build() && !k.cpu_built()) builds.push_back(k.cpu_);
     }
+    if (builds.empty()) return;
+    joinPrebuilds(/*finishedOnly=*/true);
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread t([builds = std::move(builds), done] {
+        // Module requests from the tables alone: no owner answers this thread.
+        Channel ch;
+        t_channel = &ch;
+        for (const auto& b : builds) {
+            CompiledKernel k;
+            k.cpu_ = b;
+            (void)k.cpu_error();
+        }
+        t_channel = nullptr;
+        done->store(true, std::memory_order_release);
+    });
+    std::lock_guard<std::mutex> lock(g_prebuildMu);
+    g_prebuilds.push_back({std::move(t), std::move(done)});
+}
+
+void ensureCpuBuilt(const CompiledKernel& k) {
+    if (k.cpu_built()) return;
+    runCompileWork([&k] { (void)k.cpu_error(); });
 }
 
 void runCompileWork(const std::function<void()>& work) {
@@ -355,6 +407,7 @@ void shutdownKernelAsync() {
     for (auto& j : jobs) {
         if (j->w.thread.joinable()) j->w.thread.join();
     }
+    joinPrebuilds(/*finishedOnly=*/false);
 }
 
 } // namespace brokernel::api

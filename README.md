@@ -129,8 +129,11 @@ compiler with `Compiler::set_use_compile_cache(false)`).
 
 - **Key:** the compiler build (the binary holding brokernel's code: path,
   size, mtime; or `CompileCacheConfig::build_stamp`), brokernel's version, the
-  host's AVX2/FMA, the source, its file name and every `CompileOptions` field
-  (knob overrides in any order). An entry also records each module the compile
+  host's AVX2/FMA, the source, its file name, every `CompileOptions` field
+  (knob overrides in any order) and the modules registered by name (each name
+  and a hash of its source), so one source compiled against different
+  registered modules (a scene stage beside each of its hooks) keeps an entry
+  for each. An entry also records each module the compile
   read (the import as asked, where it resolved, a hash of its source); a lookup
   resolves each again as the compiler would now, without parsing, and a changed
   or missing module is a miss. Only successful compiles are stored.
@@ -139,7 +142,10 @@ compiler with `Compiler::set_use_compile_cache(false)`).
   with source, options, modules, search paths and resolver from the compiler.
   A kernel's CPU build is lowered on its first CPU run by compiling the source
   again for that kernel (a `@cpu` kernel's too), and its probed variant when
-  first asked for. `CompileResult::cache_status` (`Off` / `Hit` / `Miss`) and
+  first asked for. Through the JS API with a wait pump, a `@cpu` kernel's CPU
+  build begins on a thread of its own as its compile ends, and its first
+  `eval` / `run` waits for it pumped. One KernelJit compile makes a kernel's
+  point and grid functions both (they share a module). `CompileResult::cache_status` (`Off` / `Hit` / `Miss`) and
   `cache_note` (why it missed) say which; `compile_cache_stats()` counts them.
 - **Store:** one `<key>.bkc` file per entry, written to a temporary file and
   renamed, so threads and processes share a directory; a header with a format

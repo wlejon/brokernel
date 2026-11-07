@@ -317,6 +317,14 @@ std::unordered_map<std::string, std::string> ModuleRegistry::custom_modules() co
     return out;
 }
 
+std::unordered_map<std::string, std::string> ModuleRegistry::given_modules() const {
+    std::unordered_map<std::string, std::string> out;
+    for (const auto& [k, e] : modules_) {
+        if (!e.found && !e.path.starts_with("<builtin:")) out.emplace(k, e.source);
+    }
+    return out;
+}
+
 std::vector<std::string> ModuleRegistry::imported_modules() const {
     std::vector<std::string> out;
     for (const auto& [k, e] : modules_) {
@@ -368,6 +376,7 @@ ModuleRegistry::Entry* ModuleRegistry::find_or_discover(
         }
         if (resolved.has_value()) {
             register_module(k, std::move(*resolved));
+            modules_[k].found = true;
             return &modules_[k];
         }
     }
@@ -396,6 +405,7 @@ ModuleRegistry::Entry* ModuleRegistry::find_or_discover(
                 oss << ifs.rdbuf();
                 std::string canon = candidate.stem().string();
                 register_module(k, oss.str(), candidate.generic_string());
+                modules_[k].found = true;
                 return &modules_[k];
             }
         }

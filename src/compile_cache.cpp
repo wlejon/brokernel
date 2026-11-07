@@ -30,12 +30,27 @@ std::shared_ptr<const ActiveCache> active_cache() {
 }
 
 detail::Digest entry_key(const ActiveCache& c, std::string_view source, const std::string& file_name,
-                         const CompileOptions& opts) {
+                         const CompileOptions& opts,
+                         const std::unordered_map<std::string, std::string>& registered) {
     std::string material = c.key_material;
     detail::ByteWriter w(material);
     w.str(source);
     w.str(file_name);
     detail::encode_options(opts, w);
+    // The modules given by name (register_module), so one source compiled
+    // against different ones (a stage beside each of its hooks) keeps an
+    // entry each; those a resolver or search path finds are the entry's
+    // records, checked at the lookup.
+    std::vector<std::pair<std::string_view, detail::Digest>> mods;
+    mods.reserve(registered.size());
+    for (const auto& [name, src] : registered) mods.emplace_back(name, detail::hash128(src));
+    std::sort(mods.begin(), mods.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    w.u32(static_cast<uint32_t>(mods.size()));
+    for (const auto& [name, d] : mods) {
+        w.str(name);
+        w.u64(d.lo);
+        w.u64(d.hi);
+    }
     return detail::hash128(material);
 }
 
@@ -146,7 +161,7 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
     const std::shared_ptr<const ActiveCache> cache = use_cache_ ? active_cache() : nullptr;
     if (!cache) return compile_uncached(source, std::move(file_name), opts);
 
-    const detail::Digest key = entry_key(*cache, source, file_name, opts);
+    const detail::Digest key = entry_key(*cache, source, file_name, opts, modules_.given_modules());
     const std::filesystem::path file = detail::entry_path(cache->config.dir, key);
     std::string why;
     std::string payload;

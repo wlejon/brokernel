@@ -14,6 +14,7 @@
 #include <brass/gpu/vulkan_driver.hpp>
 #include <brass/target/spirv_target.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -301,6 +302,8 @@ public:
     const brass::codegen::KernelFunction& cpu_grid_fn() const;
     const std::string& cpu_error() const;
     bool has_cpu_build() const noexcept { return cpu_ != nullptr; }
+    // Whether the CPU functions are made already (no CPU build: true).
+    bool cpu_built() const noexcept { return !cpu_ || cpu_->ready.load(std::memory_order_acquire); }
     // Cells the grid function computes per step along x: 8 or 4 (AVX2
     // lanes), or 1 when it runs one cell at a time (the CPU build is made).
     uint32_t cpu_grid_lanes() const;
@@ -311,6 +314,7 @@ public:
     // checked in held by it), then they are built once (compile_source).
     struct CpuBuild {
         std::once_flag once;
+        std::atomic<bool> ready{false};   // set once `once` has run
         std::function<void(CpuBuild&)> lower;
         std::unique_ptr<brass::Module> module;
         brass::Function* point = nullptr;

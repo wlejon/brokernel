@@ -289,8 +289,17 @@ const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::
             if (cpu->point && cpu->error.empty()) {
                 brass::codegen::KernelJit jit_point(cpu->options);
                 cpu->point_fn = jit_point.compile(*cpu->point);
+                // KernelJit compiles the whole module the entry is in, so a
+                // grid function beside it is already in the same code.
+                if (cpu->grid && cpu->grid->parent() == cpu->point->parent() && cpu->point->parent()) {
+                    if (auto engine = cpu->point_fn.engine()) {
+                        if (void* addr = engine->get_symbol_address(cpu->grid->name())) {
+                            cpu->grid_fn = brass::codegen::KernelFunction(std::string(cpu->grid->name()), addr, 0, engine);
+                        }
+                    }
+                }
             }
-            if (cpu->grid && cpu->error.empty()) {
+            if (cpu->grid && !cpu->grid_fn.is_valid() && cpu->error.empty()) {
                 brass::codegen::KernelJit jit_grid(cpu->options);
                 cpu->grid_fn = jit_grid.compile(*cpu->grid);
             }
@@ -298,6 +307,7 @@ const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::
             cpu->error = std::string("backend compilation error: ") + ex.what();
         }
         cpu->module.reset();
+        cpu->ready.store(true, std::memory_order_release);
     });
     return cpu.get();
 }

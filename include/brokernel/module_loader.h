@@ -38,6 +38,9 @@ public:
 
     /// Returns all non-builtin modules currently registered in memory.
     std::unordered_map<std::string, std::string> custom_modules() const;
+    /// The non-builtin modules given by register_module, not those a resolver
+    /// or a search path found for an import.
+    std::unordered_map<std::string, std::string> given_modules() const;
     /// The non-builtin modules a compile parsed: what it imported, directly or not.
     std::vector<std::string> imported_modules() const;
     const std::vector<std::filesystem::path>& search_paths() const noexcept { return search_paths_; }
@@ -89,6 +92,7 @@ private:
         std::unique_ptr<ModuleAst> ast;
         bool loading = false;
         bool failed = false;
+        bool found = false;   // by the resolver or on a search path
     };
 
     std::unordered_map<std::string, Entry> modules_;

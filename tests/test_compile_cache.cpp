@@ -319,7 +319,7 @@ void test_hit_equals_compile() {
 
     const std::string shapes2 = std::string(kShapesSrc) + "\n    pub fn extra() -> f32 { return 1.0; }\n";
     const CompileResult edited = hit.with_sources({{"shapes", shapes2}});
-    CHECK(edited.ok && edited.cache_status == CacheStatus::Miss && edited.cache_note == "module changed: shapes");
+    CHECK(edited.ok && edited.cache_status == CacheStatus::Miss && edited.cache_note == "no entry");
     CHECK(edited.loaded_modules.at("shapes") == shapes2);
     const CompileResult edited_plain = plain.with_sources({{"shapes", shapes2}});
     CHECK(edited_plain.cache_status == CacheStatus::Hit);
@@ -336,21 +336,47 @@ void test_invalidation() {
     const std::string root2 = std::string(kRootSrc) + "\n    fn unused() -> f32 { return 2.0; }\n";
     CHECK(compile_with(root2, kShapesSrc, opts).cache_note == "no entry");
 
-    // A module the root imports through another one.
+    // A given module the root imports through another one: given modules are
+    // part of the key, so another one is another entry.
+    const char* kBase2 = "module shapes_base;\npub fn bias(x: f32) -> f32 { return x + 2.0; }\n";
     {
         Compiler c;
-        c.register_module("shapes_base", "module shapes_base;\npub fn bias(x: f32) -> f32 { return x + 2.0; }\n");
+        c.register_module("shapes_base", kBase2);
         c.register_module("shapes", kShapesSrc);
         const CompileResult r = c.compile_source(kRootSrc, "root.bk", opts);
-        CHECK(r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == "module changed: shapes_base");
+        CHECK(r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == "no entry");
         CHECK(r.find_kernel("point")->eval_f32({KernelArg(0.0f)}) == 3.0f * 3.0f + 2.0f + 0.25f);
     }
-    // A module no longer found.
+    // A module no longer given is another key too.
     {
         Compiler c;
         c.register_module("shapes", kShapesSrc);
         const CompileResult r = c.compile_source(kRootSrc, "root.bk", opts);
-        CHECK(!r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == "module missing: shapes_base");
+        CHECK(!r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == "no entry");
+    }
+    // Modules a resolver finds are the entry's records: one that changes, or
+    // is no longer found, misses at the lookup.
+    {
+        std::string base = kBaseSrc;
+        bool found = true;
+        auto resolving = [&] {
+            Compiler c;
+            c.set_module_resolver([&](std::string_view name) -> std::optional<std::string> {
+                if (name == "shapes_base" && found) return base;
+                return std::nullopt;
+            });
+            c.register_module("shapes", kShapesSrc);
+            return c.compile_source(kRootSrc, "root.bk", opts);
+        };
+        CHECK(resolving().cache_status == CacheStatus::Miss);
+        CHECK(resolving().cache_status == CacheStatus::Hit);
+        base = kBase2;
+        const CompileResult r = resolving();
+        CHECK(r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == "module changed: shapes_base");
+        CHECK(r.find_kernel("point")->eval_f32({KernelArg(0.0f)}) == 3.0f * 3.0f + 2.0f + 0.25f);
+        found = false;
+        const CompileResult gone = resolving();
+        CHECK(!gone.ok && gone.cache_status == CacheStatus::Miss && gone.cache_note == "module missing: shapes_base");
     }
     CompileOptions o2 = opts;
     o2.opt_level = 1;
@@ -363,10 +389,16 @@ void test_invalidation() {
     CompileOptions o4 = opts;
     o4.local_size[0] = 32;
     CHECK(compile_with(kRootSrc, kShapesSrc, o4).cache_note == "no entry");
-    // One entry per key: the compile with the edited module replaced it, so
-    // the original modules miss once and are stored again.
-    CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_note == "module changed: shapes_base");
+    // The original given modules' entry stands beside the edited one's: a
+    // source compiled against each of several given modules alternately (a
+    // scene stage beside each hook) hits every time once each is stored.
     CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_status == CacheStatus::Hit);
+    const std::string shapesB = std::string(kShapesSrc) + "\n    pub fn other() -> f32 { return 4.0; }\n";
+    CHECK(compile_with(kRootSrc, shapesB, opts).cache_status == CacheStatus::Miss);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_status == CacheStatus::Hit);
+        CHECK(compile_with(kRootSrc, shapesB, opts).cache_status == CacheStatus::Hit);
+    }
     std::cout << "  invalidation: ok\n";
 }
 

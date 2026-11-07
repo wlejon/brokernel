@@ -503,6 +503,7 @@ Value js_fnEval(Value self, std::span<const Value> args) {
     FnHandle* h = fnHandle(self);
     if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.eval: invalid receiver");
     const CompiledKernel& k = *h->point_kernel;
+    ensureCpuBuilt(k);
     if (!k.cpu_point_fn().is_valid()) {
         return ev::throwTypeError("KernelFn.eval: '" + h->fn_name + "' has no CPU build");
     }

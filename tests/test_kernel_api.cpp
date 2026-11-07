@@ -180,6 +180,47 @@ void test_sync_with_pump() {
     std::cout << "  sync compile with a pump: ok\n";
 }
 
+// A @cpu kernel's CPU build begins on a thread of its own as its compile ends:
+// the compile does not wait for it, and its first eval waits for it pumped.
+void test_cpu_prebuild() {
+    auto cpuSource = [](int variant) {
+        return "import std::noise::*;\n"
+               "@kernel @cpu fn f(x: f32) -> f32 {\n"
+               "    let p = vec2<f32>(x, " + std::to_string(variant) + ".0);\n"
+               "    return x * " + std::to_string(variant) + ".0 + 1.0 + 0.0 * (perlin2d<f32>(p, 1) + cellular_distance2d<f32>(p, 2)"
+               " + perlin3d<f32>(vec3<f32>(p, 0.5), 3));\n"
+               "}\n";
+    };
+    setThreadWaitPump(nullptr, 0);
+    auto inline_ = compileJs("compile", cpuSource(5));
+    CHECK(!inline_.thrown);
+    ev::Persistent inlineMod(inline_.value);
+    CHECK(evalF(inlineMod.get(), 2.0) == 11.0);
+
+    setThreadWaitPump(countingPump, 1);
+    for (int v = 6; v < 9; ++v) {
+        auto off = compileJs("compile", cpuSource(v));
+        CHECK(!off.thrown);
+        ev::Persistent offMod(off.value);
+        CHECK(evalF(offMod.get(), 2.0) == 2.0 * v + 1.0);
+        CHECK(evalF(offMod.get(), -1.0) == -1.0 * v + 1.0);
+    }
+    // compileAsync: the module, then its kernel's first eval.
+    Outcome out;
+    {
+        auto p = compileJs("compileAsync", cpuSource(9));
+        CHECK(!p.thrown);
+        ev::Persistent pv(p.value);
+        observe(pv.get(), out);
+    }
+    settleAsyncCompiles(true);
+    ev::drainMicrotasks();
+    CHECK(out.settled == 1 && out.fulfilled);
+    CHECK(evalF(out.value.get(), 3.0) == 28.0);
+    setThreadWaitPump(nullptr, 0);
+    std::cout << "  @cpu builds beside the compile: ok\n";
+}
+
 void test_resolver_channel() {
     setThreadWaitPump(countingPump, 1);
     const std::thread::id owner = std::this_thread::get_id();
@@ -315,6 +356,7 @@ void test_realm_destroy() {
 int main() {
     installKernel();
     test_sync_with_pump();
+    test_cpu_prebuild();
     test_resolver_channel();
     test_async();
     test_realm_destroy();
