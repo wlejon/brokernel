@@ -56,6 +56,16 @@ struct GpuLaunch;
 namespace brokernel::api {
 
 /// A buffer in the host's GPU memory: a KernelBuffer's storage.
+/// Bytes copied out of a GpuBuffer without waiting for them: ready() turns
+/// true once the GPU has made the copy, then data() holds bytes() bytes.
+class GpuReadback {
+public:
+    virtual ~GpuReadback() = default;
+    virtual bool ready() const = 0;
+    virtual const void* data() const = 0;
+    virtual size_t bytes() const = 0;
+};
+
 class GpuBuffer {
 public:
     virtual ~GpuBuffer() = default;
@@ -71,6 +81,15 @@ public:
     /// Copy `n` bytes at byte `offset` into `out`, after every dispatch so
     /// far (blocks until they are done).
     virtual bool read(size_t offset, void* out, size_t n, std::string* err) = 0;
+    /// Copy `n` bytes at byte `offset` after every dispatch so far, without
+    /// blocking: the returned readback turns ready when the GPU is done. A
+    /// device without one returns null with `err` set.
+    virtual std::shared_ptr<GpuReadback> readLater(size_t offset, size_t n, std::string* err) {
+        (void)offset;
+        (void)n;
+        if (err) *err = "this device has no asynchronous reads";
+        return nullptr;
+    }
     /// Release the buffer's GPU memory once in-flight work finishes.
     virtual void destroy() {}
 };

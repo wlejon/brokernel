@@ -19,6 +19,12 @@ ev::HostClass g_fnClass;
 
 namespace {
 
+ev::HostClass g_readbackClass;
+
+struct ReadbackHandle {
+    std::shared_ptr<GpuReadback> readback;
+};
+
 // The device this thread's realms dispatch on (setGpuDevice).
 thread_local std::shared_ptr<GpuDevice> t_device;
 // GPU buffer bytes allocated since the last collection, less bytes explicitly
@@ -201,6 +207,73 @@ Value js_bufferRead(Value self, std::span<const Value> args) {
     return args[0];
 }
 
+// buffer.readLater(byteOffset = 0, byteLength = rest): a KernelReadback of
+// those bytes after every dispatch so far, made without waiting for the GPU.
+Value js_bufferReadLater(Value self, std::span<const Value> args) {
+    GpuBuffer* b = unwrapBuffer(self, "KernelBuffer.readLater");
+    const size_t offset = offsetArg(args, 0, "KernelBuffer.readLater");
+    if (offset > b->bytes()) {
+        return ev::throwRangeError("KernelBuffer.readLater: byte " + std::to_string(offset) + " is outside its " +
+                                   std::to_string(b->bytes()));
+    }
+    size_t n = b->bytes() - offset;
+    if (args.size() > 1 && !ev::isUndefined(args[1])) n = offsetArg(args, 1, "KernelBuffer.readLater");
+    if (n == 0) return ev::throwRangeError("KernelBuffer.readLater: reads at least one byte");
+    if (n > b->bytes() - offset) {
+        return ev::throwRangeError("KernelBuffer.readLater: " + std::to_string(n) + " byte(s) at " +
+                                   std::to_string(offset) + " are outside its " + std::to_string(b->bytes()));
+    }
+    std::string err;
+    std::shared_ptr<GpuReadback> r = b->readLater(offset, n, &err);
+    if (!r) return ev::throwError("KernelBuffer.readLater: " + err);
+    auto handle = std::make_unique<ReadbackHandle>();
+    handle->readback = std::move(r);
+    return g_readbackClass.createInstance(std::move(handle));
+}
+
+GpuReadback* unwrapReadback(Value self, const std::string& what) {
+    auto* h = static_cast<ReadbackHandle*>(g_readbackClass.unwrap(self));
+    if (!h) ev::throwTypeError(what + ": invalid receiver");
+    if (!h->readback) ev::throwError(what + ": the KernelReadback has been released");
+    return h->readback.get();
+}
+
+// readback.read(target): fills `target` (a typed array, at most byteLength
+// bytes) once ready; returns it, or null while the GPU has not made the copy.
+Value js_readbackRead(Value self, std::span<const Value> args) {
+    GpuReadback* r = unwrapReadback(self, "KernelReadback.read");
+    if (args.empty() || !ev::isTypedArray(args[0])) return ev::throwTypeError("KernelReadback.read: the target is a typed array");
+    const auto info = ev::typedArrayInfo(args[0]);
+    if (info.byteLength > r->bytes()) {
+        return ev::throwRangeError("KernelReadback.read: the target's " + std::to_string(info.byteLength) +
+                                   " byte(s) exceed the readback's " + std::to_string(r->bytes()));
+    }
+    if (!r->ready()) return ev::null();
+    if (info.byteLength) std::memcpy(info.data, r->data(), info.byteLength);
+    return args[0];
+}
+
+// readback.release(): drops its staging memory now rather than at collection.
+Value js_readbackRelease(Value self, std::span<const Value>) {
+    auto* h = static_cast<ReadbackHandle*>(g_readbackClass.unwrap(self));
+    if (!h) return ev::throwTypeError("KernelReadback.release: invalid receiver");
+    h->readback.reset();
+    return ev::undefined();
+}
+
+void decorateReadback(ev::ObjectBuilder& b) {
+    b.def("read", 1, js_readbackRead);
+    b.def("release", 0, js_readbackRelease);
+    b.accessor("ready", [](Value self, std::span<const Value>) -> Value {
+        auto* h = static_cast<ReadbackHandle*>(g_readbackClass.unwrap(self));
+        return ev::fromBool(h && h->readback && h->readback->ready());
+    });
+    b.accessor("byteLength", [](Value self, std::span<const Value>) -> Value {
+        auto* h = static_cast<ReadbackHandle*>(g_readbackClass.unwrap(self));
+        return ev::fromDouble(h && h->readback ? static_cast<double>(h->readback->bytes()) : 0.0);
+    });
+}
+
 // buffer.destroy(): releases the buffer's GPU memory once in-flight work
 // finishes; any later use of the buffer throws.
 Value js_bufferDestroy(Value self, std::span<const Value>) {
@@ -218,6 +291,7 @@ Value js_bufferDestroy(Value self, std::span<const Value>) {
 void decorateBuffer(ev::ObjectBuilder& b) {
     b.def("write", 1, js_bufferWrite);
     b.def("read", 1, js_bufferRead);
+    b.def("readLater", 0, js_bufferReadLater);
     b.def("destroy", 0, js_bufferDestroy);
     b.accessor("byteLength", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
@@ -602,6 +676,7 @@ void installKernel() {
     g_moduleClass.install("KernelModule", 0, nullptr, decorateModule, /*global=*/false);
     g_kernelClass.install("Kernel", 0, nullptr, decorateKernel, /*global=*/false);
     g_bufferClass.install("KernelBuffer", 0, nullptr, decorateBuffer, /*global=*/false);
+    g_readbackClass.install("KernelReadback", 0, nullptr, decorateReadback, /*global=*/false);
     g_fnClass.install("KernelFn", 0, nullptr, decorateFnClass, /*global=*/false);
     ev::Persistent kernelObj(ensureBroKernel());
     ev::ObjectBuilder b(kernelObj.get());
