@@ -127,9 +127,11 @@ result from disk when `brokernel::set_compile_cache({dir, max_bytes})` names a
 directory (`include/brokernel/compile_cache.h`; off by default, and per
 compiler with `Compiler::set_use_compile_cache(false)`).
 
-- **Key:** the compiler build (the binary holding brokernel's code: path,
-  size, mtime; or `CompileCacheConfig::build_stamp`), brokernel's version, the
-  host's AVX2/FMA, the source, its file name, every `CompileOptions` field
+- **Key:** brass's build (`brass::cache::KeyBuilder::add_brass_build`: brass's
+  version and binary, the target, the host's AVX/AVX2/FMA), brokernel's build
+  (the binary holding brokernel's code: path, size, mtime; or
+  `CompileCacheConfig::build_stamp`) and version, the format of an entry's
+  blobs, the source, its file name, every `CompileOptions` field
   (knob overrides in any order) and the modules registered by name (each name
   and a hash of its source), so one source compiled against different
   registered modules (a scene stage beside each of its hooks) keeps an entry
@@ -140,21 +142,36 @@ compiler with `Compiler::set_use_compile_cache(false)`).
 - **A hit is the compile:** every `CompileResult` and `CompiledKernel` field
   (SPIR-V, reflection, types, constants, probes, costs, hashes, diagnostics),
   with source, options, modules, search paths and resolver from the compiler.
-  A kernel's CPU build is lowered on its first CPU run by compiling the source
-  again for that kernel (a `@cpu` kernel's too), and its probed variant when
-  first asked for. Through the JS API with a wait pump, a `@cpu` kernel's CPU
+  A probed variant is compiled when first asked for.
+- **CPU builds are native code in the cache:** a kernel's CPU build, made on
+  its first CPU run whether its compile hit or missed, is compiled into a
+  shared library image through `brass::cache::NativeModuleCache` (keyed by
+  the entry, the module records, the kernel and its CPU options) and loaded;
+  a later run, in this process or another, loads the image and compiles
+  nothing. Only when no image is stored does a hit's kernel compile the source
+  again for that kernel (a `@cpu` kernel's too), once: the image is stored
+  then. A build that cannot be an image (one calling a function it does not
+  define, which no kernel does today) is compiled in memory by KernelJit as
+  without a cache. `compile_cache_stats()` counts `cpu_loads`, `cpu_stores`
+  and `cpu_in_memory`. Through the JS API with a wait pump, a `@cpu` kernel's CPU
   build begins on a thread of its own as its compile ends, and its first
   `eval` / `run` waits for it pumped; `module.cpuReady()` is a promise
   settled once every one is built, the frames going on. One KernelJit compile makes a kernel's
   point and grid functions both (they share a module). `CompileResult::cache_status` (`Off` / `Hit` / `Miss`) and
   `cache_note` (why it missed) say which; `compile_cache_stats()` counts them.
-- **Store:** one `<key>.bkc` file per entry, written to a temporary file and
-  renamed, so threads and processes share a directory; a header with a format
-  version and checksum makes a truncated, damaged or foreign entry a miss. A hit
-  touches its mtime; a store that takes the directory past `max_bytes` (whole
-  4 KiB units) has a background thread delete the least recently used entries
-  down to 7/8 of it, and `flush_compile_cache()` waits for that trim. Deleting
-  the directory is always safe.
+- **Store:** the directory is a brass artifact cache
+  (`brass::cache::ArtifactCache`, brass `docs/artifact_cache.md`): one
+  `<key>.bac` file per entry (a compile's `modules` and `result` blobs; a CPU
+  build's image, and its metadata beside it), written to a temporary file and
+  renamed, so threads and processes share a directory; both key digests and a
+  checksum in the header make a truncated, damaged, colliding or foreign entry
+  a miss. Images load from private copies under `load/`. A hit marks its entry
+  used; a store that takes the directory past `max_bytes` (whole 4 KiB units,
+  images included) has a background thread delete the least recently used
+  entries down to 7/8 of it, and `flush_compile_cache()` waits for that trim.
+  Files of the cache brokernel kept before (`*.bkc`) are never read and are
+  deleted when a cache is set on their directory. Deleting the directory is
+  always safe.
 
 ## Layout
 
@@ -162,7 +179,7 @@ compiler with `Compiler::set_use_compile_cache(false)`).
 |------|------|
 | `include/brokernel/brokernel.h` | public C++ API: `compile_source` / `compile_file` / `Compiler`, `CompileResult` (`with_knobs`, `constants`, `probes`), `CompiledKernel` (CPU/GPU dispatch, point eval, `probe_cpu`, `probe_gpu`, `compare_cpu_gpu`) |
 | `include/brokernel/{ast,types,sema,lowering,module_loader,diagnostics}.h` | compiler stages and `ModuleRegistry` |
-| `include/brokernel/compile_cache.h`, `src/compile_cache*.cpp`, `src/compile_result_io.cpp` | the on-disk compile cache: configuration and lookup around `compile_source`, the entry files and their trim, a result's byte encoding |
+| `include/brokernel/compile_cache.h`, `src/compile_cache.cpp`, `src/compile_result_io.cpp` | the on-disk compile cache over brass's artifact cache: configuration, keys and lookup around `compile_source`, CPU builds as cached native images, a result's byte encoding |
 | `src/lexer.cpp`, `src/parser.cpp` | source to AST (`import` / `use`, `pub import`, `@knob`, `probe`) |
 | `src/sema*.cpp`, `src/types.cpp` | name resolution, re-exports, generics, type checking, forward-mode AD (`src/sema_ad.cpp`), quadrature (`expect`, `moments`, `cell_expect`) |
 | `src/lowering_*.cpp` | AST to brass MIR: GPU SPIR-V entry points, CPU point/grid functions, and CPU/GPU/fragment probes |

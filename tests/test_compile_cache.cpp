@@ -1,8 +1,10 @@
 // The on-disk compile cache (compile_cache.h): a hit is the compile, field by
 // field, and runs as the compile does on the CPU; what a compile depends on
-// (source, imported modules, options, knobs) misses when it changes; a
-// damaged entry misses; the directory is held to its limit; a hit is fast.
-// CPU only: no GPU is used.
+// (source, imported modules, options, knobs, the build stamp) misses when it
+// changes; a damaged entry misses; the old cache's files are never read and
+// are removed; a kernel's CPU build is stored as native code and a later hit
+// loads it without compiling (a damaged one is rebuilt); the directory is
+// held to its limit; a hit is fast. CPU only: no GPU is used.
 #include "brokernel/brokernel.h"
 
 #include <chrono>
@@ -245,7 +247,7 @@ void check_same_result(const CompileResult& a, const CompileResult& b) {
 }
 
 // The kernels run on the CPU as a compile's do.
-void check_same_runs(const CompileResult& a, const CompileResult& b) {
+void check_same_cpu(const CompileResult& a, const CompileResult& b) {
     const CompiledKernel* pa = a.find_kernel("point");
     const CompiledKernel* pb = b.find_kernel("point");
     CHECK(pa && pb);
@@ -267,7 +269,15 @@ void check_same_runs(const CompileResult& a, const CompileResult& b) {
     CHECK(ca && cb && cb->cpu_only && cb->spirv.words.empty());
     CHECK(ca->eval_f64({KernelArg(1.25), KernelArg(3.0)}) == cb->eval_f64({KernelArg(1.25), KernelArg(3.0)}));
     CHECK(cb->eval_f64({KernelArg(1.25), KernelArg(3.0)}) == 1.25 * 3.0 + 0.5);
+}
 
+// The same, and a probed variant (compiled when first asked for) too.
+void check_same_runs(const CompileResult& a, const CompileResult& b) {
+    check_same_cpu(a, b);
+    const CompiledKernel* fa = a.find_kernel("field");
+    const CompiledKernel* fb = b.find_kernel("field");
+    std::vector<float> oa(8 * 4, -1.0f), ob(8 * 4, -1.0f);
+    std::string err;
     std::vector<ProbeSample> sa, sb;
     CHECK(fa->probe_cpu(3, 1, 0, GridShape(8, 4), {KernelArg::store(oa), KernelArg(0.5f)}, sa, &err));
     CHECK(fb->probe_cpu(3, 1, 0, GridShape(8, 4), {KernelArg::store(ob), KernelArg(0.5f)}, sb, &err));
@@ -402,10 +412,12 @@ void test_invalidation() {
     std::cout << "  invalidation: ok\n";
 }
 
+// The cache's entries: brass artifact files (compile entries, CPU builds'
+// images and their metadata alike).
 std::vector<fs::path> entries(const fs::path& dir) {
     std::vector<fs::path> out;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.path().extension() == ".bkc") out.push_back(e.path());
+        if (e.is_regular_file() && e.path().extension() == ".bac") out.push_back(e.path());
     }
     return out;
 }
@@ -428,7 +440,7 @@ void test_damaged_entries() {
     const auto files = entries(dir);
     CHECK(files.size() == 1);
     const std::string good = read_file(files[0]);
-    CHECK(good.size() > 100);
+    CHECK(good.size() > 100 && good.compare(0, 4, "BRAC") == 0);
 
     auto attempt = [&](const std::string& bytes, const char* note) {
         write_file(files[0], bytes);
@@ -437,15 +449,20 @@ void test_damaged_entries() {
         CHECK(r.ok && r.cache_status == CacheStatus::Miss && r.cache_note == note);
         check_same_runs(r, r);
     };
-    attempt(good.substr(0, good.size() / 2), "entry truncated");
-    attempt(good.substr(0, 20), "entry truncated");
+    attempt(good.substr(0, good.size() / 2), "the entry is truncated");
+    attempt(good.substr(0, 20), "the entry is truncated");
     std::string flipped = good;
     flipped[flipped.size() - 7] ^= 0x5a;
-    attempt(flipped, "entry damaged");
-    attempt(std::string(good.size(), 'x'), "entry of another format");
+    attempt(flipped, "the entry is damaged");
+    attempt(std::string(good.size(), 'x'), "not an artifact of this format");
     std::string other_key = good;
     other_key[9] ^= 1;
-    attempt(other_key, "entry of another key");
+    attempt(other_key, "an artifact of another key");
+    // An entry of the cache brokernel kept before (magic "BKC1", format 1)
+    // where an entry is: never read as one.
+    std::string old_format = good;
+    old_format.replace(0, 8, std::string("BKC1\x01\0\0\0", 8));
+    attempt(old_format, "not an artifact of this format");
     // Each miss stored the entry again.
     CHECK(read_file(files[0]) == good);
     CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_status == CacheStatus::Hit);
@@ -459,8 +476,124 @@ void test_damaged_entries() {
 
 uint64_t dir_disk_bytes(const fs::path& dir) {
     uint64_t total = 0;
-    for (const auto& e : fs::directory_iterator(dir)) total += (e.file_size() + 4095) / 4096 * 4096;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (e.is_regular_file()) total += (e.file_size() + 4095) / 4096 * 4096;
+    }
     return total;
+}
+
+// The files of the cache brokernel kept before are removed when a cache is
+// set on their directory (the next compile cannot read them anyway); other
+// files are left alone.
+void test_old_format_removed() {
+    const fs::path dir = fresh_dir("old_format");
+    const std::string hex(32, 'a');
+    write_file(dir / (hex + ".bkc"), "BKC1 old entry");
+    write_file(dir / (hex + ".bkc.tmp1234_5"), "an old write never renamed");
+    write_file(dir / "notes.txt", "not the cache's");
+    use_cache(dir);
+    CHECK(!fs::exists(dir / (hex + ".bkc")) && !fs::exists(dir / (hex + ".bkc.tmp1234_5")));
+    CHECK(fs::exists(dir / "notes.txt"));
+    const CompileOptions opts = base_options();
+    CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_note == "no entry");
+    CHECK(compile_with(kRootSrc, kShapesSrc, opts).cache_status == CacheStatus::Hit);
+    std::cout << "  old format removed: ok\n";
+}
+
+// The build stamp (brokernel's build in the key, beside brass's): another
+// stamp is another key space, and the first one's entries stand.
+void test_build_stamp() {
+    const fs::path dir = fresh_dir("stamp");
+    auto stamped = [&](const char* stamp) {
+        CompileCacheConfig c;
+        c.dir = dir;
+        c.build_stamp = stamp;
+        set_compile_cache(c);
+        return compile_with(kRootSrc, kShapesSrc, base_options());
+    };
+    CHECK(stamped("build A").cache_note == "no entry");
+    CHECK(stamped("build A").cache_status == CacheStatus::Hit);
+    CHECK(stamped("build B").cache_note == "no entry");
+    CHECK(stamped("build A").cache_status == CacheStatus::Hit);
+    CHECK(compile_cache_config().build_stamp == "build A");
+    std::cout << "  build stamp: ok\n";
+}
+
+// A kernel's CPU build is stored as native code on its first run, and a
+// later hit's kernel loads it: nothing is compiled again (before, a hit's CPU
+// build compiled the whole source again, every process). The source's
+// module is gone by the time the hit runs, so a compile could not make it.
+void test_cpu_builds_cached() {
+    const fs::path dir = fresh_dir("cpu");
+    use_cache(dir);
+    const CompileOptions opts = base_options();
+    std::string base = kBaseSrc;
+    bool found = true;
+    auto resolving = [&] {
+        Compiler c;
+        c.set_module_resolver([&](std::string_view name) -> std::optional<std::string> {
+            if (name == "shapes_base" && found) return base;
+            return std::nullopt;
+        });
+        c.register_module("shapes", kShapesSrc);
+        return c.compile_source(kRootSrc, "root.bk", opts);
+    };
+    const CompileResult plain = compile_with(kRootSrc, kShapesSrc, opts, false);
+    const CompileCacheStats s0 = compile_cache_stats();
+    const CompileResult miss = resolving();
+    CHECK(miss.ok && miss.cache_status == CacheStatus::Miss);
+    check_same_cpu(plain, miss);   // point, field and precise run on the CPU
+    const CompileCacheStats s1 = compile_cache_stats();
+    CHECK(s1.cpu_stores - s0.cpu_stores == 3 && s1.cpu_in_memory == s0.cpu_in_memory && s1.cpu_loads == s0.cpu_loads);
+
+    // A new cache on the directory: nothing of this process's is reused.
+    use_cache(dir);
+    const CompileResult hit = resolving();
+    CHECK(hit.ok && hit.cache_status == CacheStatus::Hit);
+    found = false;   // a compile of the source would fail now
+    check_same_cpu(plain, hit);
+    const CompileCacheStats s2 = compile_cache_stats();
+    CHECK(s2.cpu_loads - s1.cpu_loads == 3 && s2.cpu_stores == s1.cpu_stores);
+    CHECK(hit.find_kernel("point")->cpu_error().empty());
+
+    // Every CPU build's files damaged: a load misses, the hit's kernels
+    // compile again (the module is back) and store anew; they run as before.
+    found = true;
+    const auto entry_files = entries(dir);
+    for (const auto& f : entry_files) {
+        std::string bytes = read_file(f);
+        bytes[bytes.size() - 3] ^= 0x33;
+        write_file(f, bytes);
+    }
+    use_cache(dir);
+    const CompileResult damaged = resolving();
+    CHECK(damaged.ok && damaged.cache_status == CacheStatus::Miss && damaged.cache_note == "the entry is damaged");
+    check_same_cpu(plain, damaged);
+    const CompileCacheStats s3 = compile_cache_stats();
+    CHECK(s3.cpu_loads == s2.cpu_loads && s3.cpu_stores - s2.cpu_stores == 3);
+    use_cache(dir);
+    const CompileResult again = resolving();
+    CHECK(again.cache_status == CacheStatus::Hit);
+    check_same_cpu(plain, again);
+    CHECK(compile_cache_stats().cpu_loads - s3.cpu_loads == 3);
+
+    // A copy of a CPU function holds its image, as a JIT function holds its
+    // engine: after the result and the cache go, it is what keeps it loaded.
+    brass::codegen::KernelFunction keep;
+    std::weak_ptr<brass::codegen::JitExecutionEngine> image;   // counts no owner itself
+    use_cache(dir);   // its own load, not `again`'s module
+    {
+        const CompileResult r = resolving();
+        CHECK(r.cache_status == CacheStatus::Hit);
+        keep = r.find_kernel("precise")->cpu_point_fn();
+        image = keep.engine();
+        CHECK(keep.is_valid() && !keep.engine() && image.use_count() > 1);
+    }
+    use_cache(fresh_dir("cpu_elsewhere"));
+    CHECK(image.use_count() == 1);   // `keep` alone
+    keep = {};
+    CHECK(image.expired());
+    std::cout << "  cpu builds cached: ok\n";
 }
 
 void test_size_limit() {
@@ -537,14 +670,26 @@ void test_speed() {
               << " SPIR-V words)\n";
     CHECK(hit_ms * 5 < compile_ms);
 
-    // The CPU build from a hit, lowered on first use, matches.
+    // The CPU build: compiled and stored on the miss's first run, loaded on
+    // a later hit's (a new cache, as another process would), and the same.
     std::vector<float> a(16 * 16), b(16 * 16);
     std::string err;
+    const auto c0 = clock::now();
     CHECK(miss.find_kernel("terrain")->dispatch_cpu(GridShape(16, 16), {KernelArg::store(a), KernelArg(int32_t(7))},
                                                     nullptr, &err));
-    CHECK(hit.find_kernel("terrain")->dispatch_cpu(GridShape(16, 16), {KernelArg::store(b), KernelArg(int32_t(7))},
-                                                   nullptr, &err));
+    const double cpu_compile_ms = std::chrono::duration<double, std::milli>(clock::now() - c0).count();
+    use_cache(compile_cache_config().dir);
+    const CompileResult later = compile_source(src, "speed.bk");
+    CHECK(later.cache_status == CacheStatus::Hit);
+    const uint64_t loads = compile_cache_stats().cpu_loads;
+    const auto c1 = clock::now();
+    CHECK(later.find_kernel("terrain")->dispatch_cpu(GridShape(16, 16), {KernelArg::store(b), KernelArg(int32_t(7))},
+                                                     nullptr, &err));
+    const double cpu_load_ms = std::chrono::duration<double, std::milli>(clock::now() - c1).count();
+    CHECK(compile_cache_stats().cpu_loads == loads + 1);
     CHECK(a == b);
+    std::cout << "  speed: first CPU run " << cpu_compile_ms << " ms compiling, " << cpu_load_ms << " ms loading\n";
+    CHECK(cpu_load_ms * 3 < cpu_compile_ms);
 }
 
 } // namespace
@@ -556,6 +701,9 @@ int main() {
     test_hit_equals_compile();
     test_invalidation();
     test_damaged_entries();
+    test_old_format_removed();
+    test_build_stamp();
+    test_cpu_builds_cached();
     test_size_limit();
     test_threads();
     test_speed();

@@ -1,24 +1,18 @@
 #pragma once
-// The compile cache's parts: hashing, the byte encoding of an entry, and the
-// directory (files, trims). compile_cache.cpp puts them together around
-// Compiler::compile_source.
+// The compile cache's encodings: what an entry's blobs hold (compile_cache.h).
+// The directory itself (files, checksums, eviction) is brass's ArtifactCache;
+// compile_cache.cpp puts them together around Compiler::compile_source.
 #include "brokernel/brokernel.h"
+
+#include <brass/core/hash128.hpp>
 
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace brokernel::detail {
-
-struct Digest {
-    uint64_t lo = 0, hi = 0;
-    std::string hex() const;   // 32 hex digits
-    bool operator==(const Digest& o) const noexcept { return lo == o.lo && hi == o.hi; }
-};
-Digest hash128(std::string_view bytes, uint64_t seed = 0x626b63616368ull);
 
 // Little-endian fields appended to a string.
 class ByteWriter {
@@ -87,7 +81,7 @@ struct ModuleRecord {
     std::string importing_dir;
     std::string key;
     std::string path;
-    Digest source;
+    brass::Digest128 source;
 };
 // Every CompileOptions field, knob overrides by name.
 void encode_options(const CompileOptions& o, ByteWriter& w);
@@ -101,21 +95,7 @@ bool decode_modules(ByteReader& r, std::vector<ModuleRecord>& mods);
 void encode_result(const CompileResult& res, ByteWriter& w);
 bool decode_result(ByteReader& r, CompileResult& res, std::vector<uint8_t>& had_cpu);
 
-// The binary holding brokernel's code: "path|size|mtime", or empty.
-std::string build_identity();
-
-// One entry file: a header (magic, format version, key, payload size and
-// checksum) and the payload. read_entry fails with `why` for a missing,
-// short, foreign or damaged file.
-bool read_entry(const std::filesystem::path& file, const Digest& key, std::string& payload, std::string& why);
-bool write_entry(const std::filesystem::path& file, const Digest& key, std::string_view payload);
-void touch_entry(const std::filesystem::path& file);
-std::filesystem::path entry_path(const std::filesystem::path& dir, const Digest& key);
-constexpr uint32_t kEntryFormat = 1;
-
-// A store of `bytes` under `keep` in `dir`: asks the trimmer thread for a walk
-// when the directory may be over `max_bytes`.
-void note_store(const std::filesystem::path& dir, uint64_t max_bytes, const Digest& keep, uint64_t bytes);
-void wait_for_trims();
+// The encodings above, in every key: a change to them is a new key space.
+constexpr uint32_t kEntryFormat = 2;
 
 } // namespace brokernel::detail
