@@ -223,9 +223,16 @@ Value js_bufferReadLater(Value self, std::span<const Value> args) {
         return ev::throwRangeError("KernelBuffer.readLater: " + std::to_string(n) + " byte(s) at " +
                                    std::to_string(offset) + " are outside its " + std::to_string(b->bytes()));
     }
+    if (n >= kGcPressureBytes || t_uncollectedBufferBytes >= kGcPressureBytes - n) collectAndReclaim();
     std::string err;
     std::shared_ptr<GpuReadback> r = b->readLater(offset, n, &err);
+    if (!r) {
+        collectAndReclaim();
+        err.clear();
+        r = b->readLater(offset, n, &err);
+    }
     if (!r) return ev::throwError("KernelBuffer.readLater: " + err);
+    t_uncollectedBufferBytes += n;
     auto handle = std::make_unique<ReadbackHandle>();
     handle->readback = std::move(r);
     return g_readbackClass.createInstance(std::move(handle));
@@ -257,7 +264,11 @@ Value js_readbackRead(Value self, std::span<const Value> args) {
 Value js_readbackRelease(Value self, std::span<const Value>) {
     auto* h = static_cast<ReadbackHandle*>(g_readbackClass.unwrap(self));
     if (!h) return ev::throwTypeError("KernelReadback.release: invalid receiver");
-    h->readback.reset();
+    if (h->readback) {
+        const size_t bytes = h->readback->bytes();
+        t_uncollectedBufferBytes = t_uncollectedBufferBytes > bytes ? t_uncollectedBufferBytes - bytes : 0;
+        h->readback.reset();
+    }
     return ev::undefined();
 }
 
@@ -562,7 +573,7 @@ KernelHandle* kernelHandle(Value self) {
 }
 
 std::shared_ptr<GpuBuffer> allocateBuffer(size_t bytes, std::string* err) {
-    if (t_uncollectedBufferBytes + bytes >= kGcPressureBytes) collectAndReclaim();
+    if (bytes >= kGcPressureBytes || t_uncollectedBufferBytes >= kGcPressureBytes - bytes) collectAndReclaim();
     std::shared_ptr<GpuBuffer> b = t_device->createBuffer(bytes, err);
     if (!b) {
         collectAndReclaim();
