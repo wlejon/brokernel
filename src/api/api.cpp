@@ -377,6 +377,11 @@ void decorateKernel(ev::ObjectBuilder& b) {
         ensureCpuBuilt(*k);
         return ev::fromDouble(k->cpu_grid_lanes());
     });
+    b.def("cpuReady", 0, [](Value self, std::span<const Value>) -> Value {
+        const CompiledKernel* k = unwrapKernel(self);
+        if (!k) return ev::throwTypeError("Kernel.cpuReady: invalid receiver");
+        return cpuReadyPromise(*k);
+    });
     b.accessor("params", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);
         if (!k) return ev::undefined();

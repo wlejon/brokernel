@@ -38,7 +38,11 @@ using brass::cache::KeyBuilder;
 
 // The key schemas: a change to what a key holds, or to what an entry's blobs
 // hold (detail::kEntryFormat), is a new domain or format, never a misread.
-constexpr std::string_view kEntryDomain = "brokernel.compile/2";
+constexpr std::string_view kBaseDomain = "brokernel.compile-base/1";
+constexpr std::string_view kReadsDomain = "brokernel.compile-reads/1";
+constexpr std::string_view kEntryDomain = "brokernel.compile/3";
+// The lists of module requests kept for one source (the oldest dropped).
+constexpr size_t kMaxReadLists = 8;
 constexpr std::string_view kCpuDomain = "brokernel.cpu/1";
 constexpr std::string_view kCpuMetaDomain = "brokernel.cpu-meta/1";
 constexpr const char* kUndecodable = "the entry does not decode";
@@ -113,28 +117,22 @@ std::shared_ptr<ActiveCache> active_cache() {
     return g_cache;
 }
 
-CacheKey entry_key(const ActiveCache& c, std::string_view source, const std::string& file_name,
-                   const CompileOptions& opts, const std::unordered_map<std::string, std::string>& registered) {
+// What a compile is of, apart from the modules it reads: the compiler, the
+// source, its file name and the options.
+CacheKey base_key(const ActiveCache& c, std::string_view source, const std::string& file_name,
+                  const CompileOptions& opts) {
     std::string options;
     detail::ByteWriter w(options);
     detail::encode_options(opts, w);
-    KeyBuilder kb(kEntryDomain);
-    kb.add_brass_build()
+    return KeyBuilder(kBaseDomain)
+        .add_brass_build()
         .add_u64("brokernel.format", detail::kEntryFormat)
         .add("brokernel.version", version())
         .add("brokernel.build", c.build)
         .add("source", source)
         .add("file_name", file_name)
-        .add("options", options);
-    // The modules given by name (register_module), so one source compiled
-    // against different ones (a stage beside each of its hooks) keeps an
-    // entry each; those a resolver or search path finds are the entry's
-    // records, checked at the lookup.
-    std::vector<std::pair<std::string_view, std::string_view>> mods(registered.begin(), registered.end());
-    std::sort(mods.begin(), mods.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    kb.add_u64("given_modules", mods.size());
-    for (const auto& [name, src] : mods) kb.add("module.name", name).add_digest("module.source", brass::hash128(src));
-    return kb.finish();
+        .add("options", options)
+        .finish();
 }
 
 // --- CPU builds as native code ------------------------------------------------
@@ -330,6 +328,76 @@ std::filesystem::path dir_path(const std::string& s) {
 
 bool is_builtin(const std::string& path) { return path.starts_with("<builtin:"); }
 
+std::string_view as_text(std::span<const uint8_t> bytes) {
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+// The modules a compile asked for, in the order it asked: (name, importing
+// directory) each. A source's entry is keyed by what these resolve to now,
+// so a module the compile never reads (one registered for other sources)
+// is no part of its key, and one source compiled against different modules
+// of the same names keeps an entry each.
+using ReadList = std::vector<std::pair<std::string, std::string>>;
+
+CacheKey reads_key(const CacheKey& base) { return KeyBuilder(kReadsDomain).add_key("base", base).finish(); }
+
+// The lists stored for `base`, the newest last.
+std::vector<ReadList> load_read_lists(ActiveCache& c, const CacheKey& base, std::string& why) {
+    std::vector<ReadList> lists;
+    brass::cache::Miss miss = brass::cache::Miss::None;
+    const std::optional<brass::cache::Artifact> art = c.store.get(reads_key(base), &miss);
+    if (!art) {
+        why = brass::cache::to_string(miss);
+        return lists;
+    }
+    why = kUndecodable;
+    if (!art->has("reads")) return lists;
+    const std::string_view bytes = as_text(art->bytes("reads"));
+    detail::ByteReader r(bytes.data(), bytes.size());
+    const size_t n = r.count();
+    for (size_t i = 0; r.ok() && i < n; ++i) {
+        ReadList list(r.count(16));
+        for (auto& [name, dir] : list) {
+            name = r.str();
+            dir = r.str();
+        }
+        lists.push_back(std::move(list));
+    }
+    if (!r.ok() || !r.at_end()) lists.clear();
+    if (!lists.empty()) why.clear();
+    return lists;
+}
+
+void store_read_lists(ActiveCache& c, const CacheKey& base, const std::vector<ReadList>& lists) {
+    std::string out;
+    detail::ByteWriter w(out);
+    w.u64(lists.size());
+    for (const ReadList& list : lists) {
+        w.u64(list.size());
+        for (const auto& [name, dir] : list) {
+            w.str(name);
+            w.str(dir);
+        }
+    }
+    c.store.put(reads_key(base), {BlobRef("reads", out)});
+}
+
+// The entry of `base` compiled with `reads` resolving as they do now in
+// `modules` (one not found is part of the key as that).
+CacheKey entry_key(const CacheKey& base, const ReadList& reads, ModuleRegistry& modules) {
+    KeyBuilder kb(kEntryDomain);
+    kb.add_key("base", base).add_u64("reads", reads.size());
+    for (const auto& [name, dir] : reads) {
+        kb.add("module.name", name).add("module.dir", dir);
+        if (const auto got = modules.resolve(name, dir_path(dir))) {
+            kb.add("module.key", got->key).add_digest("module.source", brass::hash128(*got->source));
+        } else {
+            kb.add("module.key", "<missing>");
+        }
+    }
+    return kb.finish();
+}
+
 // What a hit's kernels compile their CPU builds again from, one copy for all.
 struct CompileInputs {
     std::string source;
@@ -389,10 +457,6 @@ std::function<void(CompiledKernel::CpuBuild&)> recompiling_lower(std::shared_ptr
     };
 }
 
-std::string_view as_text(std::span<const uint8_t> bytes) {
-    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-}
-
 } // namespace
 
 void set_compile_cache(CompileCacheConfig config) {
@@ -442,10 +506,18 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
     const std::shared_ptr<ActiveCache> cache = use_cache_ ? active_cache() : nullptr;
     if (!cache) return compile_uncached(source, std::move(file_name), opts);
 
-    const CacheKey key = entry_key(*cache, source, file_name, opts, modules_.given_modules());
-    brass::cache::Miss miss = brass::cache::Miss::None;
+    const CacheKey base = base_key(*cache, source, file_name, opts);
     std::string why;
-    if (const std::optional<brass::cache::Artifact> art = cache->store.get(key, &miss)) {
+    std::vector<ReadList> lists = load_read_lists(*cache, base, why);
+    // The newest list first: the modules the last compile of this source read.
+    for (size_t li = lists.size(); li-- > 0;) {
+        const CacheKey key = entry_key(base, lists[li], modules_);
+        brass::cache::Miss miss = brass::cache::Miss::None;
+        const std::optional<brass::cache::Artifact> art = cache->store.get(key, &miss);
+        if (!art) {
+            if (why.empty()) why = brass::cache::to_string(miss);
+            continue;
+        }
         const std::string_view records = as_text(art->bytes("modules"));
         const std::string_view result = as_text(art->bytes("result"));
         detail::ByteReader mr(records.data(), records.size());
@@ -505,8 +577,6 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
             g_hits.fetch_add(1, std::memory_order_relaxed);
             return hit;
         }
-    } else {
-        why = brass::cache::to_string(miss);
     }
 
     modules_.record_requests();
@@ -519,11 +589,20 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
 
     std::vector<detail::ModuleRecord> mods;
     mods.reserve(requests.size());
+    ReadList reads;
+    reads.reserve(requests.size());
     for (const auto& rq : requests) {
         const auto got = modules_.resolve(rq.name, rq.importing_dir);
         if (!got) return res;   // nothing to check a lookup against
         mods.push_back({rq.name, dir_string(rq.importing_dir), got->key, *got->path, brass::hash128(*got->source)});
+        reads.emplace_back(rq.name, dir_string(rq.importing_dir));
     }
+    const CacheKey key = entry_key(base, reads, modules_);
+    // This compile's list the newest of the source's.
+    std::erase(lists, reads);
+    lists.push_back(std::move(reads));
+    if (lists.size() > kMaxReadLists) lists.erase(lists.begin(), lists.end() - kMaxReadLists);
+    store_read_lists(*cache, base, lists);
     std::string records;
     detail::ByteWriter mw(records);
     detail::encode_modules(mods, mw);

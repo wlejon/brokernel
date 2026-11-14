@@ -262,6 +262,8 @@ void ensureCpuBuilt(const CompiledKernel& k);
 // module.cpuReady(): a promise settled (settleAsyncCompiles) once `r`'s @cpu
 // kernels' CPU builds are made, begun now if none was.
 Value cpuReadyPromise(const CompileResult& r);
+// kernel.cpuReady(): the same for `k` alone, whichever it was built for.
+Value cpuReadyPromise(const CompiledKernel& k);
 
 // The module tables (api_modules.cpp). resolveFromTables reads the registered
 // and resolved modules (and the host's with `withHostModules`) with no JS;

@@ -132,13 +132,15 @@ compiler with `Compiler::set_use_compile_cache(false)`).
   (the binary holding brokernel's code: path, size, mtime; or
   `CompileCacheConfig::build_stamp`) and version, the format of an entry's
   blobs, the source, its file name, every `CompileOptions` field
-  (knob overrides in any order) and the modules registered by name (each name
-  and a hash of its source), so one source compiled against different
-  registered modules (a scene stage beside each of its hooks) keeps an entry
-  for each. An entry also records each module the compile
-  read (the import as asked, where it resolved, a hash of its source); a lookup
-  resolves each again as the compiler would now, without parsing, and a changed
-  or missing module is a miss. Only successful compiles are stored.
+  (knob overrides in any order) and every module the compile read (the import
+  as asked, where it resolved, a hash of its source), given by name or found
+  by a resolver or search path alike. A lookup resolves each again as the
+  compiler would now, without parsing, so one source compiled against
+  different modules of the same names (a scene stage beside each of its
+  hooks) keeps an entry for each, and a module the compile never reads (one
+  registered for other sources) is no part of its key. Which modules a source
+  asks for is kept beside its entries (the last 8 lists, for a source whose
+  modules import different ones). Only successful compiles are stored.
 - **A hit is the compile:** every `CompileResult` and `CompiledKernel` field
   (SPIR-V, reflection, types, constants, probes, costs, hashes, diagnostics),
   with source, options, modules, search paths and resolver from the compiler.

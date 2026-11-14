@@ -352,9 +352,26 @@ void settleCpuWaits(bool waitAll) {
 // module.cpuReady() -> Promise<undefined>: once the module's @cpu kernels'
 // CPU builds are made (begun now if none was), so their first eval or run
 // does not wait in a frame.
+namespace {
+Value cpuBuildsPromise(CpuBuilds builds);
+}
+
 Value cpuReadyPromise(const CompileResult& r) {
+    return cpuBuildsPromise(unbuiltCpuOnly(r));
+}
+
+// kernel.cpuReady() -> Promise<undefined>: the same for one kernel, a kernel
+// built for the GPU included (its CPU build is made for no one until asked).
+Value cpuReadyPromise(const CompiledKernel& k) {
+    CpuBuilds builds;
+    if (k.has_cpu_build() && !k.cpu_built()) builds.push_back(k.cpu_);
+    return cpuBuildsPromise(std::move(builds));
+}
+
+namespace {
+
+Value cpuBuildsPromise(CpuBuilds builds) {
     ev::Persistent promise(ev::createPromise());
-    CpuBuilds builds = unbuiltCpuOnly(r);
     if (builds.empty()) {
         ev::resolvePromise(promise.get(), ev::undefined());
         return promise.get();
@@ -377,8 +394,6 @@ Value cpuReadyPromise(const CompileResult& r) {
     t_cpuWaits.push_back(std::move(w));
     return promise.get();
 }
-
-namespace {
 
 void startCpuBuilds(CpuBuilds builds) {
     joinPrebuilds(/*finishedOnly=*/true);
