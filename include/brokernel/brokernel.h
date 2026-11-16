@@ -230,6 +230,14 @@ struct CompileOptions {
     uint32_t local_size[3] = {64, 1, 1};
     bool local_size_spec_constants = true;
     uint32_t spirv_version = 0x00010500u; // 0x00010500 (SPIR-V 1.5) or 0x00010600 (SPIR-V 1.6)
+    // brass SpirvOptions::loads_through_variable: on where the SPIR-V runs
+    // through MoltenVK, whose SPIRV-Cross (1.4.2's) otherwise moves a load
+    // past a later store to the same address.
+#ifdef __APPLE__
+    bool spirv_loads_through_variable = true;
+#else
+    bool spirv_loads_through_variable = false;
+#endif
     bool emit_spirv = true;
     bool emit_spirv_disassembly = false;
     bool emit_ptx = false;

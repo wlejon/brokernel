@@ -372,6 +372,7 @@ void encode_options(const CompileOptions& o, ByteWriter& w) {
     for (uint32_t l : o.local_size) w.u32(l);
     w.boolean(o.local_size_spec_constants);
     w.u32(o.spirv_version);
+    w.boolean(o.spirv_loads_through_variable);
     w.boolean(o.emit_spirv);
     w.boolean(o.emit_spirv_disassembly);
     w.boolean(o.emit_ptx);

@@ -857,6 +857,7 @@ CompileResult Compiler::compile_uncached(
                 spv_opts.local_size_z = ck.local_size[2];
                 spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
                 spv_opts.spirv_version = opts.spirv_version;
+                spv_opts.loads_through_variable = opts.spirv_loads_through_variable;
 
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
                 ck.function_costs = detail::function_costs(*lowered.gpu_function, lowered.gpu_module->debug_context(), ck.name);
