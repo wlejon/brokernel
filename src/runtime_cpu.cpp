@@ -4,13 +4,11 @@
 #include <cstddef>
 #include <cstring>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
+#include <brass/gc/fiber.hpp>
+
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace brokernel {
 
@@ -315,50 +313,71 @@ const CompiledKernel::CpuBuild* cpu_build(const std::shared_ptr<CompiledKernel::
 const brass::codegen::KernelFunction kNoFunction{};
 const std::string kNoError;
 
-#ifdef _WIN32
 using PointFn = void (*)(const uint64_t*, const void*, void*);
 
-struct WorkgroupFiberPool {
+// The barrier of an invocation that runs alone (a point evaluation, or a
+// workgroup of one): every invocation of its workgroup has reached it.
+void lone_barrier(void*) {}
+
+// A workgroup's invocations, each on a stack of its own (brass's fibers), so
+// that a barrier suspends one invocation and the next runs. The dispatcher
+// resumes every unfinished invocation in turn; each runs to its next barrier
+// or its end, so one round brings all of them to the same barrier. A lane's
+// fiber runs the invocation of every workgroup given it: after an invocation
+// ends it suspends, and its next resume starts the next workgroup's.
+struct WorkgroupLanes {
+    struct Lane {
+        WorkgroupLanes* group = nullptr;
+        CpuPointContext ctx{};
+        void* ret = nullptr;
+        bool done = false;
+        std::unique_ptr<brass::gc::Fiber> fiber;
+    };
+
     PointFn fn_ptr = nullptr;
     const uint64_t* slots = nullptr;
-    void* main_fiber = nullptr;
-    std::vector<void*> fibers;
-    std::vector<CpuPointContext> contexts;
-    std::vector<void*> ret_ptrs;
-    std::vector<uint8_t> done;
-    size_t wg_size = 0;
-    size_t current_idx = 0;
-    bool shutdown = false;
+    std::vector<Lane> lanes;
 
-    void step_from(size_t idx) {
-        for (size_t step = 1; step <= wg_size; ++step) {
-            size_t cand = (idx + step) % wg_size;
-            if (!done[cand]) {
-                current_idx = cand;
-                SwitchToFiber(fibers[cand]);
-                return;
+    static void run(void* arg) {
+        auto* lane = static_cast<Lane*>(arg);
+        for (;;) {
+            lane->group->fn_ptr(lane->group->slots, &lane->ctx, lane->ret);
+            lane->done = true;
+            brass::gc::Fiber::suspend();
+        }
+    }
+
+    static void barrier(void*) { brass::gc::Fiber::suspend(); }
+
+    // Creates the lanes' fibers; false (with *err set) if a stack cannot be made.
+    bool start(size_t count, std::string* err) {
+        lanes.resize(count);
+        for (Lane& lane : lanes) {
+            lane.group = this;
+            // 1 MiB, what an invocation's stack was under the Windows fibers this
+            // replaced: a kernel's local arrays live on it.
+            lane.fiber = brass::gc::Fiber::create(&WorkgroupLanes::run, &lane, size_t{1} << 20);
+            if (!lane.fiber) {
+                if (err) *err = "cannot make the stacks of a workgroup's " + std::to_string(count) + " invocations";
+                return false;
             }
         }
-        SwitchToFiber(main_fiber);
+        return true;
     }
 
-    static void WINAPI fiber_proc(void* param) {
-        auto* pool = static_cast<WorkgroupFiberPool*>(param);
-        const size_t idx = pool->current_idx;
-        while (!pool->shutdown) {
-            pool->fn_ptr(pool->slots, &pool->contexts[idx], pool->ret_ptrs[idx]);
-            pool->done[idx] = 1;
-            pool->step_from(idx);
+    // Runs the invocations whose contexts and return slots are set.
+    void run_workgroup() {
+        for (Lane& lane : lanes) lane.done = false;
+        size_t remaining = lanes.size();
+        while (remaining > 0) {
+            for (Lane& lane : lanes) {
+                if (lane.done) continue;
+                lane.fiber->resume();
+                if (lane.done) --remaining;
+            }
         }
-        SwitchToFiber(pool->main_fiber);
-    }
-
-    static void barrier_callback(void* param) {
-        auto* pool = static_cast<WorkgroupFiberPool*>(param);
-        pool->step_from(pool->current_idx);
     }
 };
-#endif
 
 } // namespace
 
@@ -419,7 +438,7 @@ bool CompiledKernel::eval_grid_point_cpu(
         gx / lx, gy / ly, gz / lz,
         lx, ly, lz,
         (gw + lx - 1) / lx, (gh + ly - 1) / ly, (gd + lz - 1) / lz,
-        shared_buf.data(), nullptr, nullptr, t_active_cpu_probe_buf,
+        shared_buf.data(), &lone_barrier, nullptr, t_active_cpu_probe_buf,
     };
 
     alignas(16) uint8_t scratch_ret[256] = {};
@@ -581,99 +600,56 @@ bool CompiledKernel::dispatch_cpu(
     alignas(16) uint8_t scratch_ret[256] = {};
     std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes(), 64), 0);
 
-    using PointFn = void (*)(const uint64_t*, const void*, void*);
     auto fn_ptr = cpu_point_fn().as<PointFn>();
 
-#ifdef _WIN32
-    if (uses_barriers_or_shared && wg_size > 1) {
-        const bool was_fiber = IsThreadAFiber() != FALSE;
-        void* main_fiber = was_fiber ? GetCurrentFiber() : ConvertThreadToFiber(nullptr);
-        WorkgroupFiberPool pool;
-        pool.fn_ptr = fn_ptr;
-        pool.slots = slots.data();
-        pool.main_fiber = main_fiber;
-        pool.wg_size = wg_size;
-        pool.fibers.resize(wg_size, nullptr);
-        pool.contexts.resize(wg_size);
-        pool.ret_ptrs.resize(wg_size, scratch_ret);
-        pool.done.resize(wg_size, 0);
-        for (size_t i = 0; i < wg_size; ++i) {
-            pool.fibers[i] = CreateFiber(0, &WorkgroupFiberPool::fiber_proc, &pool);
-        }
-
-        for (uint32_t wz = 0; wz < nwg[2]; ++wz) {
-            for (uint32_t wy = 0; wy < nwg[1]; ++wy) {
-                for (uint32_t wx = 0; wx < nwg[0]; ++wx) {
-                    std::fill(shared_buf.begin(), shared_buf.end(), 0);
-                    size_t idx = 0;
-                    for (uint32_t lz = 0; lz < lsz[2]; ++lz) {
-                        for (uint32_t ly = 0; ly < lsz[1]; ++ly) {
-                            for (uint32_t lx = 0; lx < lsz[0]; ++lx, ++idx) {
-                                const uint32_t gx = wx * lsz[0] + lx;
-                                const uint32_t gy = wy * lsz[1] + ly;
-                                const uint32_t gz = wz * lsz[2] + lz;
-                                pool.contexts[idx] = CpuPointContext{
-                                    static_cast<int32_t>(gx), static_cast<int32_t>(gy), static_cast<int32_t>(gz),
-                                    static_cast<int32_t>(w), static_cast<int32_t>(h), static_cast<int32_t>(d),
-                                    static_cast<int32_t>(lx), static_cast<int32_t>(ly), static_cast<int32_t>(lz),
-                                    static_cast<int32_t>(wx), static_cast<int32_t>(wy), static_cast<int32_t>(wz),
-                                    static_cast<int32_t>(lsz[0]), static_cast<int32_t>(lsz[1]), static_cast<int32_t>(lsz[2]),
-                                    static_cast<int32_t>(nwg[0]), static_cast<int32_t>(nwg[1]), static_cast<int32_t>(nwg[2]),
-                                    shared_buf.data(), &WorkgroupFiberPool::barrier_callback, &pool,
-                                };
-                                if (return_store_out && gx < w && gy < h && gz < d) {
-                                    size_t lin = (size_t(gz) * h + gy) * w + gx;
-                                    pool.ret_ptrs[idx] = static_cast<uint8_t*>(return_store_out) + lin * ret_stride;
-                                } else {
-                                    pool.ret_ptrs[idx] = scratch_ret;
-                                }
-                                pool.done[idx] = 0;
-                            }
-                        }
-                    }
-                    pool.current_idx = 0;
-                    SwitchToFiber(pool.fibers[0]);
-                }
-            }
-        }
-
-        for (void* f : pool.fibers) {
-            if (f) DeleteFiber(f);
-        }
-        if (!was_fiber) ConvertFiberToThread();
-        return true;
+    // A workgroup whose invocations meet at barriers runs them on fibers,
+    // all of them, those outside the grid too (they reach the barriers);
+    // otherwise each cell's invocation runs to its end in turn.
+    WorkgroupLanes group;
+    const bool on_fibers = uses_barriers_or_shared && wg_size > 1;
+    if (on_fibers) {
+        group.fn_ptr = fn_ptr;
+        group.slots = slots.data();
+        if (!group.start(wg_size, err)) return false;
     }
-#endif
 
     for (uint32_t wz = 0; wz < nwg[2]; ++wz) {
         for (uint32_t wy = 0; wy < nwg[1]; ++wy) {
             for (uint32_t wx = 0; wx < nwg[0]; ++wx) {
                 std::fill(shared_buf.begin(), shared_buf.end(), 0);
+                size_t idx = 0;
                 for (uint32_t lz = 0; lz < lsz[2]; ++lz) {
                     for (uint32_t ly = 0; ly < lsz[1]; ++ly) {
-                        for (uint32_t lx = 0; lx < lsz[0]; ++lx) {
+                        for (uint32_t lx = 0; lx < lsz[0]; ++lx, ++idx) {
                             const uint32_t gx = wx * lsz[0] + lx;
                             const uint32_t gy = wy * lsz[1] + ly;
                             const uint32_t gz = wz * lsz[2] + lz;
-                            if (gx >= w || gy >= h || gz >= d) continue;
-                            CpuPointContext ctx{
+                            const bool in_grid = gx < w && gy < h && gz < d;
+                            if (!in_grid && !on_fibers) continue;
+                            const CpuPointContext ctx{
                                 static_cast<int32_t>(gx), static_cast<int32_t>(gy), static_cast<int32_t>(gz),
                                 static_cast<int32_t>(w), static_cast<int32_t>(h), static_cast<int32_t>(d),
                                 static_cast<int32_t>(lx), static_cast<int32_t>(ly), static_cast<int32_t>(lz),
                                 static_cast<int32_t>(wx), static_cast<int32_t>(wy), static_cast<int32_t>(wz),
                                 static_cast<int32_t>(lsz[0]), static_cast<int32_t>(lsz[1]), static_cast<int32_t>(lsz[2]),
                                 static_cast<int32_t>(nwg[0]), static_cast<int32_t>(nwg[1]), static_cast<int32_t>(nwg[2]),
-                                shared_buf.data(), nullptr, nullptr,
+                                shared_buf.data(), on_fibers ? &WorkgroupLanes::barrier : &lone_barrier, nullptr, nullptr,
                             };
                             void* cell_ret = scratch_ret;
-                            if (return_store_out && gx < w && gy < h && gz < d) {
+                            if (return_store_out && in_grid) {
                                 size_t lin = (size_t(gz) * h + gy) * w + gx;
                                 cell_ret = static_cast<uint8_t*>(return_store_out) + lin * ret_stride;
                             }
-                            fn_ptr(slots.data(), &ctx, cell_ret);
+                            if (on_fibers) {
+                                group.lanes[idx].ctx = ctx;
+                                group.lanes[idx].ret = cell_ret;
+                            } else {
+                                fn_ptr(slots.data(), &ctx, cell_ret);
+                            }
                         }
                     }
                 }
+                if (on_fibers) group.run_workgroup();
             }
         }
     }
