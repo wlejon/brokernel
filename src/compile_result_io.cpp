@@ -2,6 +2,7 @@
 // a compile produces, in a fixed order (compile_cache_internal.h).
 #include "compile_cache_internal.h"
 
+#include <brass/target/spirv_target.hpp>
 #include <algorithm>
 
 namespace brokernel::detail {
@@ -177,66 +178,18 @@ void get_strings(ByteReader& r, std::vector<std::string>& v) {
 }
 
 void put(ByteWriter& w, const brass::target::SpirvKernel& s) {
-    w.str(s.entry);
-    w.u8(static_cast<uint8_t>(s.stage));
-    w.u64(s.words.size());
-    w.raw(s.words.data(), s.words.size() * sizeof(uint32_t));
-    put_list(w, s.params, [&](const brass::target::SpirvParam& p) {
-        w.u8(static_cast<uint8_t>(p.type.kind()));
-        w.u32(p.offset);
-        w.u32(p.size);
-    });
-    put_list(w, s.descriptors, [&](const brass::target::SpirvDescriptorBinding& d) {
-        w.u32(d.set);
-        w.u32(d.binding);
-        w.u8(static_cast<uint8_t>(d.kind));
-        w.u8(static_cast<uint8_t>(d.dim));
-        w.boolean(d.arrayed);
-        w.boolean(d.depth);
-        w.u8(static_cast<uint8_t>(d.scalar));
-        w.u32(d.format);
-        w.u32(d.bytes);
-    });
-    w.u32(s.push_constant_bytes);
-    w.u32(s.shared_bytes);
-    for (uint32_t l : s.local_size) w.u32(l);
-    w.boolean(s.local_size_spec_constants);
-    put_strings(w, s.capabilities);
-    put_strings(w, s.extensions);
+    const std::vector<uint8_t> encoded = brass::target::serialize_spirv_kernel(s);
+    w.u64(encoded.size());
+    if (!encoded.empty()) w.raw(encoded.data(), encoded.size());
 }
 
 void get_spirv(ByteReader& r, brass::target::SpirvKernel& s) {
-    s.entry = r.str();
-    s.stage = static_cast<brass::target::SpirvStage>(r.u8());
-    const size_t n = r.count(sizeof(uint32_t));
-    s.words.resize(n);
-    r.raw(s.words.data(), n * sizeof(uint32_t));
-    get_list(r, s.params, [&] {
-        brass::target::SpirvParam p;
-        p.type = brass::Type(static_cast<brass::TypeKind>(r.u8()));
-        p.offset = r.u32();
-        p.size = r.u32();
-        return p;
-    });
-    get_list(r, s.descriptors, [&] {
-        brass::target::SpirvDescriptorBinding d;
-        d.set = r.u32();
-        d.binding = r.u32();
-        d.kind = static_cast<brass::target::SpirvDescriptorKind>(r.u8());
-        d.dim = static_cast<brass::target::SpirvImageDim>(r.u8());
-        d.arrayed = r.boolean();
-        d.depth = r.boolean();
-        d.scalar = static_cast<brass::target::SpirvImageScalar>(r.u8());
-        d.format = r.u32();
-        d.bytes = r.u32();
-        return d;
-    });
-    s.push_constant_bytes = r.u32();
-    s.shared_bytes = r.u32();
-    for (uint32_t& l : s.local_size) l = r.u32();
-    s.local_size_spec_constants = r.boolean();
-    get_strings(r, s.capabilities);
-    get_strings(r, s.extensions);
+    const size_t n = r.count(1);
+    std::vector<uint8_t> raw(n);
+    if (n > 0) r.raw(raw.data(), n);
+    if (!r.ok() || !brass::target::deserialize_spirv_kernel(raw, s)) {
+        r.fail();
+    }
 }
 
 void put(ByteWriter& w, const CompiledKernel& k) {
@@ -377,6 +330,7 @@ void encode_options(const CompileOptions& o, ByteWriter& w) {
     w.boolean(o.emit_spirv_disassembly);
     w.boolean(o.emit_ptx);
     w.boolean(o.compile_cpu);
+    w.boolean(o.optimize_gpu_mir);
     w.boolean(o.verify_spirv_equivalence);
     w.i32(o.opt_level);
     w.boolean(o.enable_probes);

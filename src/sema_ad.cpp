@@ -188,6 +188,23 @@ StmtPtr make_return_stmt(ExprPtr val, const SourceSpan& sp) {
     return s;
 }
 
+bool expr_uses_diff_var(const Expr* e, const std::set<std::string>& diff_vars) {
+    if (!e) return false;
+    if (e->kind == Expr::Kind::Ident) {
+        return diff_vars.count(e->name) > 0;
+    }
+    if (expr_uses_diff_var(e->lhs.get(), diff_vars)) return true;
+    if (expr_uses_diff_var(e->rhs.get(), diff_vars)) return true;
+    if (expr_uses_diff_var(e->cond.get(), diff_vars)) return true;
+    for (const auto& a : e->args) {
+        if (expr_uses_diff_var(a.get(), diff_vars)) return true;
+    }
+    for (const auto& f : e->fields) {
+        if (expr_uses_diff_var(f.value.get(), diff_vars)) return true;
+    }
+    return false;
+}
+
 struct AdSynthesizer {
     SemaContext& ctx;
     std::set<std::string> diff_vars;
@@ -393,8 +410,17 @@ struct AdSynthesizer {
                 return sl;
             }
 
-            case Expr::Kind::MethodCall:
+            case Expr::Kind::MethodCall: {
+                bool dep = expr_uses_diff_var(e->lhs.get(), diff_vars);
+                for (const auto& a : e->args) {
+                    if (expr_uses_diff_var(a.get(), diff_vars)) dep = true;
+                }
+                if (dep && is_diff_type(t, ctx.out->types)) {
+                    ctx.diags.error(sp, "automatic differentiation does not support method call '" +
+                                            e->name + "' with differentiated arguments");
+                }
                 return make_zero_expr(t, ctx.out->types, sp);
+            }
 
             case Expr::Kind::Call:
                 return diff_call(e);
@@ -691,6 +717,15 @@ struct AdSynthesizer {
             }
         }
 
+        if (is_diff_type(t, ctx.out->types)) {
+            for (const auto& a : e->args) {
+                if (expr_uses_diff_var(a.get(), diff_vars)) {
+                    ctx.diags.error(sp, "automatic differentiation does not support call to '" + n +
+                                            "' with differentiated arguments");
+                    break;
+                }
+            }
+        }
         return make_zero_expr(t, ctx.out->types, sp);
     }
 
@@ -795,7 +830,17 @@ struct AdSynthesizer {
                 st->cond = clone_expr(s->cond.get());
                 st->body = diff_stmt_list(s->body);
                 if (s->for_step) {
-                    diff_stmt(s->for_step.get(), st->body);
+                    std::vector<StmtPtr> step_stmts;
+                    diff_stmt(s->for_step.get(), step_stmts);
+                    if (step_stmts.size() == 1) {
+                        st->for_step = std::move(step_stmts[0]);
+                    } else if (step_stmts.size() > 1) {
+                        auto blk = std::make_unique<Stmt>();
+                        blk->kind = Stmt::Kind::Block;
+                        blk->span = s->for_step->span;
+                        blk->body = std::move(step_stmts);
+                        st->for_step = std::move(blk);
+                    }
                 }
                 out.push_back(std::move(st));
                 break;

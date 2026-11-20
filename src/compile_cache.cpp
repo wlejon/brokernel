@@ -9,10 +9,8 @@
 
 #include <brass/cache/artifact_cache.hpp>
 #include <brass/cache/native_module_cache.hpp>
-#include <brass/core/diagnostics.hpp>
+#include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/loop_opt.hpp>
-#include <brass/mir/scalar_opt.hpp>
-#include <brass/mir/verifier.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -43,7 +41,7 @@ constexpr std::string_view kReadsDomain = "brokernel.compile-reads/1";
 constexpr std::string_view kEntryDomain = "brokernel.compile/3";
 // The lists of module requests kept for one source (the oldest dropped).
 constexpr size_t kMaxReadLists = 8;
-constexpr std::string_view kCpuDomain = "brokernel.cpu/1";
+constexpr std::string_view kCpuDomain = "brokernel.cpu/2";
 constexpr std::string_view kCpuMetaDomain = "brokernel.cpu-meta/1";
 constexpr const char* kUndecodable = "the entry does not decode";
 
@@ -140,7 +138,7 @@ CacheKey base_key(const ActiveCache& c, std::string_view source, const std::stri
 // Whether KernelJit compiles a CPU build with these options as
 // optimize_for_kernel_jit does (the options new_cpu_build makes).
 bool storable(const brass::codegen::KernelOptions& o) {
-    return !o.enable_parallel && !(o.enable_optimizations && o.opt_level >= 2 && (o.enable_superopt || o.enable_smt_guard_elim));
+    return !o.enable_parallel;
 }
 
 // A kernel's CPU build: the compile's entry and module records (what the
@@ -158,6 +156,8 @@ CacheKey cpu_key(const CacheKey& entry, std::string_view records, size_t index, 
         .add_bool("opt.enabled", o.enable_optimizations)
         .add_bool("opt.sroa", o.enable_sroa)
         .add_bool("opt.bce", o.enable_bce)
+        .add_bool("opt.smt_guard_elim", o.enable_smt_guard_elim)
+        .add_bool("opt.superopt", o.enable_superopt)
         .add_bool("opt.avx2", o.enable_avx2)
         .add_bool("opt.fma", o.enable_fma)
         .add_bool("opt.fp_reassociation", o.enable_fp_reassociation)
@@ -219,13 +219,7 @@ bool bind_image(const std::shared_ptr<const brass::cache::NativeModule>& m, cons
     return true;
 }
 
-// KernelJit::compile's MIR pipeline (brass src/codegen/kernel_jit.cpp:311,
-// run_kernel_optimizations at :247, which is private) for the options a CPU
-// build has (storable()): no auto-parallelization, no SMT guard elimination,
-// no superoptimizer. A copy because brass offers that pipeline to no one but
-// its JIT; once KernelJit has a public "prepare this module as compile()
-// would" (run_kernel_optimizations and the verify, made callable), this
-// becomes that one call and storable() goes.
+// Delegate CPU optimization + verification to brass::codegen::KernelJit::prepare_module.
 bool build_cpu_module(const brass::Module& src, const brass::codegen::KernelOptions& o, brass::Module& mod,
                       std::string& error) {
     mod.set_allow_fp_reassociation(src.allow_fp_reassociation() || o.enable_fp_reassociation);
@@ -233,34 +227,10 @@ bool build_cpu_module(const brass::Module& src, const brass::codegen::KernelOpti
     for (const brass::Function* fn : src.functions()) {
         if (fn) brass::clone_function(*fn, mod);
     }
-    if (o.enable_optimizations && o.opt_level >= 1) {
-        brass::LoopOptOptions l;
-        l.enable_sroa = o.enable_sroa && o.opt_level >= 2;
-        l.enable_bce = o.enable_bce && o.opt_level >= 2;
-        l.enable_avx2 = o.enable_avx2;
-        l.enable_fma = o.enable_fma;
-        l.enable_fp_reassociation = o.enable_fp_reassociation || mod.allow_fp_reassociation();
-        l.enable_vectorize = o.enable_vectorize;
-        l.enable_slp = o.enable_slp;
-        l.enable_unroll = o.enable_unroll;
-        l.unroll_factor = o.unroll_factor;
-        l.enable_f64_demote = false;
-        l.enable_parallel_loops = false;
-        std::vector<brass::Function*> fns;
-        for (brass::Function* fn : mod.functions()) {
-            if (fn) fns.push_back(fn);
-        }
-        for (brass::Function* fn : fns) {
-            brass::optimize_function(*fn, l);
-            if (o.opt_level >= 2) brass::eliminate_dead_code(*fn);
-        }
-    }
-    for (brass::Function* fn : mod.functions()) {
-        if (fn) fn->rebuild_cfg_predecessors();
-    }
-    brass::DiagnosticReporter diag;
-    if (!brass::verify_module(mod, &diag)) {
-        error = "verification failed: " + diag.format_all();
+    try {
+        brass::codegen::KernelJit::prepare_module(mod, o);
+    } catch (const std::exception& ex) {
+        error = ex.what();
         return false;
     }
     return true;

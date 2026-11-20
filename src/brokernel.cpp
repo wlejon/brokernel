@@ -2,6 +2,7 @@
 #include "compile_internal.h"
 #include "kernel_report.h"
 
+#include <brass/mir/gpu_opt.hpp>
 #include <brass/target/host_cpu.hpp>
 #include <brass/target/ptx_target.hpp>
 #include <brass/verify/gpu_equiv.hpp>
@@ -53,6 +54,110 @@ bool store_covers(const KernelParamInfo& p, const KernelArg& a, GridShape shape,
                std::to_string(cells) + " cell(s)";
     }
     return false;
+}
+
+struct GpuBoundBuffer {
+    brass::gpu::VulkanBuffer dev_buf;
+    void* host_ptr = nullptr;
+    size_t byte_size = 0;
+    bool write_back = false;
+};
+
+bool prepare_gpu_args_and_descriptors(
+    const std::vector<KernelParamInfo>& params,
+    const std::vector<KernelParamInfo>& block_bindings,
+    GridShape shape,
+    std::span<const KernelArg> args,
+    bool check_coverage,
+    bool record_writeback,
+    bool allow_device_store_args,
+    std::vector<KernelArg>& dev_args,
+    std::vector<GpuBoundBuffer>& bound_buffers,
+    std::vector<brass::gpu::VulkanDescriptorBuffer>& vk_descriptors,
+    std::string* err) {
+    bound_buffers.reserve(params.size() + block_bindings.size() + 1);
+    dev_args.assign(args.begin(), args.end());
+
+    const size_t non_grid = count_non_grid_params(params);
+    const size_t param_blocks = count_param_blocks(params);
+    const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
+    const size_t expected_with_blocks = non_grid + block_bindings.size();
+    const size_t expected_full = params.size() + global_blocks;
+    const bool skip_all_bound = (args.size() == non_grid && block_bindings.empty());
+    const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
+
+    std::vector<size_t> param_block_arg_idx(params.size(), SIZE_MAX);
+    size_t arg_idx = 0;
+    for (size_t p_i = 0; p_i < params.size(); ++p_i) {
+        const auto& p = params[p_i];
+        if (is_bound_param(p.role)) {
+            if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
+                if (!skip_all_bound && arg_idx < args.size()) {
+                    param_block_arg_idx[p_i] = arg_idx++;
+                }
+            } else if (!skip_all_bound && !skip_non_block_bound) {
+                ++arg_idx;
+            }
+            continue;
+        }
+        const size_t i = arg_idx++;
+        if (i >= args.size()) break;
+        if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
+        const KernelArg& a = args[i];
+        if (allow_device_store_args && a.kind() == KernelArg::Kind::Device) continue;
+        if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
+            if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
+            return false;
+        }
+        if (check_coverage && !store_covers(p, a, shape, err)) return false;
+        size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
+        GpuBoundBuffer bb;
+        bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
+        bb.host_ptr = a.buffer_ptr();
+        bb.byte_size = a.buffer_bytes();
+        bb.write_back = record_writeback && (p.role == ParamRole::Store && can_Write(p.access) && !a.is_read_only());
+        if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
+            bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
+        } else {
+            bb.dev_buf.zero();
+        }
+        bound_buffers.push_back(std::move(bb));
+        dev_args[i] = KernelArg::device(bound_buffers.back().dev_buf.device_address(), a.buffer_bytes(), bytes);
+    }
+
+    vk_descriptors.reserve(block_bindings.size());
+    for (const auto& binfo : block_bindings) {
+        size_t bi = SIZE_MAX;
+        if (binfo.mir_param_index < params.size()) {
+            bi = param_block_arg_idx[binfo.mir_param_index];
+        } else if (arg_idx < args.size()) {
+            bi = arg_idx++;
+        }
+        if (bi >= args.size() || args[bi].kind() != KernelArg::Kind::Buffer || !args[bi].buffer_ptr()) {
+            if (err) *err = "binding '" + binfo.name + "' requires a buffer argument";
+            return false;
+        }
+        const KernelArg& a = args[bi];
+        size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(binfo.element_bytes), 16});
+        GpuBoundBuffer bb;
+        bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
+        bb.host_ptr = a.buffer_ptr();
+        bb.byte_size = a.buffer_bytes();
+        bb.write_back = record_writeback && (binfo.role == ParamRole::Buffer && can_Write(binfo.access) && !a.is_read_only());
+        if (a.buffer_bytes() > 0) {
+            bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
+        } else {
+            bb.dev_buf.zero();
+        }
+        vk_descriptors.push_back(brass::gpu::VulkanDescriptorBuffer{
+            binfo.descriptor_set,
+            binfo.descriptor_binding,
+            bb.dev_buf.handle(),
+            bytes,
+        });
+        bound_buffers.push_back(std::move(bb));
+    }
+    return true;
 }
 
 } // namespace
@@ -233,99 +338,20 @@ bool CompiledKernel::dispatch_gpu(
         }
         const brass::gpu::VulkanModule& vk = *vk_module;
 
-        struct BoundBuffer {
-            brass::gpu::VulkanBuffer dev_buf;
-            void* host_ptr = nullptr;
-            size_t byte_size = 0;
-            bool write_back = false;
-        };
-        std::vector<BoundBuffer> bound_buffers;
-        bound_buffers.reserve(params.size() + block_bindings.size() + 1);
-
-        std::vector<KernelArg> dev_args(args.begin(), args.end());
-        const size_t non_grid = count_non_grid_params(params);
-        const size_t param_blocks = count_param_blocks(params);
-        const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
-        const size_t expected_with_blocks = non_grid + block_bindings.size();
-        const size_t expected_full = params.size() + global_blocks;
-        const bool skip_all_bound = (args.size() == non_grid && block_bindings.empty());
-        const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
-
-        std::vector<size_t> param_block_arg_idx(params.size(), SIZE_MAX);
-        size_t arg_idx = 0;
-        for (size_t p_i = 0; p_i < params.size(); ++p_i) {
-            const auto& p = params[p_i];
-            if (is_bound_param(p.role)) {
-                if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
-                    if (!skip_all_bound && arg_idx < args.size()) {
-                        param_block_arg_idx[p_i] = arg_idx++;
-                    }
-                } else if (!skip_all_bound && !skip_non_block_bound) {
-                    ++arg_idx;
-                }
-                continue;
-            }
-            const size_t i = arg_idx++;
-            if (i >= args.size()) break;
-            if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
-            const KernelArg& a = args[i];
-            if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
-                if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
-                return false;
-            }
-            if (!store_covers(p, a, shape, err)) return false;
-            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
-            BoundBuffer bb;
-            bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
-            bb.host_ptr = a.buffer_ptr();
-            bb.byte_size = a.buffer_bytes();
-            bb.write_back = (p.role == ParamRole::Store && can_Write(p.access) && !a.is_read_only());
-            if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
-                bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
-            } else {
-                bb.dev_buf.zero();
-            }
-            bound_buffers.push_back(std::move(bb));
-            dev_args[i] = KernelArg::device(bound_buffers.back().dev_buf.device_address(), a.buffer_bytes(), bytes);
-        }
-
+        std::vector<GpuBoundBuffer> bound_buffers;
+        std::vector<KernelArg> dev_args;
         std::vector<brass::gpu::VulkanDescriptorBuffer> vk_descriptors;
-        vk_descriptors.reserve(block_bindings.size());
-        for (const auto& binfo : block_bindings) {
-            size_t bi = SIZE_MAX;
-            if (binfo.mir_param_index < params.size()) {
-                bi = param_block_arg_idx[binfo.mir_param_index];
-            } else if (arg_idx < args.size()) {
-                bi = arg_idx++;
-            }
-            if (bi >= args.size() || args[bi].kind() != KernelArg::Kind::Buffer || !args[bi].buffer_ptr()) {
-                if (err) *err = "binding '" + binfo.name + "' requires a buffer argument";
-                return false;
-            }
-            const KernelArg& a = args[bi];
-            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(binfo.element_bytes), 16});
-            BoundBuffer bb;
-            bb.dev_buf = brass::gpu::VulkanBuffer::alloc(bytes);
-            bb.host_ptr = a.buffer_ptr();
-            bb.byte_size = a.buffer_bytes();
-            bb.write_back = (binfo.role == ParamRole::Buffer && can_Write(binfo.access) && !a.is_read_only());
-            if (a.buffer_bytes() > 0) {
-                bb.dev_buf.upload(a.buffer_ptr(), a.buffer_bytes());
-            } else {
-                bb.dev_buf.zero();
-            }
-            vk_descriptors.push_back(brass::gpu::VulkanDescriptorBuffer{
-                binfo.descriptor_set,
-                binfo.descriptor_binding,
-                bb.dev_buf.handle(),
-                bytes,
-            });
-            bound_buffers.push_back(std::move(bb));
+        if (!prepare_gpu_args_and_descriptors(params, block_bindings, shape, args,
+                                              /*check_coverage=*/true,
+                                              /*record_writeback=*/true,
+                                              /*allow_device_store_args=*/false,
+                                              dev_args, bound_buffers, vk_descriptors, err)) {
+            return false;
         }
 
         uint64_t return_address = 0;
         if (const size_t ret_total_bytes = gpu_return_bytes(shape)) {
-            BoundBuffer ret_bb;
+            GpuBoundBuffer ret_bb;
             ret_bb.dev_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_total_bytes, 16));
             ret_bb.dev_buf.zero();
             ret_bb.host_ptr = return_store_out;
@@ -339,7 +365,7 @@ bool CompiledKernel::dispatch_gpu(
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
         if (probes_compiled && stage == Stage::Compute && !probes.empty() && !launch.args.empty()) {
             const int32_t inactive_target[4] = {-1, -1, -1, 0};
-            BoundBuffer pbb;
+            GpuBoundBuffer pbb;
             pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
             pbb.dev_buf.upload(inactive_target, 16);
             launch.args.back() = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
@@ -617,38 +643,24 @@ bool CompiledKernel::probe_gpu(
         }
         const brass::gpu::VulkanModule& vk = *vk_module;
 
-        std::vector<brass::gpu::VulkanBuffer> temp_buffers;
-        std::vector<KernelArg> dev_args(args.begin(), args.end());
-        size_t arg_idx = 0;
-        for (size_t p_i = 0; p_i < params.size(); ++p_i) {
-            const auto& p = params[p_i];
-            if (is_bound_param(p.role)) continue;
-            const size_t i = arg_idx++;
-            if (i >= dev_args.size()) break;
-            if (p.role != ParamRole::Store && p.role != ParamRole::Stencil) continue;
-            const KernelArg& a = dev_args[i];
-            if (a.kind() == KernelArg::Kind::Device) continue;
-            if (a.kind() != KernelArg::Kind::Buffer || !a.buffer_ptr()) {
-                if (err) *err = "parameter '" + p.name + "' requires a buffer/store argument";
-                return false;
-            }
-            size_t bytes = std::max<size_t>({a.buffer_bytes(), size_t(p.element_bytes), 16});
-            auto dbuf = brass::gpu::VulkanBuffer::alloc(bytes);
-            if (a.buffer_bytes() > 0 && (p.role == ParamRole::Stencil || can_Read(p.access))) {
-                dbuf.upload(a.buffer_ptr(), a.buffer_bytes());
-            } else {
-                dbuf.zero();
-            }
-            dev_args[i] = KernelArg::device(dbuf.device_address(), a.buffer_bytes(), bytes);
-            temp_buffers.push_back(std::move(dbuf));
+        std::vector<GpuBoundBuffer> bound_buffers;
+        std::vector<KernelArg> dev_args;
+        std::vector<brass::gpu::VulkanDescriptorBuffer> vk_descriptors;
+        if (!prepare_gpu_args_and_descriptors(params, block_bindings, shape, args,
+                                              /*check_coverage=*/false,
+                                              /*record_writeback=*/false,
+                                              /*allow_device_store_args=*/true,
+                                              dev_args, bound_buffers, vk_descriptors, err)) {
+            return false;
         }
 
         uint64_t return_address = 0;
         if (const size_t ret_bytes = gpu_return_bytes(shape)) {
-            auto rbuf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_bytes, 16));
-            rbuf.zero();
-            return_address = rbuf.device_address();
-            temp_buffers.push_back(std::move(rbuf));
+            GpuBoundBuffer rbb;
+            rbb.dev_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_bytes, 16));
+            rbb.dev_buf.zero();
+            return_address = rbb.dev_buf.device_address();
+            bound_buffers.push_back(std::move(rbb));
         }
 
         uint32_t max_idx = 0;
@@ -672,6 +684,7 @@ bool CompiledKernel::probe_gpu(
             disp.grid[i] = launch.groups[i];
             disp.block[i] = launch.local_size[i];
         }
+        disp.descriptors = std::move(vk_descriptors);
         if (!vk.launch(disp, launch.args, &vk_err)) {
             if (err) *err = vk_err;
             return false;
@@ -849,6 +862,13 @@ CompileResult Compiler::compile_uncached(
         ck.stencil_halo[2] = fn->stencil_halo[2];
 
         try {
+            const bool emit_ptx_now = opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64;
+            if (opts.optimize_gpu_mir && opts.opt_level > 0 && (gpu_build || emit_ptx_now) &&
+                lowered.gpu_function && lowered.gpu_module) {
+                brass::GpuOptOptions gpu_opts;
+                gpu_opts.opt_level = opts.opt_level;
+                brass::optimize_gpu_function(*lowered.gpu_function, *lowered.gpu_module, gpu_opts);
+            }
             if (gpu_build) {
                 brass::target::SpirvOptions spv_opts;
                 spv_opts.stage = ck.stage;
@@ -882,7 +902,7 @@ CompileResult Compiler::compile_uncached(
                 }
             }
 
-            if (opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
+            if (emit_ptx_now) {
                 ck.ptx = brass::target::PtxTarget::emit_function(*lowered.gpu_function);
             }
 

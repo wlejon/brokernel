@@ -715,6 +715,39 @@ void test_speed() {
     CHECK(cpu_load_ms * 2 < cpu_compile_ms);
 }
 
+void test_wave3_options_and_cpu() {
+    use_cache(g_root / "wave3");
+    const std::string src = R"(
+        @kernel @grid(1) fn scale_add(g: grid<1>, out: write_store<f32, 1>, k: f32) {
+            let x = g.x() as f32;
+            out[g.x()] = x * k + 1.0;
+        }
+    )";
+
+    CompileOptions o_opt;
+    o_opt.optimize_gpu_mir = true;
+    const CompileResult m_opt = compile_source(src, "w3_opt.bk", o_opt);
+    const CompileResult h_opt = compile_source(src, "w3_opt.bk", o_opt);
+    CHECK(m_opt.ok && m_opt.cache_status == CacheStatus::Miss && h_opt.cache_status == CacheStatus::Hit);
+    check_same_result(m_opt, h_opt);
+
+    CompileOptions o_raw;
+    o_raw.optimize_gpu_mir = false;
+    const CompileResult m_raw = compile_source(src, "w3_opt.bk", o_raw);
+    const CompileResult h_raw = compile_source(src, "w3_opt.bk", o_raw);
+    CHECK(m_raw.ok && m_raw.cache_status == CacheStatus::Miss && h_raw.cache_status == CacheStatus::Hit);
+    check_same_result(m_raw, h_raw);
+
+    std::vector<float> a(8, 0.0f), b(8, 0.0f);
+    std::string err;
+    CHECK(m_opt.find_kernel("scale_add")->dispatch_cpu(GridShape(8), {KernelArg::store(a), KernelArg(2.0f)}, nullptr, &err));
+    use_cache(g_root / "wave3");
+    const CompileResult reload = compile_source(src, "w3_opt.bk", o_opt);
+    CHECK(reload.cache_status == CacheStatus::Hit);
+    CHECK(reload.find_kernel("scale_add")->dispatch_cpu(GridShape(8), {KernelArg::store(b), KernelArg(2.0f)}, nullptr, &err));
+    CHECK(a == b);
+}
+
 } // namespace
 
 int main() {
@@ -730,6 +763,7 @@ int main() {
     test_size_limit();
     test_threads();
     test_speed();
+    test_wave3_options_and_cpu();
     set_compile_cache({});
     flush_compile_cache();
     std::error_code ec;

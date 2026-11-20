@@ -512,6 +512,116 @@ static void test_quadrature_expect_moments_cell() {
     assert(std::abs(got_c - exact_c) < 1e-4f);
 }
 
+static void test_wave3_hardening() {
+    // 1. ForC loop with `continue` under AD (differentiated induction var updated in for_step).
+    {
+        const char* src = R"(
+            fn step_diff_skip(x: f32) -> f32 {
+                var acc: f32 = 0.0;
+                var iter: i32 = 0;
+                for (var t: f32 = x; iter < 4; t = t + x) {
+                    iter = iter + 1;
+                    if (iter == 2) { continue; }
+                    acc = acc + t;
+                }
+                return acc;
+            }
+            @kernel fn d_step_diff_skip(x: f32) -> f32 {
+                return grad(step_diff_skip, x);
+            }
+        )";
+        auto res = compile_source(src, "ad_for_continue.bk");
+        assert(res.ok);
+        const auto* kd = res.find_kernel("d_step_diff_skip");
+        assert(kd != nullptr);
+        float d = kd->eval_f32({KernelArg(1.5f)});
+        // t traverses x, 2x (skipped body, still stepped), 3x, 4x => acc = 8x => d/dx = 8
+        assert(std::abs(d - 8.0f) < 1e-4f);
+    }
+
+    // 2. Unsupported builtin call with differentiated arg must diagnose an AD error.
+    {
+        const char* bad_call_src = R"(
+            fn bad_fn(x: f32) -> f32 {
+                return fmod(x, 2.0);
+            }
+            @kernel fn d_bad_fn(x: f32) -> f32 {
+                return grad(bad_fn, x);
+            }
+        )";
+        auto res = compile_source(bad_call_src, "ad_bad_call.bk");
+        assert(!res.ok);
+    }
+
+    // 3. Large struct return (> 256 bytes) evaluated/dispatched without out_return.
+    {
+        const char* big_src = R"(
+            struct BigRet {
+                head: f32,
+                data: array<f32, 80>,
+                tail: f32,
+            }
+            @kernel fn make_big(x: f32) -> BigRet {
+                var arr: array<f32, 80>;
+                arr[0] = x;
+                arr[79] = x * 3.0;
+                return BigRet(x + 1.0, arr, x * 2.0);
+            }
+        )";
+        auto res = compile_source(big_src, "big_struct_ret.bk");
+        assert(res.ok);
+        const auto* k = res.find_kernel("make_big");
+        assert(k != nullptr);
+        assert(k->return_byte_size > 256);
+        std::string err;
+        assert(k->eval_cpu({KernelArg(2.5f)}, nullptr, &err));
+        assert(k->dispatch_cpu(GridShape(4, 1, 1), {KernelArg(2.5f)}, nullptr, &err));
+
+        std::vector<float> out_words(k->return_byte_size / sizeof(float), -1.0f);
+        assert(k->eval_cpu({KernelArg(2.5f)}, out_words.data(), &err));
+        assert(std::abs(out_words[0] - 3.5f) < 1e-5f);
+        assert(std::abs(out_words[1] - 2.5f) < 1e-5f);
+        assert(std::abs(out_words[80] - 7.5f) < 1e-5f);
+        assert(std::abs(out_words[81] - 5.0f) < 1e-5f);
+    }
+
+    // 4. probe_gpu with @binding uniform buffer descriptor.
+    if (brass::gpu::vulkan_available()) {
+        const char* probe_u_src = R"(
+            struct Params { a: f32, b: f32, c: f32, d: f32 }
+            @binding(0, 0) var u_params: uniform<Params>;
+            @kernel @grid(1) fn k_probe_u(g: grid<1>, out: write_store<f32, 1>) {
+                let v = probe("uval", u_params.a * 2.0 + u_params.b);
+                out[g.x()] = v;
+            }
+        )";
+        auto res = compile_source(probe_u_src, "probe_gpu_uniform.bk");
+        if (!res.ok) std::cerr << "probe_gpu_uniform compile error: " << res.error_message() << "\n";
+        assert(res.ok);
+        const auto* k = res.find_kernel("k_probe_u");
+        assert(k != nullptr);
+        std::vector<float> out_buf(4, 0.0f);
+        std::vector<float> u_data = {3.5f, 1.25f, 0.0f, 0.0f};
+        std::vector<ProbeSample> samples;
+        std::string err;
+        bool gok = k->probe_gpu(1, 0, 0, GridShape(4, 1, 1),
+                                {KernelArg::store(out_buf),
+                                 KernelArg::buffer(static_cast<const void*>(u_data.data()), u_data.size() * sizeof(float))},
+                                samples, &err);
+        if (!gok) std::cerr << "probe_gpu uniform error: " << err << "\n";
+        assert(gok);
+        bool saw_uval = false;
+        for (const auto& s : samples) {
+            if (s.name == "uval") {
+                saw_uval = true;
+                assert(s.hit);
+                assert(std::abs(s.values[0] - 8.25f) < 1e-4f);
+            }
+        }
+        assert(saw_uval);
+    }
+}
+
 int main() {
     test_reexports_and_use_synonym();
     test_module_resolver();
@@ -521,6 +631,7 @@ int main() {
     test_function_costs();
     test_grad_forward_ad();
     test_quadrature_expect_moments_cell();
+    test_wave3_hardening();
     std::cout << "All wishlist tests passed!\n";
     return 0;
 }

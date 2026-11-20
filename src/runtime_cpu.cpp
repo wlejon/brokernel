@@ -441,8 +441,11 @@ bool CompiledKernel::eval_grid_point_cpu(
         shared_buf.data(), &lone_barrier, nullptr, t_active_cpu_probe_buf,
     };
 
-    alignas(16) uint8_t scratch_ret[256] = {};
-    void* ret_ptr = out_return ? out_return : static_cast<void*>(scratch_ret);
+    std::vector<uint64_t> scratch_ret;
+    if (!out_return) {
+        scratch_ret.assign((std::max<size_t>(return_byte_size, 8) + 7) / 8, 0);
+    }
+    void* ret_ptr = out_return ? out_return : static_cast<void*>(scratch_ret.data());
 
     using PointFn = void (*)(const uint64_t*, const void*, void*);
     auto fn_ptr = cpu_point_fn().as<PointFn>();
@@ -597,7 +600,9 @@ bool CompiledKernel::dispatch_cpu(
     };
     const size_t wg_size = size_t(lsz[0]) * lsz[1] * lsz[2];
     const size_t ret_stride = std::max<size_t>(return_byte_size, 4);
-    alignas(16) uint8_t scratch_ret[256] = {};
+    const size_t ret_words = (std::max<size_t>(return_byte_size, 8) + 7) / 8;
+    const bool on_fibers = uses_barriers_or_shared && wg_size > 1;
+    std::vector<uint64_t> scratch_ret(ret_words * (on_fibers ? wg_size : 1), 0);
     std::vector<uint8_t> shared_buf(std::max<size_t>(cpu_shared_bytes(), 64), 0);
 
     auto fn_ptr = cpu_point_fn().as<PointFn>();
@@ -606,7 +611,6 @@ bool CompiledKernel::dispatch_cpu(
     // all of them, those outside the grid too (they reach the barriers);
     // otherwise each cell's invocation runs to its end in turn.
     WorkgroupLanes group;
-    const bool on_fibers = uses_barriers_or_shared && wg_size > 1;
     if (on_fibers) {
         group.fn_ptr = fn_ptr;
         group.slots = slots.data();
@@ -635,7 +639,7 @@ bool CompiledKernel::dispatch_cpu(
                                 static_cast<int32_t>(nwg[0]), static_cast<int32_t>(nwg[1]), static_cast<int32_t>(nwg[2]),
                                 shared_buf.data(), on_fibers ? &WorkgroupLanes::barrier : &lone_barrier, nullptr, nullptr,
                             };
-                            void* cell_ret = scratch_ret;
+                            void* cell_ret = scratch_ret.data() + (on_fibers ? idx * ret_words : 0);
                             if (return_store_out && in_grid) {
                                 size_t lin = (size_t(gz) * h + gy) * w + gx;
                                 cell_ret = static_cast<uint8_t*>(return_store_out) + lin * ret_stride;

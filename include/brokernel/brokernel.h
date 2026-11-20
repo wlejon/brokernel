@@ -242,6 +242,7 @@ struct CompileOptions {
     bool emit_spirv_disassembly = false;
     bool emit_ptx = false;
     bool compile_cpu = true;
+    bool optimize_gpu_mir = true;
     bool verify_spirv_equivalence = false;
     int opt_level = 2;
     bool enable_probes = false;
