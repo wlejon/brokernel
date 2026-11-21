@@ -28,6 +28,29 @@ KernelVerifyReport CompiledKernel::verify() const {
     }
     rep.spirv_parsed = true;
 
+    constexpr size_t kMaxSmtSpirvWords = 3072;
+    if (spirv.words.size() > kMaxSmtSpirvWords) {
+        const auto audit = brass::verify::prove_spirv_shader_safety(spv_mod);
+        const bool struct_ok = audit.parse_ok && audit.structural_ok && audit.dominance_ok;
+        rep.memory_safe = struct_ok && audit.shared_bounds_ok;
+        rep.barrier_uniform = struct_ok && audit.barriers_uniform;
+        for (const auto& sa : audit.shared_accesses) {
+            if (sa.proven_in_bounds) ++rep.shared_accesses_proven;
+            else rep.violations.push_back(sa.detail.empty() ? "shared memory safety violation" : sa.detail);
+        }
+        for (const auto& b : audit.barriers) {
+            if (b.uniform_control_flow) ++rep.barriers_proven;
+            else rep.violations.push_back(b.detail.empty() ? "barrier divergence" : b.detail);
+        }
+        for (const auto& d : audit.verifier_diagnostics) {
+            if (!d.message.empty()) rep.violations.push_back(d.message);
+        }
+        rep.diagnostic = rep.violations.empty()
+                             ? "verified via static SPIR-V compute shader audit"
+                             : rep.violations.front();
+        return rep;
+    }
+
     brass::verify::GpuProverOptions opts;
     opts.local_size_x = std::max(1u, local_size[0]);
     opts.local_size_y = std::max(1u, local_size[1]);
