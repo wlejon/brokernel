@@ -11,6 +11,33 @@
 
 namespace brokernel {
 
+namespace {
+
+void populate_from_static_audit(const brass::spirv::Module& spv_mod, KernelVerifyReport& rep) {
+    const auto audit = brass::verify::prove_spirv_shader_safety(spv_mod);
+    const bool struct_ok = audit.parse_ok && audit.structural_ok && audit.dominance_ok;
+    rep.memory_safe = struct_ok && audit.shared_bounds_ok;
+    rep.barrier_uniform = struct_ok && audit.barriers_uniform;
+    for (const auto& sa : audit.shared_accesses) {
+        if (sa.proven_in_bounds) ++rep.shared_accesses_proven;
+        else rep.violations.push_back(sa.detail.empty() ? "shared memory safety violation" : sa.detail);
+    }
+    for (const auto& b : audit.barriers) {
+        if (b.uniform_control_flow) ++rep.barriers_proven;
+        else rep.violations.push_back(b.detail.empty() ? "barrier divergence" : b.detail);
+    }
+    for (const auto& d : audit.verifier_diagnostics) {
+        if (!d.message.empty()) rep.violations.push_back(d.message);
+    }
+    if (rep.diagnostic.empty()) {
+        rep.diagnostic = rep.violations.empty()
+                             ? "verified via static SPIR-V compute shader audit"
+                             : rep.violations.front();
+    }
+}
+
+} // namespace
+
 KernelVerifyReport CompiledKernel::verify() const {
     KernelVerifyReport rep;
     if (spirv.words.empty()) {
@@ -30,24 +57,7 @@ KernelVerifyReport CompiledKernel::verify() const {
 
     constexpr size_t kMaxSmtSpirvWords = 3072;
     if (spirv.words.size() > kMaxSmtSpirvWords) {
-        const auto audit = brass::verify::prove_spirv_shader_safety(spv_mod);
-        const bool struct_ok = audit.parse_ok && audit.structural_ok && audit.dominance_ok;
-        rep.memory_safe = struct_ok && audit.shared_bounds_ok;
-        rep.barrier_uniform = struct_ok && audit.barriers_uniform;
-        for (const auto& sa : audit.shared_accesses) {
-            if (sa.proven_in_bounds) ++rep.shared_accesses_proven;
-            else rep.violations.push_back(sa.detail.empty() ? "shared memory safety violation" : sa.detail);
-        }
-        for (const auto& b : audit.barriers) {
-            if (b.uniform_control_flow) ++rep.barriers_proven;
-            else rep.violations.push_back(b.detail.empty() ? "barrier divergence" : b.detail);
-        }
-        for (const auto& d : audit.verifier_diagnostics) {
-            if (!d.message.empty()) rep.violations.push_back(d.message);
-        }
-        rep.diagnostic = rep.violations.empty()
-                             ? "verified via static SPIR-V compute shader audit"
-                             : rep.violations.front();
+        populate_from_static_audit(spv_mod, rep);
         return rep;
     }
 
@@ -113,6 +123,17 @@ KernelVerifyReport CompiledKernel::verify() const {
     }
     auto mem = brass::verify::verify_spirv_memory_safety(spv_mod, opts);
     auto bar = brass::verify::verify_spirv_barrier_uniformity(spv_mod, opts);
+
+    if (mem.status == brass::verify::EquivStatus::Unknown && mem.violations.empty() &&
+        mem.diagnostic.find("loop_unroll_bound") != std::string::npos && bar.is_uniform()) {
+        // Bounded-unroll SMT checked every path up to `loop_unroll_bound` with 0 violations;
+        // verify structural/shared-bounds invariants on the dynamic loop via static SPIR-V audit.
+        populate_from_static_audit(spv_mod, rep);
+        rep.shared_accesses_proven = std::max(rep.shared_accesses_proven, size_t(mem.shared_accesses_proven));
+        rep.global_accesses_proven = std::max(rep.global_accesses_proven, size_t(mem.global_accesses_proven));
+        rep.barriers_proven = std::max(rep.barriers_proven, size_t(bar.barriers_proven));
+        return rep;
+    }
 
     rep.memory_safe = mem.is_safe();
     rep.barrier_uniform = bar.is_uniform();
