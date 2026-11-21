@@ -105,7 +105,8 @@ rapid world iteration by a coding agent:
 - **Vertex and fragment stages (`@vertex`, `@fragment`).** Stage inputs at
   `@location(n)` (`@flat` supported), outputs via `set_vertex_output`,
   `set_frag_output`, `set_frag_color`, `set_vertex_position`, `set_frag_depth`,
-  and builtins `vertex_index()`, `instance_index()`, `frag_coord()`,
+  `set_frag_depth_less` (a depth never above the rasterized one, so early
+  depth tests still run), and builtins `vertex_index()`, `instance_index()`, `frag_coord()`,
   `front_facing()`, `discard_fragment()`.
 - **Descriptor resources (`@binding(set, binding)`).** Combined samplers
   (`sampler2d<T>`, `sampler_cube<T>`, shadow samplers), separate `texture*` and

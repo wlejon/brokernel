@@ -233,6 +233,40 @@ static void test_stage_io() {
     }
 }
 
+// set_frag_depth_less: the depth replaced, and promised never above the
+// rasterized one (DepthLess), so early depth tests still run.
+static void test_frag_depth_less() {
+    const char* src = R"(
+        @fragment fn fs(@location(0) uv: vec2<f32>) {
+            set_frag_color(vec4<f32>(uv, 0.0, 1.0));
+            set_frag_depth_less(uv.x * 0.5);
+        }
+    )";
+    CompileOptions opts;
+    opts.emit_spirv_disassembly = true;
+    auto res = compile_source(src, "depth_less.bk", opts);
+    if (!res.ok) std::cerr << res.error_message() << "\n";
+    assert(res.ok);
+    require_valid(res);
+    const std::string& d = res.kernels[0].spirv_disassembly;
+    auto mode = [&](const std::string& value) {
+        std::istringstream lines(d);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream w(line);
+            std::string o, id, v, more;
+            if (w >> o >> id >> v && !(w >> more) && o == "OpExecutionMode" && v == value) return true;
+        }
+        return false;
+    };
+    assert(mode("12"));   // DepthReplacing
+    assert(mode("15"));   // DepthLess
+    assert(d.find("gl_FragDepth") != std::string::npos);
+
+    auto bad = compile_source("@vertex fn v() { set_frag_depth_less(0.5); }", "bad_depth_less.bk");
+    assert(!bad.ok);
+}
+
 // Buffers at descriptors: a uniform block laid out std140 (a vec3 padded to
 // 16 bytes, an array of structs at a 16-byte multiple), read through fields,
 // a dynamic index and a helper function; a storage buffer written.
@@ -972,6 +1006,7 @@ int main() {
     test_vertex_stage_spirv();
     test_fragment_stage_spirv();
     test_stage_io();
+    test_frag_depth_less();
     test_buffers();
     test_render_math();
     test_textures();

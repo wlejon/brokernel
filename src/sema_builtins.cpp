@@ -553,13 +553,13 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = Type::void_type();
         return Type::void_type();
     }
-    if (n == "set_frag_depth") {
-        require_stage(Stage::Fragment, "set_frag_depth", e->span);
+    if (n == "set_frag_depth" || n == "set_frag_depth_less") {
+        require_stage(Stage::Fragment, n.c_str(), e->span);
         if (e->args.size() == 1) {
             check_expr(e->args[0].get(), Type::f32());
             check_assignable(e->args[0].get(), Type::f32(), ctx.diags, e->args[0]->span);
         } else {
-            ctx.diags.error(e->span, "'set_frag_depth(depth)' expects 1 f32 argument");
+            ctx.diags.error(e->span, "'" + n + "(depth)' expects 1 f32 argument");
         }
         e->resolved_type = Type::void_type();
         return Type::void_type();

@@ -789,6 +789,11 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 if (is_gpu) kb.set_frag_depth(v[0]);
                 return {};
             }
+            if (n == "set_frag_depth_less") {
+                ValueList v = lower_expr(e->args[0].get());
+                if (is_gpu) kb.set_frag_depth_less(v[0]);
+                return {};
+            }
             if (n == "frag_coord") {
                 if (is_gpu) {
                     return {b.build_call("spirv_frag_coord_x", brass::Type::f32()), b.build_call("spirv_frag_coord_y", brass::Type::f32()),
