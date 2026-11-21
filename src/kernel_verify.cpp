@@ -55,6 +55,7 @@ KernelVerifyReport CompiledKernel::verify() const {
     opts.local_size_x = std::max(1u, local_size[0]);
     opts.local_size_y = std::max(1u, local_size[1]);
     opts.local_size_z = std::max(1u, local_size[2]);
+    opts.max_sat_conflicts = 4000;
     std::vector<int32_t> grid_dim_indices;
     uint32_t max_store_mir_end = 0;
     for (const auto& p : params) {
@@ -70,10 +71,24 @@ KernelVerifyReport CompiledKernel::verify() const {
                 brass::verify::GpuParamConstraint pc;
                 pc.param_index = p.mir_param_index + 1;
                 pc.min_val = 1;
+                pc.max_val = 0x3FFFFFFFu;
                 opts.param_constraints.push_back(pc);
             }
         } else if (p.mir_param_count > 0) {
             max_store_mir_end = std::max(max_store_mir_end, p.mir_param_index + p.mir_param_count);
+        }
+    }
+    if (grid_dim >= 1 && max_store_mir_end < spirv.params.size()) {
+        for (const auto& p : params) {
+            if ((p.role == ParamRole::Store || p.role == ParamRole::Stencil) &&
+                p.mir_param_count >= 2 && p.grid_cover_dim == 1) {
+                brass::verify::GpuParamConstraint cov;
+                cov.param_index = max_store_mir_end;          // grid_w (i32)
+                cov.rhs_param_index = p.mir_param_index + 1;  // store length (i64, bounded <= 0x3FFFFFFF)
+                cov.min_val = 1;
+                cov.max_val = 0x3FFFFFFFu;
+                opts.param_constraints.push_back(cov);
+            }
         }
     }
     // Note any trailing implicit return-store pointer (which appears after grid dims in spirv.params).
