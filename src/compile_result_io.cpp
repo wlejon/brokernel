@@ -223,7 +223,21 @@ void put(ByteWriter& w, const CompiledKernel& k) {
     put(w, k.spirv);
     w.str(k.spirv_disassembly);
     w.str(k.ptx);
+    w.str(k.msl);
+    w.str(k.msl_entry);
     w.boolean(k.spirv_equivalent);
+    w.u32(k.runtime_knob_bytes);
+    put_list(w, k.runtime_knobs, [&](const RuntimeKnobInfo& rk) {
+        w.str(rk.name);
+        w.str(rk.module);
+        w.str(rk.key);
+        put(w, rk.type);
+        w.u32(rk.byte_offset);
+        w.u32(rk.byte_size);
+        put(w, rk.default_value);
+    });
+    w.u32(k.telemetry_slots);
+    w.boolean(k.uses_telemetry);
     w.boolean(k.has_cpu_build());
 }
 
@@ -260,7 +274,25 @@ void get_kernel(ByteReader& r, CompiledKernel& k, uint8_t& had_cpu) {
     get_spirv(r, k.spirv);
     k.spirv_disassembly = r.str();
     k.ptx = r.str();
+    k.msl = r.str();
+    k.msl_entry = r.str();
     k.spirv_equivalent = r.boolean();
+    k.runtime_knob_bytes = r.u32();
+    get_list(r, k.runtime_knobs, [&] {
+        RuntimeKnobInfo rk;
+        rk.name = r.str();
+        rk.module = r.str();
+        rk.key = r.str();
+        rk.type = get_type(r);
+        rk.byte_offset = r.u32();
+        rk.byte_size = r.u32();
+        rk.default_value = get_const(r);
+        return rk;
+    });
+    k.init_runtime_knobs();
+    k.telemetry_slots = r.u32();
+    k.uses_telemetry = r.boolean();
+    k.init_telemetry();
     had_cpu = r.boolean() ? 1 : 0;
 }
 
@@ -329,12 +361,15 @@ void encode_options(const CompileOptions& o, ByteWriter& w) {
     w.boolean(o.emit_spirv);
     w.boolean(o.emit_spirv_disassembly);
     w.boolean(o.emit_ptx);
+    w.boolean(o.emit_msl);
     w.boolean(o.compile_cpu);
     w.boolean(o.optimize_gpu_mir);
     w.boolean(o.verify_spirv_equivalence);
     w.i32(o.opt_level);
     w.boolean(o.enable_probes);
     w.boolean(o.enable_fragment_probes);
+    w.boolean(o.runtime_knobs);
+    w.u32(o.telemetry_slots);
     std::vector<const std::pair<const std::string, ConstValue>*> knobs;
     for (const auto& kv : o.knob_overrides) knobs.push_back(&kv);
     std::sort(knobs.begin(), knobs.end(), [](const auto* a, const auto* b) { return a->first < b->first; });

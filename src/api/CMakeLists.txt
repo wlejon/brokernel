@@ -1,7 +1,10 @@
 add_library(brokernel_api STATIC
     api.cpp
     api_async.cpp
+    api_buffer.cpp
+    api_fast.cpp
     api_fn.cpp
+    api_knobs.cpp
     api_modules.cpp
     api_reload.cpp
 )

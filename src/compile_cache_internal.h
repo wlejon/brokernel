@@ -96,6 +96,6 @@ void encode_result(const CompileResult& res, ByteWriter& w);
 bool decode_result(ByteReader& r, CompileResult& res, std::vector<uint8_t>& had_cpu);
 
 // The encodings above, in every key: a change to them is a new key space.
-constexpr uint32_t kEntryFormat = 3;
+constexpr uint32_t kEntryFormat = 6;
 
 } // namespace brokernel::detail

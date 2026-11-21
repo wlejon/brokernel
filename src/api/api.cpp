@@ -73,15 +73,20 @@ const char* accessName(AccessMode m) {
 
 // kernel.eval(...args): a point kernel at one point, on the CPU.
 Value js_eval(Value self, std::span<const Value> args) {
-    const CompiledKernel* k = unwrapKernel(self);
+    KernelHandle* h = kernelHandle(self);
+    const CompiledKernel* k = h ? h->kernel.get() : nullptr;
     if (!k) return ev::throwTypeError("Kernel.eval: invalid receiver");
     if (k->grid_dim != 0) return ev::throwTypeError("Kernel.eval: '" + k->name + "' is a grid kernel; use run()");
     ensureCpuBuilt(*k);
+    Value fastOut;
+    if (tryFastEval(*h, args, fastOut)) return fastOut;
     if (!k->cpu_point_fn().is_valid()) return ev::throwTypeError("Kernel.eval: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
     ArgPack pack(*k, args, "Kernel.eval");
     alignas(16) uint8_t ret[256] = {};
     std::string err;
+    syncKernelTelemetry(*h, /*gpu=*/false);
     const bool ok = k->eval_cpu(pack.bind(args), k->return_byte_size <= sizeof ret ? ret : nullptr, &err);
+    finishKernelTelemetry(*h, /*gpu=*/false);
     if (!ok) return ev::throwError("Kernel.eval: " + err);
     if (!k->has_return_value() || k->return_byte_size > sizeof ret) return ev::undefined();
     return decodeLeaves(*k, ret);
@@ -91,7 +96,8 @@ Value js_eval(Value self, std::span<const Value> args) {
 // stores are written in place; a kernel that returns a value returns one per
 // cell, in a typed array.
 Value js_run(Value self, std::span<const Value> args) {
-    const CompiledKernel* k = unwrapKernel(self);
+    KernelHandle* h = kernelHandle(self);
+    const CompiledKernel* k = h ? h->kernel.get() : nullptr;
     if (!k) return ev::throwTypeError("Kernel.run: invalid receiver");
     if (k->grid_dim == 0) return ev::throwTypeError("Kernel.run: '" + k->name + "' is a point kernel; use eval()");
     ensureCpuBuilt(*k);
@@ -117,11 +123,19 @@ Value js_run(Value self, std::span<const Value> args) {
         std::span<const KernelArg> bound = pack.bind(current);
         std::string err;
         const auto info = ev::typedArrayInfo(out.get());
-        if (!k->dispatch_cpu(shape, bound, info.data, &err)) return ev::throwError("Kernel.run: " + err);
+        syncKernelTelemetry(*h, /*gpu=*/false);
+        const bool ok = k->dispatch_cpu(shape, bound, info.data, &err);
+        finishKernelTelemetry(*h, /*gpu=*/false);
+        if (!ok) return ev::throwError("Kernel.run: " + err);
+        pack.finishCpu();
         return out.get();
     }
     std::string err;
-    if (!k->dispatch_cpu(shape, pack.bind(kargs), nullptr, &err)) return ev::throwError("Kernel.run: " + err);
+    syncKernelTelemetry(*h, /*gpu=*/false);
+    const bool ok = k->dispatch_cpu(shape, pack.bind(kargs), nullptr, &err);
+    finishKernelTelemetry(*h, /*gpu=*/false);
+    if (!ok) return ev::throwError("Kernel.run: " + err);
+    pack.finishCpu();
     return ev::undefined();
 }
 
@@ -151,10 +165,13 @@ Value js_dispatch(Value self, std::span<const Value> args) {
         if (!returns) return ev::throwError("Kernel.dispatch: " + err);
     }
     GpuLaunch launch;
+    syncKernelTelemetry(*h, /*gpu=*/true);
     if (!k.gpu_launch(shape, pack.gpuArgs(), returns ? returns->address() : 0, launch, &err) ||
         !t_device->dispatch(*h->program, k, launch, &err)) {
         return ev::throwError("Kernel.dispatch: " + err);
     }
+    finishKernelTelemetry(*h, /*gpu=*/true);
+    pack.finishGpu();
     return returns ? makeBuffer(std::move(returns)) : ev::undefined();
 }
 
@@ -310,35 +327,7 @@ void decorateBuffer(ev::ObjectBuilder& b) {
         if (!h->buffer) return ev::throwError("KernelBuffer.byteLength: the KernelBuffer has been destroyed");
         return ev::fromDouble(static_cast<double>(h->buffer->bytes()));
     });
-}
-
-// bro.kernel.createBuffer(byteLength | typedArray): GPU memory for a
-// dispatch's stores, reading zero, or holding the typed array's bytes.
-Value js_createBuffer(Value, std::span<const Value> args) {
-    if (!t_device || !t_device->available()) {
-        return ev::throwError("bro.kernel.createBuffer: this realm has no GPU device (bro.kernel.gpu is false)");
-    }
-    const bool fromArray = !args.empty() && ev::isTypedArray(args[0]);
-    size_t bytes = 0;
-    if (fromArray) {
-        bytes = ev::typedArrayInfo(args[0]).byteLength;
-    } else if (!args.empty() && ev::isNumber(args[0])) {
-        const double d = ev::toDouble(args[0]);
-        if (!(d >= 0.0) || d != static_cast<double>(static_cast<uint64_t>(d))) {
-            return ev::throwRangeError("bro.kernel.createBuffer: the byte length is a non-negative integer");
-        }
-        bytes = static_cast<size_t>(d);
-    } else {
-        return ev::throwTypeError("bro.kernel.createBuffer: takes a byte length or a typed array");
-    }
-    std::string err;
-    std::shared_ptr<GpuBuffer> buffer = allocateBuffer(bytes, &err);
-    if (!buffer) return ev::throwError("bro.kernel.createBuffer: " + err);
-    if (fromArray && bytes > 0) {
-        const auto info = ev::typedArrayInfo(args[0]);
-        if (!buffer->write(0, info.data, info.byteLength, &err)) return ev::throwError("bro.kernel.createBuffer: " + err);
-    }
-    return makeBuffer(std::move(buffer));
+    decorateBufferExtras(b);
 }
 
 Value paramInfo(const KernelParamInfo& p) {
@@ -567,6 +556,7 @@ KernelHandle* kernelHandle(Value self) {
     if (!nk) return h;
     releaseLater(std::exchange(h->module_result, res));
     releaseLater(std::exchange(h->kernel, std::shared_ptr<const CompiledKernel>(res, nk)));
+    h->fast_eval.reset();
     h->program.reset();
     if (nk->grid_dim > 0 && !nk->spirv.words.empty()) {
         if (GpuDevice* dev = currentDevice()) {
@@ -694,6 +684,7 @@ void installKernel() {
     g_bufferClass.install("KernelBuffer", 0, nullptr, decorateBuffer, /*global=*/false);
     g_readbackClass.install("KernelReadback", 0, nullptr, decorateReadback, /*global=*/false);
     g_fnClass.install("KernelFn", 0, nullptr, decorateFnClass, /*global=*/false);
+    installBufferClasses();
     ev::Persistent kernelObj(ensureBroKernel());
     ev::ObjectBuilder b(kernelObj.get());
     b.set("available", true);
@@ -704,7 +695,7 @@ void installKernel() {
     b.def("compile", 2, js_compile);
     decorateAsync(b);
     installAsyncRealmHook();
-    if (t_device) b.def("createBuffer", 1, js_createBuffer);
+    b.def("createBuffer", 1, js_createBuffer);
     decorateBroKernelExtras(b);
 }
 

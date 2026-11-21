@@ -43,6 +43,8 @@ std::shared_ptr<ModuleCell> makeModuleCell(std::shared_ptr<const CompileResult> 
 // This thread's modules still held by a handle.
 std::vector<std::shared_ptr<ModuleCell>> liveModuleCells();
 
+struct FastEvalPlan;
+
 struct KernelHandle {
     std::shared_ptr<const CompileResult> module_result;
     std::shared_ptr<const CompiledKernel> kernel;
@@ -50,6 +52,9 @@ struct KernelHandle {
     std::shared_ptr<ModuleCell> owner;   // the module it came from
     uint64_t generation = 0;             // the owner's, as last followed
     std::unordered_map<std::string, ConstValue> knobs;   // its own (Kernel.knobs)
+    std::shared_ptr<FastEvalPlan> fast_eval;
+    std::shared_ptr<GpuBuffer> telemetry_buffer;
+    std::shared_ptr<ev::Persistent> telemetry_typed_array;
 };
 
 // The Kernel behind `self`, moved onto its module's current compile first.
@@ -135,16 +140,28 @@ public:
                 if (!h) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a KernelBuffer");
                 if (!h->buffer) ev::throwError(what + ": '" + p.name + "' is a destroyed KernelBuffer");
                 std::shared_ptr<GpuBuffer> b = h->buffer;
+                std::string err;
+                if (!b->prepareForGpu(&err)) ev::throwTypeError(what + ": '" + p.name + "': " + err);
                 args_[i] = KernelArg::device(b->address(), b->bytes(), b->capacity());
+                if (can_Write(p.access)) write_buffers_.push_back(b);
                 buffers_.push_back(std::move(b));
             } else if (isStore(p)) {
-                if (!ev::isTypedArray(v)) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a typed array");
-                const Type elem = p.type.element_type();
-                const auto want = elem.is_scalar() ? elementKindOf(elem.scalar) : std::nullopt;
-                if (want && ev::typedArrayInfo(v).elementKind != *want) {
-                    ev::throwTypeError(what + ": store '" + p.name + "' takes a " + elementKindName(*want));
+                if (auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(v))) {
+                    if (!h->buffer) ev::throwError(what + ": '" + p.name + "' is a destroyed KernelBuffer");
+                    std::string err;
+                    if (!h->buffer->prepareForCpu(&err)) ev::throwTypeError(what + ": '" + p.name + "': " + err);
+                    args_[i] = KernelArg::buffer(h->buffer->hostDataForCpu(), h->buffer->bytes());
+                    if (can_Write(p.access)) write_buffers_.push_back(h->buffer);
+                    buffers_.push_back(h->buffer);
+                } else {
+                    if (!ev::isTypedArray(v)) ev::throwTypeError(what + ": '" + p.name + "' is a store and takes a typed array or host/shared KernelBuffer");
+                    const Type elem = p.type.element_type();
+                    const auto want = elem.is_scalar() ? elementKindOf(elem.scalar) : std::nullopt;
+                    if (want && ev::typedArrayInfo(v).elementKind != *want) {
+                        ev::throwTypeError(what + ": store '" + p.name + "' takes a " + elementKindName(*want));
+                    }
+                    stores_.push_back(i);
                 }
-                stores_.push_back(i);
             } else if (p.role == ParamRole::Scalar) {
                 if (!ev::isNumber(v) && !ev::isBigInt(v) && !ev::isBool(v)) {
                     ev::throwTypeError(what + ": '" + p.name + "' takes a number");
@@ -197,10 +214,17 @@ public:
     }
 
     std::span<const KernelArg> gpuArgs() const { return args_; }
+    void finishCpu() const {
+        for (const auto& b : write_buffers_) b->markHostWritten();
+    }
+    void finishGpu() const {
+        for (const auto& b : write_buffers_) b->markGpuWritten();
+    }
 
 private:
     std::vector<KernelArg> args_;
     std::vector<std::shared_ptr<GpuBuffer>> buffers_;
+    std::vector<std::shared_ptr<GpuBuffer>> write_buffers_;
     std::vector<size_t> stores_;
     std::vector<std::vector<uint8_t>> bytes_;
 };
@@ -282,6 +306,27 @@ void decorateModuleExtras(ev::ObjectBuilder& b);
 void decorateKernelExtras(ev::ObjectBuilder& b);
 void decorateBroKernelExtras(ev::ObjectBuilder& b);
 void decorateReload(ev::ObjectBuilder& b);   // bro.kernel.reload (api_reload.cpp)
+
+// Dual-residency buffers & structView (api_buffer.cpp).
+Value js_createBuffer(Value self, std::span<const Value> args);
+void installBufferClasses();
+void decorateBufferExtras(ev::ObjectBuilder& b);
+Value js_moduleStructView(Value self, std::span<const Value> args);
+
+// Zero-alloc fast CPU eval & Bronze native export (api_fast.cpp).
+bool tryFastEval(KernelHandle& h, std::span<const Value> args, Value& out);
+Value js_kernelExportNative(Value self, std::span<const Value> args);
+
+// Runtime @knobs & knobGrad (api_knobs.cpp, helpers from api_fn.cpp).
+std::unordered_map<std::string, ConstValue> parseKnobOverrides(Value obj, const std::string& what);
+Value makeFnValueFromResult(std::shared_ptr<ModuleCell> cell,
+                            std::shared_ptr<const CompileResult> res,
+                            const std::string& fn_name);
+Value js_kernelSetKnobs(Value self, std::span<const Value> args);
+Value js_moduleKnobGrad(Value self, std::span<const Value> args);
+void syncKernelTelemetry(KernelHandle& h, bool gpu);
+void finishKernelTelemetry(KernelHandle& h, bool gpu);
+void decorateKernelTargetExtras(ev::ObjectBuilder& b);
 // Registered and resolved modules of these names take the new sources.
 void updateRegisteredSources(const std::unordered_map<std::string, std::string>& sources);
 void configureCompilerModulesAndOptions(

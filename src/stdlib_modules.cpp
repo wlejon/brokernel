@@ -1,4 +1,5 @@
 #include "brokernel/module_loader.h"
+#include "ast_cache.h"
 #include "stdlib_noise_parts.h"
 
 #include <algorithm>
@@ -458,16 +459,13 @@ const ModuleAst* ModuleRegistry::load_module(
 
     entry->loading = true;
     DiagnosticBag mod_diags;
-    entry->ast = parse_source(entry->source, entry->path, mod_diags);
+    entry->ast = detail::parse_source_cached(entry->source, entry->path, mod_diags, entry->name);
     entry->loading = false;
 
     if (mod_diags.has_errors() || !entry->ast) {
         entry->failed = true;
         diags.merge_from(mod_diags);
         return nullptr;
-    }
-    if (entry->ast->module_name.empty()) {
-        entry->ast->module_name = entry->name;
     }
     return entry->ast.get();
 }

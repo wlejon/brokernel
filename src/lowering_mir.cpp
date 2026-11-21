@@ -264,8 +264,8 @@ void MirBodyLowerer::lower_stmt(const Stmt* s) {
         }
         case Stmt::Kind::Assign: {
             ValueList rhs = lower_expr(s->assign_value.get());
-            // 0. A place in a storage buffer at a descriptor, in shared memory, or in a local array slot.
-            if (try_block_assign(s, rhs) || try_shared_assign(s, rhs) || try_local_assign(s, rhs)) return;
+            // 0. A place in a storage buffer at a descriptor, in shared memory, in a local array slot, or a structured store sub-element.
+            if (try_block_assign(s, rhs) || try_shared_assign(s, rhs) || try_local_assign(s, rhs) || try_store_place_assign(s, rhs)) return;
             // 1. Store indexing assignment: `st[x, y] = val` or `st[x, y] += val`
             if (s->assign_target->kind == Expr::Kind::Index &&
                 s->assign_target->lhs->resolved_type.is_store()) {
@@ -376,6 +376,9 @@ struct GridFrame {
     brass::Value* has_out_i32 = nullptr;   // the shape's fourth word: nonzero when out_ret is a store
     brass::Value* out_ret = nullptr;
     brass::Value* scratch = nullptr;       // a vector build's masked-off stores
+    brass::Value* knobs_ptr = nullptr;     // packed runtime @knob bytes (if any)
+    brass::Value* telemetry_ptr = nullptr; // runtime telemetry float buffer (if any)
+    brass::Value* telemetry_cap = nullptr; // capacity in floats (i64)
     std::vector<ValueList> params;
     std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> block_ptrs;
 };
@@ -405,6 +408,9 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     lowerer.nwg_x = f.nwg_x;
     lowerer.nwg_y = f.nwg_y;
     lowerer.nwg_z = f.nwg_z;
+    lowerer.cpu_knobs_ptr = f.knobs_ptr;
+    lowerer.cpu_telemetry_ptr = f.telemetry_ptr;
+    lowerer.cpu_telemetry_cap = f.telemetry_cap;
     lowerer.wgid_x = lowerer.b.build_udiv(lowerer.gx, f.lsz_x);
     lowerer.wgid_y = b.build_udiv(gy, f.lsz_y);
     lowerer.wgid_z = b.build_udiv(gz, f.lsz_z);
@@ -515,6 +521,15 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
         brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
         brass::Value* bytes_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
         f.block_ptrs[bb.mir_param_index] = {ptr_v, bytes_v};
+        slot += 2;
+    }
+    if (!mod.runtime_knobs.empty()) {
+        f.knobs_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+        slot += 1;
+    }
+    if (mod.telemetry_slots > 0 && fn.uses_telemetry) {
+        f.telemetry_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+        f.telemetry_cap = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
         slot += 2;
     }
     brass::BasicBlock* z_head = new_block(b, "grid_z_head");
@@ -713,6 +728,23 @@ LoweredKernelMir lower_kernel_to_mir(
             lowerer.gpu_probe_ptr = b.add_param(brass::Type::ptr());
             mir_idx += 1;
         }
+        if (!mod.runtime_knobs.empty()) {
+            for (uint32_t rk_idx = 0; rk_idx < mod.runtime_knobs.size(); ++rk_idx) {
+                auto kinds = mod.types.flatten_scalars(mod.runtime_knobs[rk_idx].type);
+                ValueList leaves;
+                leaves.reserve(kinds.size());
+                for (ScalarKind sk : kinds) {
+                    leaves.push_back(b.add_param(to_mir_scalar_type(sk)));
+                    mir_idx += 1;
+                }
+                lowerer.gpu_knob_values[rk_idx] = std::move(leaves);
+            }
+        }
+        if (mod.telemetry_slots > 0 && fn.uses_telemetry) {
+            lowerer.gpu_telemetry_ptr = b.add_param(brass::Type::ptr());
+            lowerer.gpu_telemetry_cap = b.add_param(brass::Type::i32());
+            mir_idx += 2;
+        }
         {
             std::vector<brass::Type> ptypes;
             ptypes.reserve(entry->params().size());
@@ -882,6 +914,15 @@ void lower_kernel_cpu_to_mir(
             brass::Value* ptr_v = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
             brass::Value* bytes_v = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
             lowerer.cpu_block_ptrs[bb.mir_param_index] = {ptr_v, bytes_v};
+            slot += 2;
+        }
+        if (!mod.runtime_knobs.empty()) {
+            lowerer.cpu_knobs_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+            slot += 1;
+        }
+        if (mod.telemetry_slots > 0 && fn.uses_telemetry) {
+            lowerer.cpu_telemetry_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+            lowerer.cpu_telemetry_cap = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
             slot += 2;
         }
         lowerer.lower_stmt_list(fn.body);

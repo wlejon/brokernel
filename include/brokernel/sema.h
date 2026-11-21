@@ -166,6 +166,7 @@ struct CheckedFunction {
     bool uses_barriers_or_shared = false;
     bool uses_descriptors = false;     // a texture or buffer parameter at a descriptor
     bool uses_textures = false;        // an image or sampler at a descriptor: GPU only, no CPU build
+    bool uses_telemetry = false;       // calls telemetry(slot, val) directly or transitively
     // @cpu: a kernel with no GPU build (it may use f64).
     bool cpu_only = false;
     int32_t max_stencil_radius = 0;
@@ -174,12 +175,26 @@ struct CheckedFunction {
     std::vector<StmtPtr> body;         // Deep-cloned, type-annotated & const-specialized body
 };
 
+/// Layout metadata for one `@knob` when compiled with runtime_knobs enabled.
+struct RuntimeKnobLayout {
+    std::string name;
+    std::string module;
+    std::string key;
+    Type type;
+    uint32_t byte_offset = 0;
+    uint32_t byte_size = 0;
+    ConstValue default_value;
+};
+
 /// Result of semantic analysis on a root module and its transitive imports.
 struct CheckedModule {
     std::string module_name;
     TypeRegistry types;
     std::unordered_map<std::string, ConstValue> constants;
     std::vector<ConstInfo> exported_constants;
+    std::vector<RuntimeKnobLayout> runtime_knobs;
+    uint32_t runtime_knob_bytes = 0;
+    uint32_t telemetry_slots = 0;
     std::vector<ProbeInfo> probes;
     std::vector<std::string> exported_functions;
     bool enable_probes = false;
@@ -206,6 +221,8 @@ std::unique_ptr<CheckedModule> check_module(
     DiagnosticBag& diags,
     const std::filesystem::path& root_dir = {},
     std::string_view entry_name = {},
-    const std::unordered_map<std::string, ConstValue>* knob_overrides = nullptr);
+    const std::unordered_map<std::string, ConstValue>* knob_overrides = nullptr,
+    bool runtime_knobs = false,
+    uint32_t telemetry_slots = 0);
 
 } // namespace brokernel

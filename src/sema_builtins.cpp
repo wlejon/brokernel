@@ -807,6 +807,23 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = Type::bool_type();
         return Type::bool_type();
     }
+    if (n == "telemetry") {
+        if (e->args.size() != 2) {
+            ctx.diags.error(e->span, "'telemetry' expects (slot, value) arguments");
+            return Type::void_type();
+        }
+        Type st = check_expr(e->args[0].get(), Type::i32());
+        Type vt = check_expr(e->args[1].get(), Type::f32());
+        if (!st.is_scalar() || !st.is_integer()) {
+            ctx.diags.error(e->args[0]->span, "'telemetry' slot must be an integer, got '" + st.to_string() + "'");
+        }
+        if (!vt.is_scalar() || (!vt.is_float() && !vt.is_integer())) {
+            ctx.diags.error(e->args[1]->span, "'telemetry' value must be numeric, got '" + vt.to_string() + "'");
+        }
+        fn.uses_telemetry = true;
+        e->resolved_type = Type::void_type();
+        return Type::void_type();
+    }
     // 5. Struct constructor syntax `StructName(field0, field1, ...)`
     std::string st_mod;
     if (const StructDecl* sdecl = ctx.find_struct_decl(fn.module_name, n, &st_mod)) {

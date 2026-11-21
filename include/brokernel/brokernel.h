@@ -241,13 +241,40 @@ struct CompileOptions {
     bool emit_spirv = true;
     bool emit_spirv_disassembly = false;
     bool emit_ptx = false;
+    bool emit_msl = false;
     bool compile_cpu = true;
     bool optimize_gpu_mir = true;
     bool verify_spirv_equivalence = false;
     int opt_level = 2;
     bool enable_probes = false;
     bool enable_fragment_probes = false;
+    bool runtime_knobs = false;
+    uint32_t telemetry_slots = 0;
     std::unordered_map<std::string, ConstValue> knob_overrides;
+};
+
+struct RuntimeKnobStorage;
+struct TelemetryStorage;
+
+struct RuntimeKnobInfo {
+    std::string name;
+    std::string module;
+    std::string key;
+    Type type;
+    uint32_t byte_offset = 0;
+    uint32_t byte_size = 0;
+    ConstValue default_value;
+};
+
+struct KernelVerifyReport {
+    bool spirv_parsed = false;
+    bool memory_safe = false;
+    bool barrier_uniform = false;
+    size_t shared_accesses_proven = 0;
+    size_t global_accesses_proven = 0;
+    size_t barriers_proven = 0;
+    std::vector<std::string> violations;
+    std::string diagnostic;
 };
 
 /// One GPU dispatch of a kernel (CompiledKernel::gpu_launch): its arguments in
@@ -258,6 +285,8 @@ struct GpuLaunch {
     std::vector<brass::gpu::VulkanArg> args;
     uint32_t groups[3] = {1, 1, 1};
     uint32_t local_size[3] = {1, 1, 1};
+    size_t probe_arg_index = static_cast<size_t>(-1);
+    size_t telemetry_arg_index = static_cast<size_t>(-1);
 };
 
 /// One compiled kernel with its SPIR-V binary, CPU native builds, and reflection metadata.
@@ -300,7 +329,30 @@ public:
     brass::target::SpirvKernel spirv;
     std::string spirv_disassembly;
     std::string ptx;
+    std::string msl;
+    std::string msl_entry;
     bool spirv_equivalent = false;
+
+    KernelVerifyReport verify() const;
+
+    std::vector<RuntimeKnobInfo> runtime_knobs;
+    uint32_t runtime_knob_bytes = 0;
+    std::shared_ptr<RuntimeKnobStorage> runtime_knob_storage;
+
+    void init_runtime_knobs();
+    bool set_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const;
+    const void* runtime_knob_data() const;
+    uint64_t runtime_knob_generation() const;
+
+    uint32_t telemetry_slots = 0;
+    bool uses_telemetry = false;
+    std::shared_ptr<TelemetryStorage> telemetry_storage;
+
+    void init_telemetry();
+    void set_telemetry_buffer(float* host_ptr, uint32_t capacity_floats, uint64_t gpu_address = 0) const;
+    float* telemetry_host_ptr() const;
+    uint32_t telemetry_capacity_floats() const;
+    uint64_t telemetry_gpu_address() const;
 
     // The CPU builds: the point function and the grid function, lowered and
     // compiled the first time either is asked for (most kernels only ever run
@@ -574,6 +626,11 @@ struct CompileResult {
 
     /// Recompiles the module with updated `@knob` overrides without editing source text.
     CompileResult with_knobs(const std::unordered_map<std::string, ConstValue>& overrides) const;
+
+    /// Compiles forward-mode gradients d(fn_name)/d(knob) for each listed float/vec `@knob`.
+    CompileResult compile_knob_grads(
+        std::string_view fn_name,
+        const std::vector<std::string>& knob_names) const;
 
     /// True when `key` is this module's file or a module it imported.
     bool depends_on(const std::string& key) const;

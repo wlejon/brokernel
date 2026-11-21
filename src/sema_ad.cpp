@@ -188,19 +188,23 @@ StmtPtr make_return_stmt(ExprPtr val, const SourceSpan& sp) {
     return s;
 }
 
-bool expr_uses_diff_var(const Expr* e, const std::set<std::string>& diff_vars) {
+bool expr_uses_diff_var(const Expr* e, const std::set<std::string>& diff_vars,
+                        const std::string& target_knob_key = {}) {
     if (!e) return false;
+    if (!target_knob_key.empty() && e->knob_key == target_knob_key) {
+        return true;
+    }
     if (e->kind == Expr::Kind::Ident) {
         return diff_vars.count(e->name) > 0;
     }
-    if (expr_uses_diff_var(e->lhs.get(), diff_vars)) return true;
-    if (expr_uses_diff_var(e->rhs.get(), diff_vars)) return true;
-    if (expr_uses_diff_var(e->cond.get(), diff_vars)) return true;
+    if (expr_uses_diff_var(e->lhs.get(), diff_vars, target_knob_key)) return true;
+    if (expr_uses_diff_var(e->rhs.get(), diff_vars, target_knob_key)) return true;
+    if (expr_uses_diff_var(e->cond.get(), diff_vars, target_knob_key)) return true;
     for (const auto& a : e->args) {
-        if (expr_uses_diff_var(a.get(), diff_vars)) return true;
+        if (expr_uses_diff_var(a.get(), diff_vars, target_knob_key)) return true;
     }
     for (const auto& f : e->fields) {
-        if (expr_uses_diff_var(f.value.get(), diff_vars)) return true;
+        if (expr_uses_diff_var(f.value.get(), diff_vars, target_knob_key)) return true;
     }
     return false;
 }
@@ -208,9 +212,14 @@ bool expr_uses_diff_var(const Expr* e, const std::set<std::string>& diff_vars) {
 struct AdSynthesizer {
     SemaContext& ctx;
     std::set<std::string> diff_vars;
+    std::string target_knob_key;
+    Type target_knob_type;
+    std::string knob_suffix;
 
     std::string ensure_jvp_function(const std::string& fn_name) {
-        std::string jvp_name = "__ad_jvp_" + fn_name;
+        std::string jvp_name = target_knob_key.empty()
+                                   ? ("__ad_jvp_" + fn_name)
+                                   : ("__ad_jvp_" + fn_name + "_knob_" + knob_suffix);
         if (ctx.out->find_function(jvp_name)) return jvp_name;
 
         const CheckedFunction* orig_ptr = ctx.out->find_function(fn_name);
@@ -247,6 +256,14 @@ struct AdSynthesizer {
                 jvp.params.push_back(std::move(dp));
                 diff_vars.insert(p.name);
             }
+        }
+        if (!target_knob_key.empty()) {
+            CheckedParam dk;
+            dk.span = orig_ptr->span;
+            dk.name = "_d_knob";
+            dk.type = target_knob_type;
+            dk.role = target_knob_type.is_scalar() ? ParamRole::Scalar : ParamRole::Vector;
+            jvp.params.push_back(std::move(dk));
         }
 
         jvp.body = diff_stmt_list(orig_body);
@@ -296,6 +313,12 @@ struct AdSynthesizer {
         const Type& t = e->resolved_type;
         const SourceSpan& sp = e->span;
         if (!is_diff_type(t, ctx.out->types)) {
+            return make_zero_expr(t, ctx.out->types, sp);
+        }
+        if (!target_knob_key.empty() && !e->knob_key.empty()) {
+            if (e->knob_key == target_knob_key) {
+                return make_ident("_d_knob", t, sp);
+            }
             return make_zero_expr(t, ctx.out->types, sp);
         }
         switch (e->kind) {
@@ -411,9 +434,9 @@ struct AdSynthesizer {
             }
 
             case Expr::Kind::MethodCall: {
-                bool dep = expr_uses_diff_var(e->lhs.get(), diff_vars);
+                bool dep = expr_uses_diff_var(e->lhs.get(), diff_vars, target_knob_key);
                 for (const auto& a : e->args) {
-                    if (expr_uses_diff_var(a.get(), diff_vars)) dep = true;
+                    if (expr_uses_diff_var(a.get(), diff_vars, target_knob_key)) dep = true;
                 }
                 if (dep && is_diff_type(t, ctx.out->types)) {
                     ctx.diags.error(sp, "automatic differentiation does not support method call '" +
@@ -442,6 +465,9 @@ struct AdSynthesizer {
                 if (is_diff_type(cparams[i].type, ctx.out->types)) {
                     jvp_args.push_back(diff_expr(e->args[i].get()));
                 }
+            }
+            if (!target_knob_key.empty()) {
+                jvp_args.push_back(make_ident("_d_knob", target_knob_type, sp));
             }
             return make_call(jvp_name, std::move(jvp_args), t, sp);
         }
@@ -719,7 +745,7 @@ struct AdSynthesizer {
 
         if (is_diff_type(t, ctx.out->types)) {
             for (const auto& a : e->args) {
-                if (expr_uses_diff_var(a.get(), diff_vars)) {
+                if (expr_uses_diff_var(a.get(), diff_vars, target_knob_key)) {
                     ctx.diags.error(sp, "automatic differentiation does not support call to '" + n +
                                             "' with differentiated arguments");
                     break;
@@ -874,6 +900,16 @@ struct AdSynthesizer {
 
 } // namespace
 
+std::string synthesize_knob_jvp_function(
+    SemaContext& ctx,
+    const std::string& inst_name,
+    const std::string& target_knob_key,
+    const Type& knob_type,
+    const std::string& knob_suffix) {
+    AdSynthesizer ad{ctx, {}, target_knob_key, knob_type, knob_suffix};
+    return ad.ensure_jvp_function(inst_name);
+}
+
 std::string synthesize_grad_wrapper(
     SemaContext& ctx,
     const std::string& inst_name,
@@ -881,7 +917,7 @@ std::string synthesize_grad_wrapper(
     const Type& x_type,
     const Type& f_ret,
     const SourceSpan& sp) {
-    AdSynthesizer ad{ctx, {}};
+    AdSynthesizer ad{ctx, {}, {}, {}, {}};
     std::string jvp_name = ad.ensure_jvp_function(inst_name);
 
     std::string wrap_name = "__ad_grad_" + inst_name;

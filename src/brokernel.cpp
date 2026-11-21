@@ -1,4 +1,5 @@
 #include "brokernel/brokernel.h"
+#include "ast_cache.h"
 #include "compile_internal.h"
 #include "kernel_report.h"
 
@@ -16,17 +17,13 @@
 
 namespace brokernel {
 
-const char* version() {
-    return "0.1.0";
-}
+const char* version() { return "0.1.0"; }
 
 namespace {
 
 size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
     size_t c = 0;
-    for (const auto& p : params) {
-        if (!is_bound_param(p.role)) ++c;
-    }
+    for (const auto& p : params) if (!is_bound_param(p.role)) ++c;
     return c;
 }
 
@@ -297,8 +294,11 @@ bool CompiledKernel::gpu_launch(
         vk_args.emplace_back(return_address);
     }
     if (probes_compiled && stage == Stage::Compute && !probes.empty()) {
+        out.probe_arg_index = vk_args.size();
         vk_args.emplace_back(uint64_t(0));
     }
+    detail::append_gpu_runtime_knob_args(*this, vk_args);
+    detail::append_gpu_telemetry_args(*this, out, vk_args);
 
     for (int i = 0; i < 3; ++i) out.local_size[i] = std::max(1u, local_size[i]);
     out.groups[0] = (w + out.local_size[0] - 1) / out.local_size[0];
@@ -363,14 +363,16 @@ bool CompiledKernel::dispatch_gpu(
 
         GpuLaunch launch;
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
-        if (probes_compiled && stage == Stage::Compute && !probes.empty() && !launch.args.empty()) {
+        if (probes_compiled && stage == Stage::Compute && !probes.empty() && launch.probe_arg_index < launch.args.size()) {
             const int32_t inactive_target[4] = {-1, -1, -1, 0};
             GpuBoundBuffer pbb;
             pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
             pbb.dev_buf.upload(inactive_target, 16);
-            launch.args.back() = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
+            launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
             bound_buffers.push_back(std::move(pbb));
         }
+        detail::TelemetryVkBounce telem_bounce;
+        detail::setup_gpu_telemetry_bounce(*this, launch, telem_bounce);
 
         brass::gpu::VulkanDispatch disp;
         for (int i = 0; i < 3; ++i) {
@@ -383,6 +385,7 @@ bool CompiledKernel::dispatch_gpu(
             if (err) *err = vk_err;
             return false;
         }
+        detail::finish_gpu_telemetry_bounce(telem_bounce);
 
         for (const auto& bb : bound_buffers) {
             if (bb.write_back && bb.host_ptr && bb.byte_size > 0) {
@@ -675,8 +678,8 @@ bool CompiledKernel::probe_gpu(
 
         GpuLaunch launch;
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
-        if (probes_compiled && stage == Stage::Compute && !probes.empty() && !launch.args.empty()) {
-            launch.args.back() = brass::gpu::VulkanArg(probe_buf.device_address());
+        if (probes_compiled && stage == Stage::Compute && !probes.empty() && launch.probe_arg_index < launch.args.size()) {
+            launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(probe_buf.device_address());
         }
 
         brass::gpu::VulkanDispatch disp;
@@ -740,7 +743,7 @@ CompileResult Compiler::compile_uncached(
     res.search_paths = modules_.search_paths();
     res.module_resolver = modules_.resolver();
 
-    auto ast = parse_source(source, file_name, res.diagnostics);
+    auto ast = detail::parse_source_cached(source, file_name, res.diagnostics);
     if (!ast || res.diagnostics.has_errors()) {
         res.ok = false;
         return res;
@@ -754,7 +757,8 @@ CompileResult Compiler::compile_uncached(
 
     // Shared: a kernel's CPU functions are lowered from it when first asked for.
     std::shared_ptr<CheckedModule> checked = check_module(*ast, modules_, res.diagnostics, root_dir, opts.entry_name,
-                                                          opts.knob_overrides.empty() ? nullptr : &opts.knob_overrides);
+                                                          opts.knob_overrides.empty() ? nullptr : &opts.knob_overrides,
+                                                          opts.runtime_knobs, opts.telemetry_slots);
     res.loaded_modules = modules_.custom_modules();
     res.imports = modules_.imported_modules();
     if (!checked || res.diagnostics.has_errors()) {
@@ -860,10 +864,19 @@ CompileResult Compiler::compile_uncached(
         ck.stencil_halo[0] = fn->stencil_halo[0];
         ck.stencil_halo[1] = fn->stencil_halo[1];
         ck.stencil_halo[2] = fn->stencil_halo[2];
+        for (const auto& rk : checked->runtime_knobs) {
+            ck.runtime_knobs.push_back(RuntimeKnobInfo{
+                rk.name, rk.module, rk.key, rk.type, rk.byte_offset, rk.byte_size, rk.default_value});
+        }
+        ck.runtime_knob_bytes = checked->runtime_knob_bytes;
+        ck.init_runtime_knobs();
+        ck.telemetry_slots = opts.telemetry_slots;
+        ck.uses_telemetry = fn->uses_telemetry;
+        ck.init_telemetry();
 
         try {
-            const bool emit_ptx_now = opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64;
-            if (opts.optimize_gpu_mir && opts.opt_level > 0 && (gpu_build || emit_ptx_now) &&
+            const bool emit_text_now = (opts.emit_ptx || opts.emit_msl) && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64;
+            if (opts.optimize_gpu_mir && opts.opt_level > 0 && (gpu_build || emit_text_now) &&
                 lowered.gpu_function && lowered.gpu_module) {
                 brass::GpuOptOptions gpu_opts;
                 gpu_opts.opt_level = opts.opt_level;
@@ -902,8 +915,8 @@ CompileResult Compiler::compile_uncached(
                 }
             }
 
-            if (emit_ptx_now) {
-                ck.ptx = brass::target::PtxTarget::emit_function(*lowered.gpu_function);
+            if (lowered.gpu_function) {
+                detail::emit_optional_gpu_targets(opts, *fn, *lowered.gpu_function, ck);
             }
 
             if (opts.compile_cpu && has_cpu_lowering(*fn)) {

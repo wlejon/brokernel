@@ -56,7 +56,7 @@ ConstValue jsToConstValue(Value v, const std::string& what) {
     return ConstValue::from_f32(0.0f);
 }
 
-std::unordered_map<std::string, ConstValue> parseKnobOverrides(Value obj, const std::string& what) {
+std::unordered_map<std::string, ConstValue> parseKnobOverridesImpl(Value obj, const std::string& what) {
     std::unordered_map<std::string, ConstValue> out;
     if (!ev::isObject(obj)) {
         ev::throwTypeError(what + ": expected an object of knob overrides");
@@ -157,8 +157,9 @@ bool probeOnDevice(
 
     GpuLaunch launch;
     if (!pk->gpu_launch(shape, gpu_args, returns ? returns->address() : 0, launch, err)) return false;
-    if (pk->probes_compiled && pk->stage == Stage::Compute && !pk->probes.empty() && !launch.args.empty()) {
-        launch.args.back() = brass::gpu::VulkanArg(probe_buf->address());
+    if (pk->probes_compiled && pk->stage == Stage::Compute && !pk->probes.empty() &&
+        launch.probe_arg_index < launch.args.size()) {
+        launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(probe_buf->address());
     }
     if (!dev.dispatch(*prog, *pk, launch, err)) return false;
     if (!probe_buf->read(0, host_probe.data(), probe_words * sizeof(uint32_t), err)) return false;
@@ -243,6 +244,13 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
     }
     if (args.empty()) return self;
     auto overrides = parseKnobOverrides(args[0], "Kernel.knobs");
+    if (!h->kernel->runtime_knobs.empty()) {
+        if (!h->kernel->set_knobs(overrides)) {
+            return ev::throwError("Kernel.knobs: unknown knob or incompatible type");
+        }
+        for (const auto& [k, v] : overrides) h->knobs[k] = v;
+        return self;
+    }
     auto next_res = compileOff([&] { return h->module_result->with_knobs(overrides); });
     if (!next_res->ok) throwCompileError(*next_res);
     for (const auto& [k, v] : overrides) h->knobs[k] = v;
@@ -250,6 +258,7 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
     if (!nk) return ev::throwError("Kernel.knobs: kernel '" + h->kernel->name + "' not found after recompilation");
     h->module_result = next_res;
     h->kernel = std::shared_ptr<const CompiledKernel>(next_res, nk);
+    h->fast_eval.reset();
     h->program.reset();
     if (nk->grid_dim > 0 && !nk->spirv.words.empty()) {
         if (GpuDevice* dev = currentDevice()) {
@@ -626,6 +635,13 @@ Value js_fnKnobs(Value self, std::span<const Value> args) {
     if (!h || !h->module_result) return ev::throwTypeError("KernelFn.knobs: invalid receiver");
     if (args.empty()) return self;
     auto overrides = parseKnobOverrides(args[0], "KernelFn.knobs");
+    if (h->point_kernel && !h->point_kernel->runtime_knobs.empty()) {
+        if (!h->point_kernel->set_knobs(overrides)) {
+            return ev::throwError("KernelFn.knobs: unknown knob or incompatible type");
+        }
+        for (const auto& [k, v] : overrides) h->knobs[k] = v;
+        return self;
+    }
     auto next_res = compileOff([&] { return h->module_result->with_knobs(overrides); });
     if (!next_res->ok) throwCompileError(*next_res);
     for (const auto& [k, v] : overrides) h->knobs[k] = v;
@@ -637,6 +653,26 @@ Value js_fnKnobs(Value self, std::span<const Value> args) {
 }
 
 } // namespace
+
+std::unordered_map<std::string, ConstValue> parseKnobOverrides(Value obj, const std::string& what) {
+    return parseKnobOverridesImpl(obj, what);
+}
+
+Value makeFnValueFromResult(
+    std::shared_ptr<ModuleCell> cell,
+    std::shared_ptr<const CompileResult> res,
+    const std::string& fn_name) {
+    auto fn_handle = std::make_unique<FnHandle>();
+    fn_handle->module_result = std::move(res);
+    fn_handle->owner = std::move(cell);
+    fn_handle->generation = fn_handle->owner ? fn_handle->owner->generation : 0;
+    fn_handle->fn_name = fn_name;
+    std::string err;
+    if (!buildPointKernelForFn(*fn_handle, &err)) {
+        return ev::throwError("KernelModule.knobGrad: " + err);
+    }
+    return g_fnClass.createInstance(std::move(fn_handle));
+}
 
 void decorateFnClass(ev::ObjectBuilder& b) {
     b.def("eval", 0, js_fnEval);
@@ -660,7 +696,10 @@ void decorateFnClass(ev::ObjectBuilder& b) {
 void decorateKernelExtras(ev::ObjectBuilder& b) {
     b.def("probe", 0, js_kernelProbe);
     b.def("knobs", 1, js_kernelKnobs);
+    b.def("setKnobs", 1, js_kernelSetKnobs);
     b.def("stats", 0, js_kernelStats);
+    b.def("exportNative", 1, js_kernelExportNative);
+    decorateKernelTargetExtras(b);
 }
 
 void decorateModuleExtras(ev::ObjectBuilder& b) {
@@ -761,6 +800,8 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
         out.set("fields", fieldsArr.get());
         return out.get();
     });
+    b.def("structView", 2, js_moduleStructView);
+    b.def("knobGrad", 2, js_moduleKnobGrad);
     b.accessor("functions", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
         if (!h || !h->cell->result) return ev::undefined();
@@ -837,6 +878,22 @@ void configureCompilerModulesAndOptions(
         if (ev::isBool(ep)) compile_opts.enable_probes = ev::toBool(ep);
         const Value efp = ev::getProperty(opts.get(), "enableFragmentProbes");
         if (ev::isBool(efp)) compile_opts.enable_fragment_probes = ev::toBool(efp);
+        const Value rtk = ev::getProperty(opts.get(), "runtimeKnobs");
+        if (ev::isBool(rtk)) compile_opts.runtime_knobs = ev::toBool(rtk);
+        const Value tsl = ev::getProperty(opts.get(), "telemetrySlots");
+        if (ev::isNumber(tsl)) {
+            const double v = ev::toDouble(tsl);
+            if (v < 0 || v > 1048576.0) {
+                ev::throwRangeError("bro.kernel.compile: telemetrySlots must be in [0, 1048576]");
+            }
+            compile_opts.telemetry_slots = static_cast<uint32_t>(v);
+        }
+        const Value emsl = ev::getProperty(opts.get(), "emitMsl");
+        if (ev::isBool(emsl)) compile_opts.emit_msl = ev::toBool(emsl);
+        const Value eptx = ev::getProperty(opts.get(), "emitPtx");
+        if (ev::isBool(eptx)) compile_opts.emit_ptx = ev::toBool(eptx);
+        const Value edis = ev::getProperty(opts.get(), "emitSpirvDisassembly");
+        if (ev::isBool(edis)) compile_opts.emit_spirv_disassembly = ev::toBool(edis);
     }
 }
 

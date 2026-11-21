@@ -189,13 +189,23 @@ static void test_store_access_modes_and_mutability() {
     }
     {
         const char* src = R"(
-            @kernel fn bad_store_sub(s: rw_store<vec3<f32>, 1>) {
+            @kernel fn bad_ro_store_sub(s: read_store<vec3<f32>, 1>) {
                 s[0].x = 1.0;
             }
         )";
-        auto res = compile_source(src, "bad_store_sub.bk");
+        auto res = compile_source(src, "bad_ro_store_sub.bk");
         assert(!res.ok);
-        assert(res.error_message().find("sub-element of store") != std::string::npos);
+        assert(res.error_message().find("read-only store") != std::string::npos);
+    }
+    {
+        const char* src = R"(
+            @kernel fn ok_rw_store_sub(s: rw_store<vec3<f32>, 1>) {
+                s[0].x = 1.0;
+                s[0].yz += vec2<f32>(2.0, 3.0);
+            }
+        )";
+        auto res = compile_source(src, "ok_rw_store_sub.bk");
+        assert(res.ok);
     }
 
     // 6. Atomic builtins on unsupported store element types are rejected

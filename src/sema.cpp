@@ -808,8 +808,11 @@ std::unique_ptr<CheckedModule> check_module(
     DiagnosticBag& diags,
     const std::filesystem::path& root_dir,
     std::string_view entry_name,
-    const std::unordered_map<std::string, ConstValue>* knob_overrides) {
-    detail::SemaContext ctx(registry, diags, root_dir);
+    const std::unordered_map<std::string, ConstValue>* knob_overrides,
+    bool runtime_knobs,
+    uint32_t telemetry_slots) {
+    detail::SemaContext ctx(registry, diags, root_dir, runtime_knobs);
+    ctx.out->telemetry_slots = telemetry_slots;
     std::string root_name = !root_ast.module_name.empty() ? root_ast.module_name : "root";
     ctx.out->module_name = root_name;
 
@@ -854,6 +857,7 @@ std::unique_ptr<CheckedModule> check_module(
             ctx.resolve_type(&te, mod_name, empty_env);
         }
     }
+    ctx.init_knobs_layout();
 
     // Collect exported constants (`pub const`, `@knob const`, and re-exported `pub const`s)
     // and exported functions (`pub fn`).

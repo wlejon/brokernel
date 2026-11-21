@@ -220,6 +220,9 @@ struct Expr {
     std::string name;
     std::vector<std::string> path; // For Path (`a::b`)
     int32_t global_index = -1;     // An Ident or Path naming a module-level resource: its CheckedModule::globals index
+    bool is_runtime_knob = false;
+    uint32_t runtime_knob_index = 0;
+    std::string knob_key;          // Canonical "module::name" when referencing a `@knob` const
 
     // Operators
     UnaryOp unary_op = UnaryOp::Neg;

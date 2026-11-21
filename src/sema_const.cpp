@@ -668,7 +668,41 @@ void FnCheckState::check_stmt(Stmt* s) {
                 return;
             }
             if (lv->type.is_store()) {
-                ctx.diags.error(s->span, "cannot assign to sub-element of store '" + base->name + "' directly; assign a full store element");
+                if (s->assign_target->kind == Expr::Kind::Ident || s->assign_target->kind == Expr::Kind::Path) {
+                    ctx.diags.error(s->span, "assign to an element of store '" + base->name + "', not the store");
+                    if (s->assign_value) check_expr(s->assign_value.get());
+                    return;
+                }
+                Type target_t = check_store_lvalue(s->assign_target.get(), s->compound_op.has_value());
+                for (const Expr* cur = s->assign_target.get();
+                     cur && (cur->kind == Expr::Kind::Field || cur->kind == Expr::Kind::Index);
+                     cur = cur->lhs.get()) {
+                    if (cur->kind == Expr::Kind::Field && cur->lhs && cur->lhs->resolved_type.is_vector() && cur->name.size() > 1) {
+                        uint32_t seen_mask = 0;
+                        for (char c : cur->name) {
+                            uint32_t idx = (c == 'x' || c == 'r' || c == 's') ? 0 :
+                                           (c == 'y' || c == 'g' || c == 't') ? 1 :
+                                           (c == 'z' || c == 'b' || c == 'p') ? 2 : 3;
+                            if (seen_mask & (1u << idx)) {
+                                ctx.diags.error(cur->span, "cannot assign to vector swizzle with duplicate components '." + cur->name + "'");
+                                break;
+                            }
+                            seen_mask |= (1u << idx);
+                        }
+                    }
+                }
+                if (s->compound_op.has_value() && !target_t.is_numeric()) {
+                    ctx.diags.error(s->span, "compound assignment requires a numeric scalar or vector target, got '" + target_t.to_string() + "'");
+                }
+                check_expr(s->assign_value.get(), target_t);
+                if (s->compound_op.has_value() && target_t.is_vector()) {
+                    Type elem_t = Type::scalar_type(target_t.scalar);
+                    if (s->assign_value->resolved_type == elem_t || coerce_expr_to_type(s->assign_value.get(), elem_t)) {
+                        coerce_expr_to_type(s->assign_value.get(), target_t);
+                    }
+                }
+                check_assignable(s->assign_value.get(), target_t, ctx.diags, s->span);
+                mark_type_usage(target_t);
                 return;
             }
             if (lv->type.is_block()) {

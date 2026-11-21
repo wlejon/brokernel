@@ -3,6 +3,16 @@
 #include <cmath>
 #include <cstdlib>
 namespace brokernel::detail {
+static bool expr_has_runtime_knob(const Expr* e) {
+    if (!e) return false;
+    if (e->is_runtime_knob || !e->knob_key.empty()) return true;
+    if (expr_has_runtime_knob(e->lhs.get()) || expr_has_runtime_knob(e->rhs.get()) || expr_has_runtime_knob(e->cond.get())) {
+        return true;
+    }
+    for (const auto& a : e->args) if (expr_has_runtime_knob(a.get())) return true;
+    for (const auto& f : e->fields) if (expr_has_runtime_knob(f.value.get())) return true;
+    return false;
+}
 static bool match_type_pattern(const TypeExpr* pattern, const Type& actual, const std::string& decl_mod,
                                const std::vector<GenericParamDecl>& generic_params, SemaContext& ctx,
                                GenericEnv& inferred) {
@@ -249,6 +259,7 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     if (inst->uses_descriptors) fn.uses_descriptors = true;   // a resource read in the callee
     if (inst->uses_textures) fn.uses_textures = true;
     if (inst->uses_barriers_or_shared) fn.uses_barriers_or_shared = true;
+    if (inst->uses_telemetry) fn.uses_telemetry = true;
     if (inst->required_stage) require_stage(*inst->required_stage, callee_decl.name, e->span);
     if (inst_grid) ensure_grid_dim(std::max(1u, inst_grid_dim));
     for (const auto& pr : inst->probes) {
@@ -445,7 +456,21 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             auto cv = ctx.find_const(fn.module_name, {}, e->name, genv, scopes);
             if (cv) {
-                fold_const_into_expr(e, *cv);
+                if (auto kkey = ctx.find_knob_key(fn.module_name, {}, e->name)) {
+                    auto kit = ctx.knob_index_by_key.find(*kkey);
+                    if (ctx.runtime_knobs && kit != ctx.knob_index_by_key.end() && kit->second < ctx.out->runtime_knobs.size()) {
+                        e->is_runtime_knob = true;
+                        e->runtime_knob_index = kit->second;
+                        e->knob_key = *kkey;
+                        e->resolved_type = ctx.out->runtime_knobs[kit->second].type;
+                        mark_type_usage(e->resolved_type);
+                        return e->resolved_type;
+                    }
+                    fold_const_into_expr(e, *cv);
+                    e->knob_key = *kkey;
+                } else {
+                    fold_const_into_expr(e, *cv);
+                }
                 mark_type_usage(cv->type);
                 return cv->type;
             }
@@ -468,7 +493,21 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         case Expr::Kind::Path: {
             auto cv = ctx.find_const(fn.module_name, e->path, e->name, genv, scopes);
             if (cv) {
-                fold_const_into_expr(e, *cv);
+                if (auto kkey = ctx.find_knob_key(fn.module_name, e->path, e->name)) {
+                    auto kit = ctx.knob_index_by_key.find(*kkey);
+                    if (ctx.runtime_knobs && kit != ctx.knob_index_by_key.end() && kit->second < ctx.out->runtime_knobs.size()) {
+                        e->is_runtime_knob = true;
+                        e->runtime_knob_index = kit->second;
+                        e->knob_key = *kkey;
+                        e->resolved_type = ctx.out->runtime_knobs[kit->second].type;
+                        mark_type_usage(e->resolved_type);
+                        return e->resolved_type;
+                    }
+                    fold_const_into_expr(e, *cv);
+                    e->knob_key = *kkey;
+                } else {
+                    fold_const_into_expr(e, *cv);
+                }
                 mark_type_usage(cv->type);
                 return cv->type;
             }
@@ -499,7 +538,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             }
             e->resolved_type = sub;
             mark_type_usage(sub);
-            if (!sub.is_scalar()) {
+            if (!sub.is_scalar() && !expr_has_runtime_knob(e)) {
                 if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
                     cv->type = sub;
                     fold_const_into_expr(e, *cv);
@@ -511,7 +550,8 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             bool is_cmp = (e->binary_op == BinaryOp::Eq || e->binary_op == BinaryOp::Ne || e->binary_op == BinaryOp::Lt ||
                            e->binary_op == BinaryOp::Le || e->binary_op == BinaryOp::Gt || e->binary_op == BinaryOp::Ge);
             Type lt = check_expr(e->lhs.get(), is_cmp ? std::nullopt : expected);
-            if (e->binary_op == BinaryOp::LogAnd || e->binary_op == BinaryOp::LogOr) {
+            if ((e->binary_op == BinaryOp::LogAnd || e->binary_op == BinaryOp::LogOr) &&
+                !expr_has_runtime_knob(e->lhs.get())) {
                 if (auto lcv = ctx.eval_const_expr(e->lhs.get(), fn.module_name, genv, scopes);
                     lcv && lcv->type.is_bool()) {
                     if ((e->binary_op == BinaryOp::LogAnd && !lcv->bool_val) ||
@@ -566,7 +606,7 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                     return e->resolved_type = Type::bool_type();
                 default:
                     e->resolved_type = lt;
-                    if (!lt.is_scalar()) {
+                    if (!lt.is_scalar() && !expr_has_runtime_knob(e)) {
                         if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
                             cv->type = lt;
                             fold_const_into_expr(e, *cv);
@@ -620,6 +660,9 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             if (fdecl) {
                 return check_user_call(e, *fdecl, callee_mod);
             }
+            if (e->path.empty() && e->name == "grad_knob") {
+                return check_grad_knob_call(e, expected);
+            }
             if (e->path.empty() &&
                 (e->name == "probe" || e->name == "grad" || e->name == "expect" ||
                  e->name == "moments" || e->name == "cell_expect")) {
@@ -660,8 +703,10 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 Type rt = (f.size() == 1) ? Type::scalar_type(recv.scalar)
                                           : Type::vec(recv.scalar, static_cast<uint32_t>(f.size()));
                 e->resolved_type = rt;
-                if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
-                    fold_const_into_expr(e, *cv);
+                if (!expr_has_runtime_knob(e)) {
+                    if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                        fold_const_into_expr(e, *cv);
+                    }
                 }
                 return rt;
             }
@@ -738,8 +783,10 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 }
                 Type elem = recv.element_type();
                 e->resolved_type = elem;
-                if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
-                    fold_const_into_expr(e, *cv);
+                if (!expr_has_runtime_knob(e)) {
+                    if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                        fold_const_into_expr(e, *cv);
+                    }
                 }
                 return elem;
             }

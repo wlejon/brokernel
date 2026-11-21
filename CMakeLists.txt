@@ -28,11 +28,14 @@ endif()
 
 add_library(brokernel STATIC
     src/brokernel.cpp
+    src/ast_cache.cpp
     src/compile_cache.cpp
     src/compile_result.cpp
     src/compile_result_io.cpp
     src/kernel_report.cpp
+    src/kernel_verify.cpp
     src/runtime_cpu.cpp
+    src/runtime_knobs.cpp
     src/diagnostics.cpp
     src/types.cpp
     src/lexer.cpp
@@ -44,14 +47,18 @@ add_library(brokernel STATIC
     src/sema.cpp
     src/sema_const.cpp
     src/sema_check.cpp
+    src/sema_ext.cpp
     src/sema_builtins.cpp
     src/sema_ad.cpp
+    src/sema_ad_knobs.cpp
     src/sema_quad.cpp
     src/lowering_mir.cpp
     src/lowering_expr.cpp
     src/lowering_math.cpp
     src/lowering_ops.cpp
     src/lowering_block.cpp
+    src/lowering_store_place.cpp
+    src/lowering_telemetry.cpp
     src/lowering_texture.cpp
 )
 add_library(brokernel::brokernel ALIAS brokernel)

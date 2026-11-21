@@ -42,9 +42,15 @@ struct SemaContext {
     std::vector<std::string> active_fn_stack;
     // Active module stack for circular import detection
     std::vector<std::string> active_import_stack;
-    SemaContext(ModuleRegistry& reg, DiagnosticBag& d, std::filesystem::path dir)
+    bool runtime_knobs = false;
+    std::unordered_map<std::string, uint32_t> knob_index_by_key;
+    SemaContext(ModuleRegistry& reg, DiagnosticBag& d, std::filesystem::path dir, bool rt_knobs = false)
         : registry(reg), diags(d), root_dir(std::move(dir)),
-          out(std::make_unique<CheckedModule>()) {}
+          out(std::make_unique<CheckedModule>()), runtime_knobs(rt_knobs) {}
+    void init_knobs_layout();
+    std::optional<std::string> find_knob_key(const std::string& current_mod,
+                                             const std::vector<std::string>& path,
+                                             const std::string& name) const;
     bool load_and_index_module(const ModuleAst& ast, const std::string& canonical_name,
                                const std::filesystem::path& file_dir);
     bool symbol_exists_in_module(const std::string& mod_name, const std::string& sym,
@@ -102,6 +108,13 @@ bool is_unsuffixed_literal(const Expr* e);
 ConstValue convert_const_value(const ConstValue& cv, const Type& target, const TypeRegistry& types);
 void fold_const_into_expr(Expr* e, const ConstValue& cv);
 bool validate_shared_type(const Type& t, const TypeRegistry& types, DiagnosticBag& diags, const SourceSpan& span, const std::string& name);
+bool is_ad_diff_type(const Type& t, const TypeRegistry& types);
+std::string synthesize_knob_jvp_function(
+    SemaContext& ctx,
+    const std::string& inst_name,
+    const std::string& target_knob_key,
+    const Type& knob_type,
+    const std::string& knob_suffix);
 struct FnCheckState {
     SemaContext& ctx;
     CheckedFunction& fn;
@@ -167,11 +180,13 @@ struct FnCheckState {
         fn.stage = want;
     }
     Type check_expr(Expr* e, std::optional<Type> expected = std::nullopt);
+    Type check_store_lvalue(Expr* e, bool is_compound);
     void check_stmt(Stmt* s);
     void check_block_stmts(std::vector<StmtPtr>& stmts);
     bool validate_stencil_access(CheckedParam& param, const std::vector<ExprPtr>& offset_args, const SourceSpan& span);
     Type check_builtin_call(Expr* e, std::optional<Type> expected);
     Type check_ad_or_quadrature_call(Expr* e, std::optional<Type> expected);
+    Type check_grad_knob_call(Expr* e, std::optional<Type> expected);
     Type check_user_call(Expr* e, const FnDecl& callee_decl, const std::string& callee_mod);
     Type check_method_call(Expr* e);
     Type check_texture_method(Expr* e, const Type& recv_t);   // an image's or a sampler's method

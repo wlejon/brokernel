@@ -89,7 +89,7 @@ private:
         std::string name;
         std::string path;
         std::string source;
-        std::unique_ptr<ModuleAst> ast;
+        std::shared_ptr<const ModuleAst> ast;
         bool loading = false;
         bool failed = false;
         bool found = false;   // by the resolver or on a search path

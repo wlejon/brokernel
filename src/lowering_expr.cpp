@@ -81,6 +81,7 @@ ValueList MirBodyLowerer::lower_inlined_call(
 }
 ValueList MirBodyLowerer::lower_expr(const Expr* e) {
     if (!e) return {};
+    if (e->is_runtime_knob) return lower_runtime_knob(e);
     switch (e->kind) {
         case Expr::Kind::IntLit: {
             ScalarKind sk = e->resolved_type.scalar;
@@ -257,6 +258,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return out;
         }
         case Expr::Kind::Field: {
+            if (auto v = try_store_place_read(e)) return *v;
             if (auto v = try_block_read(e)) return *v;
             if (auto v = try_shared_read(e)) return *v;
             if (auto v = try_local_read(e)) return *v;
@@ -288,6 +290,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             return recv;
         }
         case Expr::Kind::Index: {
+            if (auto v = try_store_place_read(e)) return *v;
             if (auto v = try_block_read(e)) return *v;
             if (auto v = try_shared_read(e)) return *v;
             if (auto v = try_local_read(e)) return *v;
@@ -593,6 +596,13 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 ValueList vals = lower_expr(e->args[1].get());
                 emit_probe(static_cast<uint32_t>(e->args[0]->int_val), e->resolved_type, vals);
                 return vals;
+            }
+            if (n == "telemetry") {
+                ValueList slot = lower_expr(e->args[0].get());
+                ValueList val = lower_expr(e->args[1].get());
+                lower_telemetry(slot[0], e->args[0]->resolved_type.scalar,
+                                val[0], e->args[1]->resolved_type.scalar);
+                return {};
             }
             // 3. Scalar casts f32(x), f64(x), i32(x), u32(x), i64(x), u64(x), bool(x)
             if (n == "f32" || n == "f64" || n == "i32" || n == "u32" || n == "i64" || n == "u64" || n == "bool") {

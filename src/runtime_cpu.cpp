@@ -273,6 +273,15 @@ bool pack_cpu_args(
         slots_out.push_back(reinterpret_cast<uint64_t>(ba->buffer_ptr()));
         slots_out.push_back(static_cast<uint64_t>(ba->buffer_bytes()));
     }
+    if (!kernel.runtime_knobs.empty()) {
+        slots_out.push_back(reinterpret_cast<uint64_t>(kernel.runtime_knob_data()));
+    }
+    if (kernel.telemetry_slots > 0 && kernel.uses_telemetry) {
+        float* ptr = kernel.telemetry_host_ptr();
+        const uint32_t cap = ptr ? std::min(kernel.telemetry_slots, kernel.telemetry_capacity_floats()) : 0u;
+        slots_out.push_back(reinterpret_cast<uint64_t>(ptr));
+        slots_out.push_back(static_cast<uint64_t>(cap));
+    }
     return true;
 }
 

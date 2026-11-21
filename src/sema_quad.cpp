@@ -32,6 +32,9 @@ ExprPtr clone_expr(const Expr* e) {
     c->name = e->name;
     c->path = e->path;
     c->global_index = e->global_index;
+    c->is_runtime_knob = e->is_runtime_knob;
+    c->runtime_knob_index = e->runtime_knob_index;
+    c->knob_key = e->knob_key;
     c->unary_op = e->unary_op;
     c->binary_op = e->binary_op;
     c->lhs = clone_expr(e->lhs.get());

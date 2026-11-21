@@ -66,6 +66,13 @@ public:
     virtual size_t bytes() const = 0;
 };
 
+/// Where a KernelBuffer's bytes live.
+enum class BufferResidency : uint8_t {
+    Gpu = 0,     // GPU-only device buffer (default when GPU is available)
+    Host = 1,    // Host-resident buffer (usable by kernel.run() without a GPU)
+    Shared = 2,  // Dual-resident host + GPU buffer with lazy coherence
+};
+
 class GpuBuffer {
 public:
     virtual ~GpuBuffer() = default;
@@ -75,6 +82,27 @@ public:
     virtual size_t bytes() const = 0;
     /// The bytes behind address(), at least bytes() (KernelArg::device).
     virtual size_t capacity() const = 0;
+    /// Where this buffer's bytes reside.
+    virtual BufferResidency residency() const { return BufferResidency::Gpu; }
+    /// Host pointer for CPU kernel.run() on Host/Shared buffers.
+    virtual void* hostDataForCpu() { return nullptr; }
+    /// Ensure host memory reflects latest GPU writes before CPU execution.
+    virtual bool prepareForCpu(std::string* err) {
+        if (err) *err = "this KernelBuffer is GPU-resident (pass a TypedArray or create with { residency: 'shared' | 'host' })";
+        return false;
+    }
+    /// Record that CPU execution modified host memory.
+    virtual void markHostWritten() {}
+    /// Ensure GPU memory reflects latest host writes before GPU dispatch.
+    virtual bool prepareForGpu(std::string* err) {
+        if (address() == 0) {
+            if (err) *err = "this KernelBuffer is host-only (create with { residency: 'shared' | 'gpu' })";
+            return false;
+        }
+        return true;
+    }
+    /// Record that GPU dispatch modified device memory.
+    virtual void markGpuWritten() {}
     /// Copy `n` bytes of `data` (now) to byte `offset`, after every dispatch
     /// so far.
     virtual bool write(size_t offset, const void* data, size_t n, std::string* err) = 0;

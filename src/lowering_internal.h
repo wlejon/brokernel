@@ -222,6 +222,34 @@ struct MirBodyLowerer {
     bool try_local_assign(const Stmt* s, ValueList rhs);
     void assign_local_lvalue(const Stmt* s, const ValueList& rhs);
 
+    // Structured store sub-element places (lowering_store_place.cpp).
+    struct StorePlace {
+        ValueList store;
+        brass::Value* linear_idx = nullptr;
+        uint32_t elem_bytes = 0;
+        brass::Value* rel_byte_off = nullptr;
+        Type type;
+        std::vector<uint32_t> lanes;
+    };
+    bool is_store_subpath(const Expr* e) const;
+    bool store_place(const Expr* e, StorePlace& p);
+    ValueList store_place_load(const StorePlace& p);
+    void store_place_store(const StorePlace& p, const ValueList& value);
+    std::optional<ValueList> try_store_place_read(const Expr* e);
+    bool try_store_place_assign(const Stmt* s, ValueList rhs);
+
+    // Runtime @knobs (runtime_knobs.cpp).
+    brass::Value* cpu_knobs_ptr = nullptr;
+    std::unordered_map<uint32_t, ValueList> gpu_knob_values;
+    ValueList lower_runtime_knob(const Expr* e);
+
+    // Runtime telemetry buffer (lowering_telemetry.cpp).
+    brass::Value* cpu_telemetry_ptr = nullptr;
+    brass::Value* cpu_telemetry_cap = nullptr;
+    brass::Value* gpu_telemetry_ptr = nullptr;
+    brass::Value* gpu_telemetry_cap = nullptr;
+    void lower_telemetry(brass::Value* slot_v, ScalarKind slot_sk, brass::Value* val_v, ScalarKind val_sk);
+
     // `store` accessed at a cell, covering `dim` axes: its pointer alone.
     ValueList at_cells(const ValueList& store, uint32_t dim);
     // `store` (of `dim` axes) accessed at (x, y, z): at_cells when those are
