@@ -103,6 +103,7 @@ private:
     std::vector<ModuleRequest> requests_;
 
     void register_builtin_modules();
+    void register_domain_builtin_modules();
     Entry* find_or_discover(std::string_view key, const std::filesystem::path& importing_dir);
 };
 

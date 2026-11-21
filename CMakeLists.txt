@@ -41,6 +41,7 @@ add_library(brokernel STATIC
     src/lexer.cpp
     src/parser.cpp
     src/stdlib_modules.cpp
+    src/stdlib_domain.cpp
     src/stdlib_noise_core.cpp
     src/stdlib_noise_3d.cpp
     src/stdlib_noise_fractal_warp.cpp

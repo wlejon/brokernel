@@ -287,6 +287,8 @@ void ModuleRegistry::register_builtin_modules() {
 
     register_module("color", kStdColorSource, "<builtin:color.bk>");
     aliases_["std::color"] = "color";
+
+    register_domain_builtin_modules();
 }
 
 void ModuleRegistry::register_module(std::string name, std::string source, std::string virtual_path) {

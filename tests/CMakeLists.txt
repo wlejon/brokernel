@@ -30,6 +30,7 @@ brokernel_add_test(test_struct_stores)
 brokernel_add_test(test_runtime_knobs_ad)
 brokernel_add_test(test_verify_multitarget)
 brokernel_add_test(test_telemetry)
+brokernel_add_test(test_stdlib_domains)
 # The bro.kernel binding, in a build with BROKERNEL_ENABLE_API.
 if(TARGET brokernel_api)
     brokernel_add_test(test_kernel_api)
