@@ -618,6 +618,16 @@ struct CompileResult {
     CacheStatus cache_status = CacheStatus::Off;
     std::string cache_note;
 
+    struct CompileTimings {
+        double parse_ms = 0.0;
+        double sema_ms = 0.0;
+        double lower_ms = 0.0;
+        double gpu_opt_ms = 0.0;
+        double spirv_ms = 0.0;
+        double total_ms = 0.0;
+    };
+    CompileTimings timings;
+
     const CompiledKernel* find_kernel(std::string_view name) const noexcept;
     const CompiledKernel* default_kernel() const noexcept {
         return kernels.empty() ? nullptr : &kernels.front();
@@ -631,6 +641,14 @@ struct CompileResult {
     CompileResult compile_knob_grads(
         std::string_view fn_name,
         const std::vector<std::string>& knob_names) const;
+
+    /// Compiles a `@kernel @grid(D)` loss-gradient reduction kernel accumulating
+    /// `d(fn_name)/d(knob)` over all grid cells into `rw_store<f32, 1>` via `atomic_add`,
+    /// with `runtime_knobs = true` so iterative optimization needs zero recompilation.
+    CompileResult compile_knob_grid_grads(
+        std::string_view fn_name,
+        const std::vector<std::string>& knob_names,
+        uint32_t grid_dim = 1) const;
 
     /// True when `key` is this module's file or a module it imported.
     bool depends_on(const std::string& key) const;

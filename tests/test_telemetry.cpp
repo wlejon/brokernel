@@ -151,24 +151,37 @@ void test_ast_cache_and_cold_compile_benchmark() {
     using clock = std::chrono::steady_clock;
     constexpr int kIters = 20;
 
-    auto bench = [&](bool cache_on) -> double {
+    auto bench = [&](bool cache_on, brokernel::CompileResult::CompileTimings& sum_t, double& ctor_ms) -> double {
         brokernel::detail::clear_ast_cache();
         brokernel::detail::set_ast_cache_enabled(cache_on);
+        sum_t = {};
+        ctor_ms = 0.0;
         const auto t0 = clock::now();
         for (int i = 0; i < kIters; ++i) {
+            const auto tc0 = clock::now();
             brokernel::Compiler c;
+            const auto tc1 = clock::now();
+            ctor_ms += std::chrono::duration<double, std::milli>(tc1 - tc0).count();
             brokernel::CompileOptions opts;
             opts.compile_cpu = false;
             opts.knob_overrides["GAIN"] = brokernel::ConstValue::from_f32(1.0f + 0.01f * float(i));
             auto r = c.compile_source(kAstBenchSrc, "bench_ast.bk", opts);
             CHECK(r.ok);
+            sum_t.parse_ms += r.timings.parse_ms;
+            sum_t.sema_ms += r.timings.sema_ms;
+            sum_t.lower_ms += r.timings.lower_ms;
+            sum_t.gpu_opt_ms += r.timings.gpu_opt_ms;
+            sum_t.spirv_ms += r.timings.spirv_ms;
+            sum_t.total_ms += r.timings.total_ms;
         }
         const auto t1 = clock::now();
         return std::chrono::duration<double, std::milli>(t1 - t0).count();
     };
 
-    const double off_ms = bench(false);
-    const double on_ms = bench(true);
+    brokernel::CompileResult::CompileTimings t_off{}, t_on{};
+    double ctor_off = 0.0, ctor_on = 0.0;
+    const double off_ms = bench(false, t_off, ctor_off);
+    const double on_ms = bench(true, t_on, ctor_on);
     const auto stats = brokernel::detail::ast_cache_stats();
     CHECK(stats.hits > 0);
     CHECK(stats.entries >= 1);
@@ -184,10 +197,13 @@ void test_ast_cache_and_cold_compile_benchmark() {
     CHECK(stats2.misses > stats.misses);
 
     brokernel::detail::set_ast_cache_enabled(true);
-    std::printf("cold_compile_%d_iters: ast_cache_off=%.2f ms, ast_cache_on=%.2f ms (hits=%llu, misses=%llu)\n",
-                kIters, off_ms, on_ms,
-                static_cast<unsigned long long>(stats.hits),
-                static_cast<unsigned long long>(stats.misses));
+    std::printf(
+        "cold_compile_%d_iters: ast_cache_off=%.2f ms, ast_cache_on=%.2f ms (hits=%llu, misses=%llu)\n"
+        "  stages_on_ms : ctor=%.2f parse=%.2f sema=%.2f lower=%.2f gpu_opt=%.2f spirv=%.2f total_uncached=%.2f\n",
+        kIters, off_ms, on_ms,
+        static_cast<unsigned long long>(stats.hits),
+        static_cast<unsigned long long>(stats.misses),
+        ctor_on, t_on.parse_ms, t_on.sema_ms, t_on.lower_ms, t_on.gpu_opt_ms, t_on.spirv_ms, t_on.total_ms);
 }
 
 } // namespace

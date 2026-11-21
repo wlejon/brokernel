@@ -1,12 +1,15 @@
 #pragma once
 // Process-wide thread-safe parsed AST cache for brokernel.
 #include "brokernel/ast.h"
+#include "brokernel/sema.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace brokernel::detail {
 
@@ -27,6 +30,10 @@ std::shared_ptr<const ModuleAst> parse_source_cached(
     const std::string& file_name,
     DiagnosticBag& diags,
     std::string fallback_module_name = {});
+
+/// Caches evaluated non-knob module constants keyed by immutable `ModuleAst*`.
+bool lookup_cached_module_consts(const ModuleAst* ast, std::vector<std::pair<std::string, ConstValue>>& out);
+void store_cached_module_consts(const ModuleAst* ast, std::vector<std::pair<std::string, ConstValue>> consts);
 
 AstCacheStats ast_cache_stats();
 void clear_ast_cache();

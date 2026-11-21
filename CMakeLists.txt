@@ -28,6 +28,7 @@ endif()
 
 add_library(brokernel STATIC
     src/brokernel.cpp
+    src/runtime_gpu.cpp
     src/ast_cache.cpp
     src/compile_cache.cpp
     src/compile_result.cpp
@@ -50,6 +51,7 @@ add_library(brokernel STATIC
     src/sema_check.cpp
     src/sema_ext.cpp
     src/sema_builtins.cpp
+    src/sema_methods.cpp
     src/sema_ad.cpp
     src/sema_ad_knobs.cpp
     src/sema_quad.cpp

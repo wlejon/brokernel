@@ -76,6 +76,54 @@ Value js_moduleKnobGrad(Value self, std::span<const Value> args) {
     return out.get();
 }
 
+Value js_moduleKnobGradGrid(Value self, std::span<const Value> args) {
+    auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
+    if (!h || !h->cell || !h->cell->result) {
+        return ev::throwTypeError("KernelModule.knobGradGrid: invalid receiver");
+    }
+    if (args.size() < 2 || !ev::isString(args[0])) {
+        return ev::throwTypeError("KernelModule.knobGradGrid: expects (fnName, knobNameOrArray, gridDim?)");
+    }
+    const std::string fnName = ev::toUtf8(args[0]);
+    std::vector<std::string> knobNames;
+    if (ev::isString(args[1])) {
+        knobNames.push_back(ev::toUtf8(args[1]));
+    } else if (ev::isObject(args[1])) {
+        ev::Persistent arr(args[1]);
+        const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(arr.get(), "length")));
+        for (uint32_t i = 0; i < n; ++i) {
+            const Value el = ev::getElement(arr.get(), i);
+            if (!ev::isString(el)) {
+                return ev::throwTypeError("KernelModule.knobGradGrid: knob array elements must be strings");
+            }
+            knobNames.push_back(ev::toUtf8(el));
+        }
+    } else {
+        return ev::throwTypeError("KernelModule.knobGradGrid: second argument must be a knob name string or array");
+    }
+    uint32_t gridDim = 1;
+    if (args.size() >= 3 && !ev::isUndefined(args[2]) && !ev::isNull(args[2])) {
+        if (!ev::isNumber(args[2])) {
+            return ev::throwTypeError("KernelModule.knobGradGrid: gridDim must be a number in 1..3");
+        }
+        const double d = ev::toDouble(args[2]);
+        if (d < 1.0 || d > 3.0) {
+            return ev::throwRangeError("KernelModule.knobGradGrid: gridDim must be 1, 2, or 3");
+        }
+        gridDim = static_cast<uint32_t>(d);
+    }
+
+    auto gradRes = compileOff([&] {
+        return h->cell->result->compile_knob_grid_grads(fnName, knobNames, gridDim);
+    });
+    if (!gradRes->ok) throwCompileError(*gradRes);
+    if (gradRes->kernels.empty()) {
+        return ev::throwError("KernelModule.knobGradGrid: no gradient reduction kernel generated");
+    }
+    auto gradCell = makeModuleCell(std::move(gradRes));
+    return makeKernelValue(gradCell, gradCell->result->kernels[0].name, "KernelModule.knobGradGrid");
+}
+
 Value js_kernelVerify(Value self, std::span<const Value>) {
     KernelHandle* h = kernelHandle(self);
     if (!h || !h->kernel) {

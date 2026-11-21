@@ -260,6 +260,51 @@ Type FnCheckState::check_grad_knob_call(Expr* e, std::optional<Type>) {
 
 namespace brokernel {
 
+namespace {
+
+bool inspect_knob_grad_target(
+    const CompileResult& src_res,
+    std::string_view fn_name,
+    DiagnosticBag& out_diags,
+    std::shared_ptr<CheckedModule>& out_checked,
+    const CheckedFunction*& out_target_fn) {
+    Compiler inspect_comp;
+    for (const auto& sp : src_res.search_paths) inspect_comp.add_search_path(sp);
+    for (const auto& [mn, ms] : src_res.loaded_modules) inspect_comp.register_module(mn, ms);
+    if (src_res.module_resolver) inspect_comp.set_module_resolver(src_res.module_resolver);
+    DiagnosticBag inspect_diags;
+    auto ast = parse_source(src_res.source, src_res.file_name, inspect_diags);
+    if (!ast || inspect_diags.has_errors()) {
+        out_diags.merge_from(inspect_diags);
+        return false;
+    }
+    std::filesystem::path root_dir = std::filesystem::path(src_res.file_name).parent_path();
+    out_checked = check_module(*ast, inspect_comp.modules(), inspect_diags, root_dir, {},
+                               src_res.options.knob_overrides.empty() ? nullptr : &src_res.options.knob_overrides,
+                               src_res.options.runtime_knobs);
+    if (!out_checked || inspect_diags.has_errors()) {
+        out_diags.merge_from(inspect_diags);
+        return false;
+    }
+    out_target_fn = out_checked->find_function(fn_name);
+    if (!out_target_fn) {
+        out_diags.error({src_res.file_name, 1, 1, 0, 0},
+                        "function '" + std::string(fn_name) + "' not found");
+        return false;
+    }
+    return true;
+}
+
+const ConstInfo* find_exported_knob(const CheckedModule& checked, const std::string& name) {
+    for (const auto& c : checked.exported_constants) {
+        if (!c.is_knob) continue;
+        if (c.name == name || (c.module + "::" + c.name) == name) return &c;
+    }
+    return nullptr;
+}
+
+} // namespace
+
 CompileResult CompileResult::compile_knob_grads(
     std::string_view fn_name,
     const std::vector<std::string>& knob_names) const {
@@ -269,43 +314,16 @@ CompileResult CompileResult::compile_knob_grads(
         return out;
     }
 
-    // Inspect target function signature via check_module so parameter types match even if not an @kernel.
-    Compiler inspect_comp;
-    for (const auto& sp : search_paths) inspect_comp.add_search_path(sp);
-    for (const auto& [mn, ms] : loaded_modules) inspect_comp.register_module(mn, ms);
-    if (module_resolver) inspect_comp.set_module_resolver(module_resolver);
-    DiagnosticBag inspect_diags;
-    auto ast = parse_source(source, file_name, inspect_diags);
-    if (!ast || inspect_diags.has_errors()) {
-        out.diagnostics.merge_from(inspect_diags);
+    std::shared_ptr<CheckedModule> checked;
+    const CheckedFunction* target_fn = nullptr;
+    if (!inspect_knob_grad_target(*this, fn_name, out.diagnostics, checked, target_fn)) {
         return out;
     }
-    std::filesystem::path root_dir = std::filesystem::path(file_name).parent_path();
-    auto checked = check_module(*ast, inspect_comp.modules(), inspect_diags, root_dir, {},
-                                options.knob_overrides.empty() ? nullptr : &options.knob_overrides,
-                                options.runtime_knobs);
-    if (!checked || inspect_diags.has_errors()) {
-        out.diagnostics.merge_from(inspect_diags);
-        return out;
-    }
-    const CheckedFunction* target_fn = checked->find_function(fn_name);
-    if (!target_fn) {
-        out.diagnostics.error({file_name, 1, 1, 0, 0}, "compile_knob_grads: function '" + std::string(fn_name) + "' not found");
-        return out;
-    }
-
-    auto find_knob_info = [&](const std::string& name) -> const ConstInfo* {
-        for (const auto& c : checked->exported_constants) {
-            if (!c.is_knob) continue;
-            if (c.name == name || (c.module + "::" + c.name) == name) return &c;
-        }
-        return nullptr;
-    };
 
     std::string augmented = source;
     augmented += "\n";
     for (const std::string& kname : knob_names) {
-        const ConstInfo* ki = find_knob_info(kname);
+        const ConstInfo* ki = find_exported_knob(*checked, kname);
         if (!ki) {
             out.diagnostics.error({file_name, 1, 1, 0, 0}, "compile_knob_grads: @knob '" + kname + "' not found");
             return out;
@@ -346,6 +364,128 @@ CompileResult CompileResult::compile_knob_grads(
     }
     compiled.kernels = std::move(grad_kernels);
     return compiled;
+}
+
+CompileResult CompileResult::compile_knob_grid_grads(
+    std::string_view fn_name,
+    const std::vector<std::string>& knob_names,
+    uint32_t grid_dim) const {
+    CompileResult out;
+    if (grid_dim < 1 || grid_dim > 3) {
+        out.diagnostics.error({file_name, 1, 1, 0, 0},
+                              "compile_knob_grid_grads: grid_dim must be 1, 2, or 3");
+        return out;
+    }
+    if (knob_names.empty()) {
+        out.diagnostics.error({file_name, 1, 1, 0, 0},
+                              "compile_knob_grid_grads: at least one knob name is required");
+        return out;
+    }
+
+    std::shared_ptr<CheckedModule> checked;
+    const CheckedFunction* target_fn = nullptr;
+    if (!inspect_knob_grad_target(*this, fn_name, out.diagnostics, checked, target_fn)) {
+        return out;
+    }
+    if (!target_fn->return_type.is_f32()) {
+        out.diagnostics.error(target_fn->span,
+                              "compile_knob_grid_grads: target function '" + std::string(fn_name) +
+                                  "' must return 'f32', got '" + target_fn->return_type.to_string() + "'");
+        return out;
+    }
+
+    std::vector<const ConstInfo*> knob_infos;
+    knob_infos.reserve(knob_names.size());
+    for (const std::string& kname : knob_names) {
+        const ConstInfo* ki = find_exported_knob(*checked, kname);
+        if (!ki) {
+            out.diagnostics.error({file_name, 1, 1, 0, 0},
+                                  "compile_knob_grid_grads: @knob '" + kname + "' not found");
+            return out;
+        }
+        if (!ki->type.is_float() || ki->type.scalar != ScalarKind::F32 ||
+            (!ki->type.is_scalar() && !ki->type.is_vector())) {
+            out.diagnostics.error({file_name, 1, 1, 0, 0},
+                                  "compile_knob_grid_grads: @knob '" + kname +
+                                      "' must be 'f32' or 'vec{2,3,4}<f32>', got '" +
+                                      ki->type.to_string() + "'");
+            return out;
+        }
+        knob_infos.push_back(ki);
+    }
+
+    bool has_grid_param = false;
+    for (const auto& p : target_fn->params) {
+        if (p.role == ParamRole::Grid) {
+            if (p.type.dimension != grid_dim) {
+                out.diagnostics.error(p.span,
+                                      "compile_knob_grid_grads: target function grid dimension (" +
+                                          std::to_string(p.type.dimension) +
+                                          ") does not match requested grid_dim (" +
+                                          std::to_string(grid_dim) + ")");
+                return out;
+            }
+            has_grid_param = true;
+            break;
+        }
+    }
+
+    const std::string safe_fn = detail::sanitize_ident(std::string(fn_name));
+    const std::string synth_name = "grad_grid_" + safe_fn;
+
+    std::string augmented = source;
+    augmented += "\n";
+    if (target_fn->cpu_only) augmented += "@cpu ";
+    augmented += "@kernel @grid(" + std::to_string(grid_dim) + ") pub fn " + synth_name + "(";
+    bool need_comma = false;
+    if (!has_grid_param) {
+        augmented += "_gg: grid<" + std::to_string(grid_dim) + ">";
+        need_comma = true;
+    }
+    for (const auto& p : target_fn->params) {
+        if (need_comma) augmented += ", ";
+        augmented += p.name + ": " + p.type.to_string();
+        need_comma = true;
+    }
+    if (need_comma) augmented += ", ";
+    augmented += "__grad_out: rw_store<f32, 1>) {\n";
+
+    static const char* kVecComps[4] = {"x", "y", "z", "w"};
+    uint32_t slot_offset = 0;
+    for (size_t i = 0; i < knob_names.size(); ++i) {
+        const std::string& kname = knob_names[i];
+        const ConstInfo* ki = knob_infos[i];
+        std::string grad_call = "grad_knob(" + std::string(fn_name) + ", " + kname;
+        for (const auto& p : target_fn->params) {
+            grad_call += ", " + p.name;
+        }
+        grad_call += ")";
+        if (ki->type.is_scalar()) {
+            augmented += "    __grad_out.atomic_add(" + std::to_string(slot_offset) + ", " + grad_call + ");\n";
+            slot_offset += 1;
+        } else {
+            const uint32_t dim = ki->type.dimension;
+            const std::string vname = "_ggv" + std::to_string(i);
+            augmented += "    let " + vname + ": " + ki->type.to_string() + " = " + grad_call + ";\n";
+            for (uint32_t c = 0; c < dim; ++c) {
+                augmented += "    __grad_out.atomic_add(" + std::to_string(slot_offset + c) + ", " +
+                             vname + "." + kVecComps[c] + ");\n";
+            }
+            slot_offset += dim;
+        }
+    }
+    augmented += "}\n";
+
+    Compiler synth;
+    for (const auto& sp : search_paths) synth.add_search_path(sp);
+    for (const auto& [mn, ms] : loaded_modules) synth.register_module(mn, ms);
+    if (module_resolver) synth.set_module_resolver(module_resolver);
+
+    CompileOptions copts = options;
+    copts.runtime_knobs = true;
+    copts.entry_name = synth_name;
+    copts.compile_all_functions = false;
+    return synth.compile_source(augmented, file_name, copts);
 }
 
 } // namespace brokernel

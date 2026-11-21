@@ -393,24 +393,32 @@ const CompileResult* unwrapModule(Value self) {
     return h ? h->cell->result.get() : nullptr;
 }
 
+} // namespace
+
+Value makeKernelValue(std::shared_ptr<ModuleCell> cell, const std::string& name, const char* what) {
+    const std::shared_ptr<const CompileResult>& result = cell->result;
+    const CompiledKernel* k = result->find_kernel(name);
+    if (!k) return ev::throwError(std::string(what) + ": no kernel '" + name + "'");
+    auto handle = std::make_unique<KernelHandle>();
+    handle->module_result = result;
+    handle->kernel = std::shared_ptr<const CompiledKernel>(result, k);
+    handle->owner = cell;
+    handle->generation = cell->generation;
+    if (k->grid_dim > 0 && !k->spirv.words.empty() && t_device && t_device->available()) {
+        std::string err;
+        handle->program = t_device->createProgram(*k, &err);
+    }
+    return g_kernelClass.createInstance(std::move(handle));
+}
+
+namespace {
+
 void decorateModule(ev::ObjectBuilder& b) {
     b.def("kernel", 1, [](Value self, std::span<const Value> args) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
         if (!h) return ev::throwTypeError("KernelModule.kernel: invalid receiver");
         const std::string name = !args.empty() && ev::isString(args[0]) ? ev::toUtf8(args[0]) : "";
-        const std::shared_ptr<const CompileResult>& result = h->cell->result;
-        const CompiledKernel* k = result->find_kernel(name);
-        if (!k) return ev::throwError("KernelModule.kernel: no kernel '" + name + "'");
-        auto handle = std::make_unique<KernelHandle>();
-        handle->module_result = result;
-        handle->kernel = std::shared_ptr<const CompiledKernel>(result, k);
-        handle->owner = h->cell;
-        handle->generation = h->cell->generation;
-        if (k->grid_dim > 0 && !k->spirv.words.empty() && t_device && t_device->available()) {
-            std::string err;
-            handle->program = t_device->createProgram(*k, &err);
-        }
-        return g_kernelClass.createInstance(std::move(handle));
+        return brokernel::api::makeKernelValue(h->cell, name, "KernelModule.kernel");
     });
     b.accessor("kernels", [](Value self, std::span<const Value>) -> Value {
         const CompileResult* r = unwrapModule(self);

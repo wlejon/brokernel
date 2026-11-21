@@ -264,17 +264,27 @@ ModuleRegistry::ModuleRegistry() {
     }
 }
 
+namespace {
+
+const std::string& std_noise_source() {
+    static const std::string* src = [] {
+        auto* s = new std::string();
+        s->reserve(64000);
+        append_std_noise_core(*s);
+        append_std_noise_3d(*s);
+        append_std_noise_fractal_warp(*s);
+        return s;
+    }();
+    return *src;
+}
+
+} // namespace
+
 void ModuleRegistry::register_builtin_modules() {
     register_module("math", kStdMathSource, "<builtin:math.bk>");
     aliases_["std::math"] = "math";
 
-    std::string noise_src;
-    noise_src.reserve(64000);
-    append_std_noise_core(noise_src);
-    append_std_noise_3d(noise_src);
-    append_std_noise_fractal_warp(noise_src);
-
-    register_module("noise", std::move(noise_src), "<builtin:noise.bk>");
+    register_module("noise", std_noise_source(), "<builtin:noise.bk>");
     aliases_["std::noise"] = "noise";
     aliases_["fastnoise"] = "noise";
     aliases_["std::fastnoise"] = "noise";

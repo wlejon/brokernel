@@ -39,6 +39,7 @@ struct AstCacheKeyHash {
 struct GlobalAstCache {
     std::mutex mu;
     std::unordered_map<AstCacheKey, std::shared_ptr<const ModuleAst>, AstCacheKeyHash> map;
+    std::unordered_map<const ModuleAst*, std::vector<std::pair<std::string, ConstValue>>> consts_by_ast;
     std::deque<AstCacheKey> fifo;
     uint64_t hits = 0;
     uint64_t misses = 0;
@@ -98,7 +99,11 @@ std::shared_ptr<const ModuleAst> parse_source_cached(
         if (inserted) {
             c.fifo.push_back(it->first);
             while (c.fifo.size() > kMaxAstCacheEntries) {
-                c.map.erase(c.fifo.front());
+                auto ev = c.map.find(c.fifo.front());
+                if (ev != c.map.end()) {
+                    c.consts_by_ast.erase(ev->second.get());
+                    c.map.erase(ev);
+                }
                 c.fifo.pop_front();
             }
         } else {
@@ -106,6 +111,23 @@ std::shared_ptr<const ModuleAst> parse_source_cached(
         }
     }
     return shared;
+}
+
+bool lookup_cached_module_consts(const ModuleAst* ast, std::vector<std::pair<std::string, ConstValue>>& out) {
+    if (!ast || !g_ast_cache_enabled.load(std::memory_order_acquire)) return false;
+    auto& c = global_ast_cache();
+    std::lock_guard<std::mutex> lock(c.mu);
+    auto it = c.consts_by_ast.find(ast);
+    if (it == c.consts_by_ast.end()) return false;
+    out = it->second;
+    return true;
+}
+
+void store_cached_module_consts(const ModuleAst* ast, std::vector<std::pair<std::string, ConstValue>> consts) {
+    if (!ast || !g_ast_cache_enabled.load(std::memory_order_acquire)) return;
+    auto& c = global_ast_cache();
+    std::lock_guard<std::mutex> lock(c.mu);
+    c.consts_by_ast.emplace(ast, std::move(consts));
 }
 
 AstCacheStats ast_cache_stats() {
@@ -118,6 +140,7 @@ void clear_ast_cache() {
     auto& c = global_ast_cache();
     std::lock_guard<std::mutex> lock(c.mu);
     c.map.clear();
+    c.consts_by_ast.clear();
     c.fifo.clear();
     c.hits = 0;
     c.misses = 0;

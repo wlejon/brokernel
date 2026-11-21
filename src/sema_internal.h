@@ -14,6 +14,11 @@ struct GenericEnv {
 struct ModuleScope {
     std::string name;
     const ModuleAst* ast = nullptr;
+    bool has_transitive_knob = false;
+    std::unordered_map<std::string, const FnDecl*> fn_by_name;
+    std::unordered_map<std::string, const StructDecl*> struct_by_name;
+    std::unordered_map<std::string, const ConstDecl*> const_by_name;
+    std::unordered_map<std::string, const BindingDecl*> binding_by_name;
     std::unordered_map<std::string, std::string> module_aliases; // alias -> canonical module name
     std::unordered_map<std::string, std::pair<std::string, std::string>> imported_symbols; // local -> (mod, sym)
     std::vector<std::string> wildcard_modules;

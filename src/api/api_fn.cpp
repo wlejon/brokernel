@@ -802,6 +802,7 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
     });
     b.def("structView", 2, js_moduleStructView);
     b.def("knobGrad", 2, js_moduleKnobGrad);
+    b.def("knobGradGrid", 3, js_moduleKnobGradGrid);
     b.accessor("functions", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<ModuleHandle*>(g_moduleClass.unwrap(self));
         if (!h || !h->cell->result) return ev::undefined();

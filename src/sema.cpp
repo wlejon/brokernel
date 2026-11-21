@@ -1,4 +1,5 @@
 #include "sema_internal.h"
+#include "ast_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -46,34 +47,11 @@ bool SemaContext::symbol_exists_in_module(
     auto it = modules.find(mod_name);
     if (it == modules.end() || !it->second.ast) return false;
     const auto& scope = it->second;
-    const ModuleAst* ast = scope.ast;
-    for (const auto& fn : ast->functions) {
-        if (fn.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            if (resolved_sym_out) *resolved_sym_out = sym;
-            return true;
-        }
-    }
-    for (const auto& st : ast->structs) {
-        if (st.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            if (resolved_sym_out) *resolved_sym_out = sym;
-            return true;
-        }
-    }
-    for (const auto& c : ast->consts) {
-        if (c.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            if (resolved_sym_out) *resolved_sym_out = sym;
-            return true;
-        }
-    }
-    for (const auto& r : ast->bindings) {
-        if (r.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            if (resolved_sym_out) *resolved_sym_out = sym;
-            return true;
-        }
+    if (scope.fn_by_name.count(sym) || scope.struct_by_name.count(sym) ||
+        scope.const_by_name.count(sym) || scope.binding_by_name.count(sym)) {
+        if (resolved_mod_out) *resolved_mod_out = mod_name;
+        if (resolved_sym_out) *resolved_sym_out = sym;
+        return true;
     }
     auto pit = scope.pub_imported_symbols.find(sym);
     if (pit != scope.pub_imported_symbols.end()) {
@@ -98,11 +76,9 @@ const FnDecl* SemaContext::find_fn_in_module(
     auto it = modules.find(mod_name);
     if (it == modules.end() || !it->second.ast) return nullptr;
     const auto& scope = it->second;
-    for (const auto& fn : scope.ast->functions) {
-        if (fn.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            return &fn;
-        }
+    if (auto fit = scope.fn_by_name.find(sym); fit != scope.fn_by_name.end()) {
+        if (resolved_mod_out) *resolved_mod_out = mod_name;
+        return fit->second;
     }
     auto pit = scope.pub_imported_symbols.find(sym);
     if (pit != scope.pub_imported_symbols.end()) {
@@ -123,11 +99,9 @@ const StructDecl* SemaContext::find_struct_in_module(
     auto it = modules.find(mod_name);
     if (it == modules.end() || !it->second.ast) return nullptr;
     const auto& scope = it->second;
-    for (const auto& st : scope.ast->structs) {
-        if (st.name == sym) {
-            if (resolved_mod_out) *resolved_mod_out = mod_name;
-            return &st;
-        }
+    if (auto sit = scope.struct_by_name.find(sym); sit != scope.struct_by_name.end()) {
+        if (resolved_mod_out) *resolved_mod_out = mod_name;
+        return sit->second;
     }
     auto pit = scope.pub_imported_symbols.find(sym);
     if (pit != scope.pub_imported_symbols.end()) {
@@ -196,6 +170,17 @@ bool SemaContext::load_and_index_module(
     ModuleScope scope;
     scope.name = canonical_name;
     scope.ast = &ast;
+    scope.fn_by_name.reserve(ast.functions.size());
+    for (const auto& fn : ast.functions) scope.fn_by_name.emplace(fn.name, &fn);
+    scope.struct_by_name.reserve(ast.structs.size());
+    for (const auto& st : ast.structs) scope.struct_by_name.emplace(st.name, &st);
+    scope.const_by_name.reserve(ast.consts.size());
+    for (const auto& c : ast.consts) {
+        scope.const_by_name.emplace(c.name, &c);
+        if (c.is_knob) scope.has_transitive_knob = true;
+    }
+    scope.binding_by_name.reserve(ast.bindings.size());
+    for (const auto& r : ast.bindings) scope.binding_by_name.emplace(r.name, &r);
     modules.emplace(canonical_name, std::move(scope));
 
     // Process imports first
@@ -215,6 +200,9 @@ bool SemaContext::load_and_index_module(
         load_and_index_module(*imported, target_canon, next_dir);
 
         auto& cur_scope = modules[canonical_name];
+        if (auto imp_it = modules.find(target_canon); imp_it != modules.end() && imp_it->second.has_transitive_knob) {
+            cur_scope.has_transitive_knob = true;
+        }
         std::string local_mod_name = imp.alias;
         if (local_mod_name.empty()) {
             if (!imp.module_path.empty()) {
@@ -286,13 +274,9 @@ const FnDecl* SemaContext::find_fn_decl(
     }
 
     // 1. Current module
-    if (scope.ast) {
-        for (const auto& fn : scope.ast->functions) {
-            if (fn.name == name) {
-                if (resolved_mod_out) *resolved_mod_out = current_mod;
-                return &fn;
-            }
-        }
+    if (auto fit = scope.fn_by_name.find(name); fit != scope.fn_by_name.end()) {
+        if (resolved_mod_out) *resolved_mod_out = current_mod;
+        return fit->second;
     }
     // 2. Selective imports
     auto sym_it = scope.imported_symbols.find(name);
@@ -332,13 +316,9 @@ const StructDecl* SemaContext::find_struct_decl(
         return nullptr;
     }
 
-    if (scope.ast) {
-        for (const auto& st : scope.ast->structs) {
-            if (st.name == name) {
-                if (resolved_mod_out) *resolved_mod_out = current_mod;
-                return &st;
-            }
-        }
+    if (auto sit = scope.struct_by_name.find(name); sit != scope.struct_by_name.end()) {
+        if (resolved_mod_out) *resolved_mod_out = current_mod;
+        return sit->second;
     }
     auto sym_it = scope.imported_symbols.find(name);
     if (sym_it != scope.imported_symbols.end()) {
@@ -821,31 +801,49 @@ std::unique_ptr<CheckedModule> check_module(
 
     // Evaluate module-level constants and non-generic structs in dependency order
     detail::GenericEnv empty_env;
+    std::vector<std::pair<std::string, ConstValue>> cached_consts;
     for (const auto& mod_name : ctx.module_order) {
-        const ModuleAst* ast = ctx.modules[mod_name].ast;
+        const auto& mod_scope = ctx.modules[mod_name];
+        const ModuleAst* ast = mod_scope.ast;
         if (!ast) continue;
 
-        for (const auto& const_decl : ast->consts) {
-            auto cv_opt = ctx.eval_const_expr(const_decl.value.get(), mod_name, empty_env, {});
-            if (!cv_opt) {
-                diags.error(const_decl.span, "constant '" + const_decl.name + "' initializer must be a compile-time constant expression");
-                continue;
-            }
-            ConstValue cv = *cv_opt;
-            if (const_decl.type) {
-                Type expected = ctx.resolve_type(const_decl.type.get(), mod_name, empty_env);
-                cv = detail::convert_const_value(cv, expected, ctx.out->types);
-            }
-            if (const_decl.is_knob && knob_overrides) {
-                auto oit = knob_overrides->find(mod_name + "::" + const_decl.name);
-                if (oit == knob_overrides->end()) oit = knob_overrides->find(const_decl.name);
-                if (oit != knob_overrides->end()) {
-                    cv = detail::convert_const_value(oit->second, cv.type, ctx.out->types);
+        if (!mod_scope.has_transitive_knob && detail::lookup_cached_module_consts(ast, cached_consts)) {
+            for (const auto& [cname, cv] : cached_consts) {
+                ctx.out->constants[mod_name + "::" + cname] = cv;
+                if (mod_name == root_name) {
+                    ctx.out->constants[cname] = cv;
                 }
             }
-            ctx.out->constants[mod_name + "::" + const_decl.name] = cv;
-            if (mod_name == root_name) {
-                ctx.out->constants[const_decl.name] = cv;
+        } else {
+            cached_consts.clear();
+            bool store_consts = !mod_scope.has_transitive_knob && !ast->consts.empty();
+            for (const auto& const_decl : ast->consts) {
+                auto cv_opt = ctx.eval_const_expr(const_decl.value.get(), mod_name, empty_env, {});
+                if (!cv_opt) {
+                    diags.error(const_decl.span, "constant '" + const_decl.name + "' initializer must be a compile-time constant expression");
+                    store_consts = false;
+                    continue;
+                }
+                ConstValue cv = *cv_opt;
+                if (const_decl.type) {
+                    Type expected = ctx.resolve_type(const_decl.type.get(), mod_name, empty_env);
+                    cv = detail::convert_const_value(cv, expected, ctx.out->types);
+                }
+                if (const_decl.is_knob && knob_overrides) {
+                    auto oit = knob_overrides->find(mod_name + "::" + const_decl.name);
+                    if (oit == knob_overrides->end()) oit = knob_overrides->find(const_decl.name);
+                    if (oit != knob_overrides->end()) {
+                        cv = detail::convert_const_value(oit->second, cv.type, ctx.out->types);
+                    }
+                }
+                ctx.out->constants[mod_name + "::" + const_decl.name] = cv;
+                if (mod_name == root_name) {
+                    ctx.out->constants[const_decl.name] = cv;
+                }
+                if (store_consts) cached_consts.emplace_back(const_decl.name, cv);
+            }
+            if (store_consts) {
+                detail::store_cached_module_consts(ast, std::move(cached_consts));
             }
         }
 
@@ -883,11 +881,10 @@ std::unique_ptr<CheckedModule> check_module(
             }
             for (const auto& [local_sym, target] : mscope.pub_imported_symbols) {
                 auto tmit = ctx.modules.find(target.first);
-                if (tmit != ctx.modules.end() && tmit->second.ast) {
-                    for (const auto& cd : tmit->second.ast->consts) {
-                        if (cd.name == target.second) {
-                            add_const_info(local_sym, target.first, cd);
-                        }
+                if (tmit != ctx.modules.end()) {
+                    if (auto cit = tmit->second.const_by_name.find(target.second);
+                        cit != tmit->second.const_by_name.end()) {
+                        add_const_info(local_sym, target.first, *cit->second);
                     }
                 }
             }

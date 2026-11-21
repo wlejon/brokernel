@@ -317,13 +317,15 @@ Value js_moduleStructView(Value self, std::span<const Value> args);
 bool tryFastEval(KernelHandle& h, std::span<const Value> args, Value& out);
 Value js_kernelExportNative(Value self, std::span<const Value> args);
 
-// Runtime @knobs & knobGrad (api_knobs.cpp, helpers from api_fn.cpp).
+// Runtime @knobs & knobGrad (api_knobs.cpp, helpers from api.cpp/api_fn.cpp).
 std::unordered_map<std::string, ConstValue> parseKnobOverrides(Value obj, const std::string& what);
+Value makeKernelValue(std::shared_ptr<ModuleCell> cell, const std::string& kernel_name, const char* what);
 Value makeFnValueFromResult(std::shared_ptr<ModuleCell> cell,
                             std::shared_ptr<const CompileResult> res,
                             const std::string& fn_name);
 Value js_kernelSetKnobs(Value self, std::span<const Value> args);
 Value js_moduleKnobGrad(Value self, std::span<const Value> args);
+Value js_moduleKnobGradGrid(Value self, std::span<const Value> args);
 void syncKernelTelemetry(KernelHandle& h, bool gpu);
 void finishKernelTelemetry(KernelHandle& h, bool gpu);
 void decorateKernelTargetExtras(ev::ObjectBuilder& b);
