@@ -28,6 +28,36 @@ std::function<std::shared_ptr<const CompiledKernel>()> probed_variant_builder(co
     };
 }
 
+std::function<std::string(std::string* err)> ptx_variant_builder(const CompileResult& res,
+                                                                 const std::string& kernel) {
+    CompileOptions popts = res.options;
+    popts.emit_ptx = true;
+    popts.emit_spirv = false;
+    popts.compile_cpu = false;
+    popts.entry_name = kernel;
+    return [src = res.source, fname = res.file_name, popts, mods = res.loaded_modules, sps = res.search_paths,
+            resolver = res.module_resolver](std::string* err) -> std::string {
+        try {
+            Compiler c;
+            for (const auto& sp : sps) c.add_search_path(sp);
+            for (const auto& [mn, ms] : mods) c.register_module(mn, ms);
+            if (resolver) c.set_module_resolver(resolver);
+            auto pres = c.compile_source(src, fname, popts);
+            if (!pres.ok || pres.kernels.empty() || pres.kernels.front().ptx.empty()) {
+                if (err) {
+                    const std::string d = pres.diagnostics.format_all();
+                    *err = d.empty() ? ("failed to emit PTX for kernel '" + popts.entry_name + "'") : d;
+                }
+                return {};
+            }
+            return std::move(pres.kernels.front().ptx);
+        } catch (const std::exception& ex) {
+            if (err) *err = ex.what();
+            return {};
+        }
+    };
+}
+
 std::shared_ptr<CompiledKernel::CpuBuild> new_cpu_build(const CompileOptions& opts) {
     auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
     cpu->options.opt_level = opts.opt_level;
@@ -74,6 +104,32 @@ CompileResult CompileResult::with_sources(const std::unordered_map<std::string, 
     compiler.set_module_resolver(use_resolver ? module_resolver : ModuleRegistry::ModuleResolver{});
     auto root = sources.find(file_name);
     return compiler.compile_source(root != sources.end() ? root->second : source, file_name, options);
+}
+
+const std::string& CompiledKernel::ensure_ptx(std::string* err) const {
+    static const std::string kEmpty;
+    if (!ptx.empty()) return ptx;
+    if (stage != Stage::Compute || cpu_only || uses_f64) {
+        if (err) *err = "kernel '" + name + "' cannot be compiled to PTX";
+        return kEmpty;
+    }
+    if (!gpu_cache_) {
+        if (err) *err = "kernel '" + name + "' has no PTX cache";
+        return kEmpty;
+    }
+    std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+    if (!gpu_cache_->ptx_tried) {
+        gpu_cache_->ptx_tried = true;
+        if (build_ptx_variant) {
+            gpu_cache_->ptx_cached = build_ptx_variant(&gpu_cache_->ptx_error);
+        } else {
+            gpu_cache_->ptx_error = "kernel '" + name + "' has no PTX builder";
+        }
+    }
+    if (gpu_cache_->ptx_cached.empty() && err) {
+        *err = gpu_cache_->ptx_error.empty() ? ("kernel '" + name + "' PTX compilation failed") : gpu_cache_->ptx_error;
+    }
+    return gpu_cache_->ptx_cached;
 }
 
 } // namespace brokernel

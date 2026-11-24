@@ -165,6 +165,9 @@ CompileResult Compiler::compile_uncached(
         ck.probes = fn->probes;
         ck.probes_compiled = opts.enable_probes && !fn->probes.empty();
         if (!opts.enable_probes && !fn->probes.empty()) ck.build_probed_variant = detail::probed_variant_builder(res, ck.name);
+        if (!opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
+            ck.build_ptx_variant = detail::ptx_variant_builder(res, ck.name);
+        }
         ck.uses_barriers_or_shared = lowered.uses_barriers_or_shared;
         ck.return_type = fn->return_type;
         ck.return_leaf_kinds = checked->types.flatten_scalars(fn->return_type);

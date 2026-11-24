@@ -14,6 +14,9 @@ namespace brokernel::detail {
 std::function<std::shared_ptr<const CompiledKernel>()> probed_variant_builder(const CompileResult& res,
                                                                               const std::string& kernel);
 
+std::function<std::string(std::string* err)> ptx_variant_builder(const CompileResult& res,
+                                                                 const std::string& kernel);
+
 // A CPU build with the code generator's options for `opts`, nothing lowered.
 std::shared_ptr<CompiledKernel::CpuBuild> new_cpu_build(const CompileOptions& opts);
 

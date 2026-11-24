@@ -315,6 +315,7 @@ public:
     uint64_t code_hash = 0;
     bool probes_compiled = false;
     std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
+    std::function<std::string(std::string* err)> build_ptx_variant;
     Type return_type = Type::void_type();
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
@@ -332,6 +333,8 @@ public:
     std::string msl;
     std::string msl_entry;
     bool spirv_equivalent = false;
+
+    const std::string& ensure_ptx(std::string* err = nullptr) const;
 
     KernelVerifyReport verify() const;
 
@@ -575,6 +578,9 @@ private:
         std::mutex mu;
         std::unique_ptr<brass::gpu::VulkanModule> module;
         std::shared_ptr<const CompiledKernel> probed_variant;
+        bool ptx_tried = false;
+        std::string ptx_cached;
+        std::string ptx_error;
     };
     std::shared_ptr<GpuCache> gpu_cache_ = std::make_shared<GpuCache>();
 };
