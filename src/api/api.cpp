@@ -142,37 +142,44 @@ Value js_run(Value self, std::span<const Value> args) {
 // kernel.dispatch(grid, ...args): a grid kernel over its grid, on the GPU,
 // after every dispatch so far. Its stores are KernelBuffers; a kernel that
 // returns a value returns a new KernelBuffer of one value per cell.
-Value js_dispatch(Value self, std::span<const Value> args) {
+// (`counts`: the buffer a counted dispatch reads its thread-group counts
+// from, at `offset`; null for a dispatch over the whole grid.)
+Value dispatchKernel(Value self, std::span<const Value> args, GpuBuffer* counts, size_t offset, const std::string& what) {
     KernelHandle* h = kernelHandle(self);
-    if (!h) return ev::throwTypeError("Kernel.dispatch: invalid receiver");
+    if (!h) return ev::throwTypeError(what + ": invalid receiver");
     const CompiledKernel& k = *h->kernel;
     if (!t_device || !t_device->available()) {
-        return ev::throwError("Kernel.dispatch: this realm has no GPU device (bro.kernel.gpu is false)");
+        return ev::throwError(what + ": this realm has no GPU device (bro.kernel.gpu is false)");
     }
-    if (k.grid_dim == 0) return ev::throwTypeError("Kernel.dispatch: '" + k.name + "' is a point kernel; use eval()");
-    if (args.empty()) return ev::throwTypeError("Kernel.dispatch: the first argument is the grid");
-    const GridShape shape = shapeArg(args[0], k, "Kernel.dispatch");
-    ArgPack pack(k, args.subspan(1), "Kernel.dispatch", /*gpu=*/true);
+    if (k.grid_dim == 0) return ev::throwTypeError(what + ": '" + k.name + "' is a point kernel; use eval()");
+    if (args.empty()) return ev::throwTypeError(what + ": the grid is missing");
+    const GridShape shape = shapeArg(args[0], k, what);
+    ArgPack pack(k, args.subspan(1), what, /*gpu=*/true);
 
     std::string err;
     if (!h->program) {
         h->program = t_device->createProgram(k, &err);
-        if (!h->program) return ev::throwError("Kernel.dispatch: " + err);
+        if (!h->program) return ev::throwError(what + ": " + err);
     }
     std::shared_ptr<GpuBuffer> returns;
     if (const size_t bytes = k.gpu_return_bytes(shape)) {
         returns = allocateBuffer(bytes, &err);
-        if (!returns) return ev::throwError("Kernel.dispatch: " + err);
+        if (!returns) return ev::throwError(what + ": " + err);
     }
     GpuLaunch launch;
     syncKernelTelemetry(*h, /*gpu=*/true);
     if (!k.gpu_launch(shape, pack.gpuArgs(), returns ? returns->address() : 0, launch, &err) ||
-        !t_device->dispatch(*h->program, k, launch, &err)) {
-        return ev::throwError("Kernel.dispatch: " + err);
+        !(counts ? t_device->dispatchCounted(*h->program, k, launch, *counts, offset, &err)
+                 : t_device->dispatch(*h->program, k, launch, &err))) {
+        return ev::throwError(what + ": " + err);
     }
     finishKernelTelemetry(*h, /*gpu=*/true);
     pack.finishGpu();
     return returns ? makeBuffer(std::move(returns)) : ev::undefined();
+}
+
+Value js_dispatch(Value self, std::span<const Value> args) {
+    return dispatchKernel(self, args, nullptr, 0, "Kernel.dispatch");
 }
 
 // A byte offset argument (default 0).
@@ -190,6 +197,23 @@ GpuBuffer* unwrapBuffer(Value self, const std::string& what) {
     if (!h) ev::throwTypeError(what + ": invalid receiver");
     if (!h->buffer) ev::throwError(what + ": the KernelBuffer has been destroyed");
     return h->buffer.get();
+}
+
+// kernel.dispatchCounted(counts, byteOffset, grid, ...args): dispatch(grid,
+// ...args) with its thread-group counts read on the GPU when it runs: three
+// u32 at byteOffset of the KernelBuffer `counts` (each at most the grid's own,
+// grid / localSize rounded up), which an earlier dispatch may have written.
+// The kernel is told it has `grid`: it bounds its own work by the count.
+Value js_dispatchCounted(Value self, std::span<const Value> args) {
+    const std::string what = "Kernel.dispatchCounted";
+    if (args.size() < 3) return ev::throwTypeError(what + ": (counts, byteOffset, grid, ...args)");
+    auto* bh = static_cast<BufferHandle*>(g_bufferClass.unwrap(args[0]));
+    if (!bh || !bh->buffer) return ev::throwTypeError(what + ": counts is a KernelBuffer");
+    const size_t offset = offsetArg(args, 1, what);
+    if (offset % 4 != 0 || offset + 12 > bh->buffer->bytes()) {
+        return ev::throwRangeError(what + ": three u32 at a multiple of 4 inside counts");
+    }
+    return dispatchKernel(self, args.subspan(2), bh->buffer.get(), offset, what);
 }
 
 // buffer.write(source, byteOffset = 0): `source`'s bytes (a typed array),
@@ -347,9 +371,15 @@ void decorateKernel(ev::ObjectBuilder& b) {
     b.def("eval", 0, js_eval);
     b.def("run", 1, js_run);
     b.def("dispatch", 1, js_dispatch);
+    b.def("dispatchCounted", 3, js_dispatchCounted);
     b.accessor("name", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);
         return k ? ev::fromUtf8(k->name) : ev::undefined();
+    });
+    // (The threads of a group along x: what a counted dispatch's counts are in.)
+    b.accessor("localSize", [](Value self, std::span<const Value>) -> Value {
+        const CompiledKernel* k = unwrapKernel(self);
+        return k ? ev::fromDouble(k->local_size[0]) : ev::undefined();
     });
     b.accessor("gridDim", [](Value self, std::span<const Value>) -> Value {
         const CompiledKernel* k = unwrapKernel(self);

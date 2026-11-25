@@ -161,6 +161,16 @@ public:
     /// One dispatch of `program` (made from `kernel`).
     virtual bool dispatch(GpuProgram& program, const CompiledKernel& kernel, const GpuLaunch& launch,
                           std::string* err) = 0;
+    /// The same dispatch with its thread-group counts read on the GPU when
+    /// it runs: three u32 at `offset` bytes into `counts`, which earlier
+    /// work may have written (`launch.groups` is their upper bound, the
+    /// grid the kernel is told it has). A device without it fails.
+    virtual bool dispatchCounted(GpuProgram& program, const CompiledKernel& kernel, const GpuLaunch& launch,
+                                 GpuBuffer& counts, size_t offset, std::string* err) {
+        (void)program; (void)kernel; (void)launch; (void)counts; (void)offset;
+        if (err) *err = "this GPU device has no counted dispatch";
+        return false;
+    }
 };
 
 /// The device the current thread's realms dispatch on (null: none). Set it
