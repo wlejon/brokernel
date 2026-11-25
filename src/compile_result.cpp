@@ -58,6 +58,43 @@ std::function<std::string(std::string* err)> ptx_variant_builder(const CompileRe
     };
 }
 
+std::function<MslArtifact(std::string* err)> msl_variant_builder(const CompileResult& res,
+                                                                 const std::string& kernel) {
+    CompileOptions popts = res.options;
+    popts.emit_msl = true;
+    popts.emit_spirv = false;
+    popts.compile_cpu = false;
+    popts.entry_name = kernel;
+    return [src = res.source, fname = res.file_name, popts, mods = res.loaded_modules, sps = res.search_paths,
+            resolver = res.module_resolver](std::string* err) -> MslArtifact {
+        try {
+            Compiler c;
+            for (const auto& sp : sps) c.add_search_path(sp);
+            for (const auto& [mn, ms] : mods) c.register_module(mn, ms);
+            if (resolver) c.set_module_resolver(resolver);
+            auto pres = c.compile_source(src, fname, popts);
+            if (!pres.ok || pres.kernels.empty() || pres.kernels.front().msl.empty()) {
+                if (err) {
+                    const std::string d = pres.diagnostics.format_all();
+                    *err = d.empty() ? ("failed to emit MSL for kernel '" + popts.entry_name + "'") : d;
+                }
+                return {};
+            }
+            auto& fk = pres.kernels.front();
+            MslArtifact out;
+            out.source = std::move(fk.msl);
+            out.entry_name = std::move(fk.msl_entry);
+            out.num_buffers = fk.msl_num_buffers;
+            out.scalar_params_bytes = fk.msl_scalar_params_bytes;
+            out.scalar_param_offsets = std::move(fk.msl_scalar_param_offsets);
+            return out;
+        } catch (const std::exception& ex) {
+            if (err) *err = ex.what();
+            return {};
+        }
+    };
+}
+
 std::shared_ptr<CompiledKernel::CpuBuild> new_cpu_build(const CompileOptions& opts) {
     auto cpu = std::make_shared<CompiledKernel::CpuBuild>();
     cpu->options.opt_level = opts.opt_level;
@@ -130,6 +167,34 @@ const std::string& CompiledKernel::ensure_ptx(std::string* err) const {
         *err = gpu_cache_->ptx_error.empty() ? ("kernel '" + name + "' PTX compilation failed") : gpu_cache_->ptx_error;
     }
     return gpu_cache_->ptx_cached;
+}
+
+const MslArtifact& CompiledKernel::ensure_msl(std::string* err) const {
+    static const MslArtifact kEmpty;
+    if (stage != Stage::Compute || cpu_only || uses_f64) {
+        if (err) *err = "kernel '" + name + "' cannot be compiled to MSL";
+        return kEmpty;
+    }
+    if (!gpu_cache_) {
+        if (err) *err = "kernel '" + name + "' has no MSL cache";
+        return kEmpty;
+    }
+    std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+    if (!gpu_cache_->msl_tried) {
+        gpu_cache_->msl_tried = true;
+        if (!msl.empty()) {
+            gpu_cache_->msl_cached = MslArtifact{
+                msl, msl_entry, msl_num_buffers, msl_scalar_params_bytes, msl_scalar_param_offsets};
+        } else if (build_msl_variant) {
+            gpu_cache_->msl_cached = build_msl_variant(&gpu_cache_->msl_error);
+        } else {
+            gpu_cache_->msl_error = "kernel '" + name + "' has no MSL builder";
+        }
+    }
+    if (gpu_cache_->msl_cached.source.empty() && err) {
+        *err = gpu_cache_->msl_error.empty() ? ("kernel '" + name + "' MSL compilation failed") : gpu_cache_->msl_error;
+    }
+    return gpu_cache_->msl_cached;
 }
 
 } // namespace brokernel

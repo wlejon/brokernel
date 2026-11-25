@@ -4,6 +4,7 @@
 #include "kernel_report.h"
 
 #include <brass/mir/gpu_opt.hpp>
+#include <brass/mir/gpu_portability.hpp>
 #include <brass/target/host_cpu.hpp>
 #include <brass/target/ptx_target.hpp>
 #include <brass/verify/gpu_equiv.hpp>
@@ -168,6 +169,9 @@ CompileResult Compiler::compile_uncached(
         if (!opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
             ck.build_ptx_variant = detail::ptx_variant_builder(res, ck.name);
         }
+        if (!opts.emit_msl && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
+            ck.build_msl_variant = detail::msl_variant_builder(res, ck.name);
+        }
         ck.uses_barriers_or_shared = lowered.uses_barriers_or_shared;
         ck.return_type = fn->return_type;
         ck.return_leaf_kinds = checked->types.flatten_scalars(fn->return_type);
@@ -204,6 +208,13 @@ CompileResult Compiler::compile_uncached(
                 gpu_opts.enable_smt_guard_elim = (opts.opt_level >= 3);
                 brass::optimize_gpu_function(*lowered.gpu_function, *lowered.gpu_module, gpu_opts);
                 res.timings.gpu_opt_ms += ms_since(t_opt0, clock::now());
+            }
+            if (lowered.gpu_function && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
+                brass::DiagnosticReporter port_diag;
+                ck.gpu_portability_ok = brass::verify_gpu_portability(*lowered.gpu_function, {}, &port_diag);
+                if (!ck.gpu_portability_ok) {
+                    ck.gpu_portability_violations.push_back(port_diag.format_all());
+                }
             }
             if (gpu_build) {
                 const auto t_spv0 = clock::now();

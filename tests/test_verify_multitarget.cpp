@@ -54,8 +54,42 @@ static void test_formal_verify_and_multitarget() {
     CHECK(!k->msl.empty());
     CHECK(k->msl.find("kernel ") != std::string::npos);
     CHECK(!k->msl_entry.empty());
+    CHECK(k->msl_num_buffers >= 2);
+    CHECK(!k->msl_scalar_param_offsets.empty());
     CHECK(!k->ptx.empty());
     CHECK(k->ptx.find(".entry") != std::string::npos);
+
+    KernelSandboxReport sb = k->verify_sandbox();
+    CHECK(sb.passed);
+    CHECK(sb.portability_ok);
+    CHECK(sb.memory_safe);
+    CHECK(sb.barrier_uniform);
+
+    // Verify lazy ensure_msl() when emit_msl = false
+    CompileOptions lazy_opts;
+    lazy_opts.emit_spirv = true;
+    lazy_opts.emit_msl = false;
+    auto lazy_res = compile_source(src, "verify_lazy_msl.bk", lazy_opts);
+    CHECK(lazy_res.ok);
+    const CompiledKernel* lk = lazy_res.find_kernel("smooth_copy");
+    CHECK(lk != nullptr && lk->msl.empty());
+    std::string msl_err;
+    const MslArtifact& art = lk->ensure_msl(&msl_err);
+    CHECK(!art.source.empty() && art.source.find("kernel ") != std::string::npos);
+    CHECK(!art.entry_name.empty());
+    CHECK(art.num_buffers == k->msl_num_buffers);
+    CHECK(art.scalar_param_offsets == k->msl_scalar_param_offsets);
+
+    // @cpu kernel must fail sandbox verification cleanly
+    const char* cpu_src = R"(
+        @cpu @kernel fn cpu_only(g: grid1d, out: write_store<f32, 1>) {
+            out[g.x()] = 1.0;
+        }
+    )";
+    auto cpu_res = compile_source(cpu_src, "verify_cpu_sb.bk", lazy_opts);
+    CHECK(cpu_res.ok);
+    const CompiledKernel* ck = cpu_res.find_kernel("cpu_only");
+    CHECK(ck != nullptr && !ck->verify_sandbox().passed);
 
     // Also verify compile-cache serialization preserves msl & ptx
     namespace fs = std::filesystem;

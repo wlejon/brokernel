@@ -175,6 +175,7 @@ struct MirBodyLowerer {
         brass::Value* gpu_base = nullptr;
         uint32_t cpu_byte_offset = 0;
         Type type;
+        bool gpu_alloc_f32 = false;
     };
     std::unordered_map<std::string, SharedVar> shared_vars;
     uint32_t total_cpu_shared_bytes = 0;

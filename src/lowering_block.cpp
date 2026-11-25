@@ -509,10 +509,14 @@ void MirBodyLowerer::init_shared_memory() {
     auto alloc_shared = [&](const std::string& key, const Type& t) {
         if (shared_vars.count(key)) return;
         uint32_t words = std::max(1u, mod.types.flat_leaf_count(t));
+        const auto kinds = mod.types.flatten_scalars(t);
         SharedVar sv;
         sv.type = t;
+        sv.gpu_alloc_f32 = !kinds.empty() && std::all_of(kinds.begin(), kinds.end(), [](ScalarKind k) {
+            return k == ScalarKind::F32;
+        });
         if (is_gpu) {
-            sv.gpu_base = kb.shared_alloc_i32(words);
+            sv.gpu_base = sv.gpu_alloc_f32 ? kb.shared_alloc_f32(words) : kb.shared_alloc_i32(words);
         } else {
             sv.cpu_byte_offset = total_cpu_shared_bytes;
             total_cpu_shared_bytes += words * 4;
@@ -665,8 +669,13 @@ ValueList MirBodyLowerer::shared_load(const Expr* e, const SharedPlace& p) {
     auto load_word = [&](ScalarKind sk, brass::Value* w_off) -> brass::Value* {
         brass::Value* v = nullptr;
         if (is_gpu) {
-            v = sk == ScalarKind::F32 ? kb.shared_load_f32_indexed(p.var->gpu_base, w_off)
-                                      : kb.shared_load_i32_indexed(p.var->gpu_base, w_off);
+            if (p.var->gpu_alloc_f32) {
+                v = kb.shared_load_f32_indexed(p.var->gpu_base, w_off);
+                if (sk != ScalarKind::F32) v = b.build_bitcast_i32_f32(v);
+            } else {
+                v = kb.shared_load_i32_indexed(p.var->gpu_base, w_off);
+                if (sk == ScalarKind::F32) v = b.build_bitcast_f32_i32(v);
+            }
         } else {
             brass::Value* base_ptr = b.build_add(cpu_shared_base, b.build_iconst_i64(p.var->cpu_byte_offset));
             brass::Type mt = sk == ScalarKind::F32 ? brass::Type::f32() : brass::Type::i32();
@@ -692,10 +701,12 @@ void MirBodyLowerer::shared_store(const Expr* e, const SharedPlace& p, const Val
     (void)e;
     auto store_word = [&](ScalarKind sk, brass::Value* w_off, brass::Value* val) {
         if (is_gpu) {
-            if (sk == ScalarKind::F32) {
-                kb.shared_store_f32_indexed(p.var->gpu_base, w_off, val);
+            if (p.var->gpu_alloc_f32) {
+                brass::Value* fv = (sk == ScalarKind::F32) ? val : b.build_bitcast_f32_i32(val);
+                kb.shared_store_f32_indexed(p.var->gpu_base, w_off, fv);
             } else {
-                kb.shared_store_i32_indexed(p.var->gpu_base, w_off, val);
+                brass::Value* iv = (sk == ScalarKind::F32) ? b.build_bitcast_i32_f32(val) : val;
+                kb.shared_store_i32_indexed(p.var->gpu_base, w_off, iv);
             }
             return;
         }

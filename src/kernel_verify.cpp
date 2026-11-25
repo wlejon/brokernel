@@ -158,6 +158,33 @@ KernelVerifyReport CompiledKernel::verify() const {
     return rep;
 }
 
+KernelSandboxReport CompiledKernel::verify_sandbox() const {
+    KernelSandboxReport sb;
+    sb.portability_ok = (!cpu_only && !uses_f64 && stage == Stage::Compute) ? gpu_portability_ok : false;
+    for (const auto& pv : gpu_portability_violations) {
+        if (!pv.empty()) sb.violations.push_back(pv);
+    }
+    const KernelVerifyReport vr = verify();
+    sb.spirv_parsed = vr.spirv_parsed;
+    sb.memory_safe = vr.memory_safe;
+    sb.barrier_uniform = vr.barrier_uniform;
+    sb.shared_accesses_proven = vr.shared_accesses_proven;
+    sb.global_accesses_proven = vr.global_accesses_proven;
+    sb.barriers_proven = vr.barriers_proven;
+    for (const auto& v : vr.violations) {
+        if (!v.empty()) sb.violations.push_back(v);
+    }
+    sb.passed = sb.portability_ok && sb.spirv_parsed && sb.memory_safe && sb.barrier_uniform && sb.violations.empty();
+    if (!sb.passed) {
+        if (!sb.violations.empty()) sb.diagnostic = sb.violations.front();
+        else if (!vr.diagnostic.empty()) sb.diagnostic = vr.diagnostic;
+        else sb.diagnostic = "sandbox verification failed";
+    } else {
+        sb.diagnostic = vr.diagnostic.empty() ? "sandbox verification passed" : vr.diagnostic;
+    }
+    return sb;
+}
+
 namespace detail {
 
 void emit_optional_gpu_targets(const CompileOptions& opts, const CheckedFunction& fn,
@@ -174,6 +201,9 @@ void emit_optional_gpu_targets(const CompileOptions& opts, const CheckedFunction
         brass::target::MslKernel mk = brass::target::MslTarget::compile(gpu_fn, mopts);
         ck.msl = std::move(mk.source);
         ck.msl_entry = std::move(mk.entry_name);
+        ck.msl_num_buffers = mk.num_buffers;
+        ck.msl_scalar_params_bytes = mk.scalar_params_bytes;
+        ck.msl_scalar_param_offsets = std::move(mk.scalar_param_offsets);
     }
 }
 

@@ -277,6 +277,27 @@ struct KernelVerifyReport {
     std::string diagnostic;
 };
 
+struct KernelSandboxReport {
+    bool passed = false;
+    bool portability_ok = false;
+    bool spirv_parsed = false;
+    bool memory_safe = false;
+    bool barrier_uniform = false;
+    size_t shared_accesses_proven = 0;
+    size_t global_accesses_proven = 0;
+    size_t barriers_proven = 0;
+    std::vector<std::string> violations;
+    std::string diagnostic;
+};
+
+struct MslArtifact {
+    std::string source;
+    std::string entry_name;
+    uint32_t num_buffers = 0;
+    uint32_t scalar_params_bytes = 0;
+    std::vector<uint32_t> scalar_param_offsets;
+};
+
 /// One GPU dispatch of a kernel (CompiledKernel::gpu_launch): its arguments in
 /// SpirvKernel::params order, the workgroups, and the workgroup size (the
 /// kernel's local size, given to the pipeline as specialization constants 0..2
@@ -316,6 +337,7 @@ public:
     bool probes_compiled = false;
     std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
     std::function<std::string(std::string* err)> build_ptx_variant;
+    std::function<MslArtifact(std::string* err)> build_msl_variant;
     Type return_type = Type::void_type();
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
@@ -332,11 +354,18 @@ public:
     std::string ptx;
     std::string msl;
     std::string msl_entry;
+    uint32_t msl_num_buffers = 0;
+    uint32_t msl_scalar_params_bytes = 0;
+    std::vector<uint32_t> msl_scalar_param_offsets;
+    bool gpu_portability_ok = true;
+    std::vector<std::string> gpu_portability_violations;
     bool spirv_equivalent = false;
 
     const std::string& ensure_ptx(std::string* err = nullptr) const;
+    const MslArtifact& ensure_msl(std::string* err = nullptr) const;
 
     KernelVerifyReport verify() const;
+    KernelSandboxReport verify_sandbox() const;
 
     std::vector<RuntimeKnobInfo> runtime_knobs;
     uint32_t runtime_knob_bytes = 0;
@@ -581,6 +610,9 @@ private:
         bool ptx_tried = false;
         std::string ptx_cached;
         std::string ptx_error;
+        bool msl_tried = false;
+        MslArtifact msl_cached;
+        std::string msl_error;
     };
     std::shared_ptr<GpuCache> gpu_cache_ = std::make_shared<GpuCache>();
 };

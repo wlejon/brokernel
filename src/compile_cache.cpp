@@ -38,7 +38,7 @@ using brass::cache::KeyBuilder;
 // hold (detail::kEntryFormat), is a new domain or format, never a misread.
 constexpr std::string_view kBaseDomain = "brokernel.compile-base/1";
 constexpr std::string_view kReadsDomain = "brokernel.compile-reads/1";
-constexpr std::string_view kEntryDomain = "brokernel.compile/3";
+constexpr std::string_view kEntryDomain = "brokernel.compile/4";
 // The lists of module requests kept for one source (the oldest dropped).
 constexpr size_t kMaxReadLists = 8;
 constexpr std::string_view kCpuDomain = "brokernel.cpu/2";
@@ -534,6 +534,9 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
                 if (!opts.enable_probes && !k.probes.empty()) k.build_probed_variant = detail::probed_variant_builder(hit, k.name);
                 if (!opts.emit_ptx && k.ptx.empty() && k.stage == Stage::Compute && !k.cpu_only && !k.uses_f64) {
                     k.build_ptx_variant = detail::ptx_variant_builder(hit, k.name);
+                }
+                if (!opts.emit_msl && k.msl.empty() && k.stage == Stage::Compute && !k.cpu_only && !k.uses_f64) {
+                    k.build_msl_variant = detail::msl_variant_builder(hit, k.name);
                 }
                 if (had_cpu[i]) {
                     if (!inputs) {

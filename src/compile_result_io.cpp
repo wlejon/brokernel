@@ -225,6 +225,11 @@ void put(ByteWriter& w, const CompiledKernel& k) {
     w.str(k.ptx);
     w.str(k.msl);
     w.str(k.msl_entry);
+    w.u32(k.msl_num_buffers);
+    w.u32(k.msl_scalar_params_bytes);
+    put_list(w, k.msl_scalar_param_offsets, [&](uint32_t off) { w.u32(off); });
+    w.boolean(k.gpu_portability_ok);
+    put_strings(w, k.gpu_portability_violations);
     w.boolean(k.spirv_equivalent);
     w.u32(k.runtime_knob_bytes);
     put_list(w, k.runtime_knobs, [&](const RuntimeKnobInfo& rk) {
@@ -276,6 +281,11 @@ void get_kernel(ByteReader& r, CompiledKernel& k, uint8_t& had_cpu) {
     k.ptx = r.str();
     k.msl = r.str();
     k.msl_entry = r.str();
+    k.msl_num_buffers = r.u32();
+    k.msl_scalar_params_bytes = r.u32();
+    get_list(r, k.msl_scalar_param_offsets, [&] { return r.u32(); });
+    k.gpu_portability_ok = r.boolean();
+    get_strings(r, k.gpu_portability_violations);
     k.spirv_equivalent = r.boolean();
     k.runtime_knob_bytes = r.u32();
     get_list(r, k.runtime_knobs, [&] {

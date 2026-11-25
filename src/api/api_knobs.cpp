@@ -147,6 +147,31 @@ Value js_kernelVerify(Value self, std::span<const Value>) {
     return out.get();
 }
 
+Value js_kernelVerifySandbox(Value self, std::span<const Value>) {
+    KernelHandle* h = kernelHandle(self);
+    if (!h || !h->kernel) {
+        return ev::throwTypeError("Kernel.verifySandbox: invalid receiver");
+    }
+    KernelSandboxReport rep = h->kernel->verify_sandbox();
+    ev::Persistent violArr(ev::makeArray(static_cast<uint32_t>(rep.violations.size())));
+    for (size_t i = 0; i < rep.violations.size(); ++i) {
+        ev::Persistent s(ev::fromUtf8(rep.violations[i]));
+        violArr.set(ev::setElement(violArr.get(), static_cast<uint32_t>(i), s.get()));
+    }
+    ev::ObjectBuilder out;
+    out.set("passed", rep.passed);
+    out.set("portabilityOk", rep.portability_ok);
+    out.set("spirvParsed", rep.spirv_parsed);
+    out.set("memorySafe", rep.memory_safe);
+    out.set("barrierUniform", rep.barrier_uniform);
+    out.set("sharedAccessesProven", static_cast<double>(rep.shared_accesses_proven));
+    out.set("globalAccessesProven", static_cast<double>(rep.global_accesses_proven));
+    out.set("barriersProven", static_cast<double>(rep.barriers_proven));
+    out.set("violations", violArr.get());
+    out.set("diagnostic", rep.diagnostic);
+    return out.get();
+}
+
 Value js_kernelSetTelemetry(Value self, std::span<const Value> args) {
     KernelHandle* h = kernelHandle(self);
     if (!h || !h->kernel) {
@@ -227,6 +252,7 @@ void finishKernelTelemetry(KernelHandle& h, bool gpu) {
 
 void decorateKernelTargetExtras(ev::ObjectBuilder& b) {
     b.def("verify", 0, js_kernelVerify);
+    b.def("verifySandbox", 0, js_kernelVerifySandbox);
     b.def("setTelemetry", 1, js_kernelSetTelemetry);
     b.accessor("telemetrySlots", [](Value self, std::span<const Value>) -> Value {
         KernelHandle* h = kernelHandle(self);
