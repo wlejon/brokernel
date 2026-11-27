@@ -311,6 +311,11 @@ bool MirBodyLowerer::local_place(const Expr* e, LocalPlace& p) {
         }
     } else if (e->kind == Expr::Kind::Field) {
         if (local_place(e->lhs.get(), p) && p.lanes.empty()) {
+            if (p.type.is_newtype()) {
+                if (e->name != "0") return false;
+                p.type = mod.types.unwrap_newtype(p.type);
+                return true;
+            }
             if (p.type.is_struct()) {
                 const StructDef* sdef = mod.types.find_struct(p.type.struct_id);
                 const StructField* sf = sdef ? sdef->find_field(e->name) : nullptr;
@@ -467,6 +472,10 @@ void MirBodyLowerer::assign_local_lvalue(const Stmt* s, const ValueList& rhs) {
         }
         if (target->kind == Expr::Kind::Field && target->lhs) {
             const Type& base_t = target->lhs->resolved_type;
+            if (base_t.is_newtype()) {
+                update_lvalue(target->lhs.get(), write_fn);
+                return;
+            }
             if (base_t.is_scalar()) {
                 update_lvalue(target->lhs.get(), write_fn);
                 return;

@@ -127,7 +127,9 @@ bool same(const ConstValue& a, const ConstValue& b) {
     return true;
 }
 
-bool same(const ProbeInfo& a, const ProbeInfo& b) { return a.name == b.name && same(a.type, b.type) && a.index == b.index; }
+bool same(const ProbeInfo& a, const ProbeInfo& b) {
+    return a.name == b.name && same(a.type, b.type) && a.index == b.index && a.is_conditional == b.is_conditional;
+}
 
 bool same(const KernelParamInfo& a, const KernelParamInfo& b) {
     if (a.name != b.name || !same(a.type, b.type) || a.role != b.role || a.access != b.access ||
@@ -189,7 +191,10 @@ void check_same_kernel(const CompiledKernel& a, const CompiledKernel& b) {
     }
     CHECK(a.code_hash == b.code_hash);
     CHECK(a.probes_compiled == b.probes_compiled);
+    CHECK(a.check_labels == b.check_labels);
+    CHECK(a.checks_compiled == b.checks_compiled && a.trap_non_finite_compiled == b.trap_non_finite_compiled);
     CHECK((a.build_probed_variant == nullptr) == (b.build_probed_variant == nullptr));
+    CHECK((a.build_checked_variant == nullptr) == (b.build_checked_variant == nullptr));
     CHECK(same(a.return_type, b.return_type));
     CHECK(a.return_flat_leaves == b.return_flat_leaves && a.return_byte_size == b.return_byte_size);
     CHECK(a.return_leaf_kinds == b.return_leaf_kinds);

@@ -462,6 +462,7 @@ void MirBodyLowerer::store_element_to_buffer(const Type& elem_type, const ValueL
     brass::Value* idx64 = (linear_idx->type() == brass::Type::i64()) ? linear_idx : b.build_sext_i64(linear_idx);
     const Ops::Bound bound_v{idx64, store.size() > 1 ? store[1] : nullptr};
     const Ops::Bound* bound = bound_v.count ? &bound_v : nullptr;
+    trap_non_finite_store(elem_type, store, vals, bound);
     auto kinds = mod.types.flatten_scalars(elem_type);
     auto norm_bool = [&](ScalarKind sk, brass::Value* v) -> brass::Value* {
         return (sk == ScalarKind::Bool && b.vector_mode()) ? b.build_and(v, b.build_iconst_i32(1)) : v;

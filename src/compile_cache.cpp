@@ -532,6 +532,7 @@ CompileResult Compiler::compile_source(std::string_view source, std::string file
             for (size_t i = 0; i < hit.kernels.size(); ++i) {
                 CompiledKernel& k = hit.kernels[i];
                 if (!opts.enable_probes && !k.probes.empty()) k.build_probed_variant = detail::probed_variant_builder(hit, k.name);
+                k.build_checked_variant = detail::checked_variant_builder(hit, k.name);
                 if (!opts.emit_ptx && k.ptx.empty() && k.stage == Stage::Compute && !k.cpu_only && !k.uses_f64) {
                     k.build_ptx_variant = detail::ptx_variant_builder(hit, k.name);
                 }

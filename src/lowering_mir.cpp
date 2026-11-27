@@ -379,6 +379,10 @@ struct GridFrame {
     brass::Value* knobs_ptr = nullptr;     // packed runtime @knob bytes (if any)
     brass::Value* telemetry_ptr = nullptr; // runtime telemetry float buffer (if any)
     brass::Value* telemetry_cap = nullptr; // capacity in floats (i64)
+    brass::Value* check_ptr = nullptr;
+    brass::Value* check_active = nullptr;
+    brass::Value* probe_if_ptr = nullptr;
+    brass::Value* probe_if_active = nullptr;
     std::vector<ValueList> params;
     std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> block_ptrs;
 };
@@ -390,6 +394,7 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
                       brass::Value* gy, brass::Value* gz, bool x_interior = false) {
     brass::Builder& b = kb.builder();
     MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/false);
+    lowerer.check_labels = fn.check_labels;
     lowerer.b.lanes = lanes;
     lowerer.b.scratch = f.scratch;
     lowerer.vplan = plan;
@@ -411,6 +416,7 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     lowerer.cpu_knobs_ptr = f.knobs_ptr;
     lowerer.cpu_telemetry_ptr = f.telemetry_ptr;
     lowerer.cpu_telemetry_cap = f.telemetry_cap;
+    lowerer.copy_diagnostic_cpu_ptrs(f.check_ptr, f.check_active, f.probe_if_ptr, f.probe_if_active);
     lowerer.wgid_x = lowerer.b.build_udiv(lowerer.gx, f.lsz_x);
     lowerer.wgid_y = b.build_udiv(gy, f.lsz_y);
     lowerer.wgid_z = b.build_udiv(gz, f.lsz_z);
@@ -459,6 +465,7 @@ void lower_grid_cells(brass::codegen::KernelBuilder& kb, const CheckedModule& mo
     brass::Value* zero = b.build_iconst_i32(0);
     brass::Value* first = lanes ? lowerer.compute_linear_index(dim, ops.iota_i32(), zero, zero)
                                 : b.build_iconst_i64(0);
+    lowerer.trap_non_finite_return(fn.return_type, ret);
     lowerer.store_element_to_buffer(fn.return_type, {f.out_ret}, ops.build_select(has_out, lin, first), ret);
 }
 
@@ -531,6 +538,16 @@ brass::Function* build_cpu_grid(brass::Module& m, const CheckedModule& mod, cons
         f.telemetry_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
         f.telemetry_cap = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
         slot += 2;
+    }
+    if (mod.enable_probes && fn.has_conditional_probes()) {
+        f.probe_if_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+        f.probe_if_active = b.build_ne(b.build_load(brass::Type::i64(), args_pack, slot * 8), b.build_iconst_i64(0));
+        slot += 1;
+    }
+    if (mod.enable_checks || mod.trap_non_finite) {
+        f.check_ptr = b.build_load(brass::Type::ptr(), args_pack, slot * 8);
+        f.check_active = b.build_ne(b.build_load(brass::Type::i64(), args_pack, slot * 8), b.build_iconst_i64(0));
+        slot += 1;
     }
     brass::BasicBlock* z_head = new_block(b, "grid_z_head");
     brass::BasicBlock* z_body = new_block(b, "grid_z_body");
@@ -630,6 +647,7 @@ LoweredKernelMir lower_kernel_to_mir(
         brass::BasicBlock* entry = b.append_block("entry");
         b.position_at_end(entry);
         MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/true);
+        lowerer.check_labels = fn.check_labels;
         lowerer.collect_dyn_indexed_vars(fn.body);
         lowerer.push_scope();
         lowerer.active_return_type = fn.return_type;
@@ -723,7 +741,7 @@ LoweredKernelMir lower_kernel_to_mir(
             gpu_out_ptr = b.add_param(brass::Type::ptr());
             mir_idx += 1;
         }
-        if (mod.enable_probes && fn.stage == Stage::Compute && !fn.probes.empty()) {
+        if (mod.enable_probes && fn.stage == Stage::Compute && fn.has_unconditional_probes()) {
             out.probe_out_mir_index = mir_idx;
             lowerer.gpu_probe_ptr = b.add_param(brass::Type::ptr());
             mir_idx += 1;
@@ -745,6 +763,7 @@ LoweredKernelMir lower_kernel_to_mir(
             lowerer.gpu_telemetry_cap = b.add_param(brass::Type::i32());
             mir_idx += 2;
         }
+        lowerer.bind_diagnostic_gpu_params(out, mir_idx);
         {
             std::vector<brass::Type> ptypes;
             ptypes.reserve(entry->params().size());
@@ -807,6 +826,7 @@ LoweredKernelMir lower_kernel_to_mir(
             out.block_bindings.push_back(make_block_info(mod.globals[idx - fn.params.size()], idx));
         }
         if (gpu_out_ptr && lowerer.ret_val_var_id >= 0) {
+            lowerer.trap_non_finite_return(fn.return_type, lowerer.var_values[lowerer.ret_val_var_id]);
             brass::Value* lin = (fn.grid_dim > 0)
                                     ? lowerer.compute_linear_index(fn.grid_dim, lowerer.gx, lowerer.gy, lowerer.gz)
                                     : b.build_iconst_i32(0);
@@ -817,6 +837,7 @@ LoweredKernelMir lower_kernel_to_mir(
             b.position_at_end(done_bb);
         }
         b.build_ret_void();
+        out.check_labels = std::move(lowerer.check_labels);
     }
     return out;
 }
@@ -845,6 +866,7 @@ void lower_kernel_cpu_to_mir(
         brass::Value* coords_shape = b.add_param(brass::Type::ptr());
         brass::Value* out_ret = b.add_param(brass::Type::ptr());
         MirBodyLowerer lowerer(mod, fn, diags, kb, /*is_gpu=*/false);
+        lowerer.check_labels = out.check_labels.empty() ? fn.check_labels : out.check_labels;
         lowerer.collect_dyn_indexed_vars(fn.body);
         lowerer.push_scope();
         lowerer.active_return_type = fn.return_type;
@@ -873,7 +895,7 @@ void lower_kernel_cpu_to_mir(
         lowerer.cpu_shared_base = b.build_load(brass::Type::ptr(), coords_shape, 72);
         lowerer.cpu_barrier_fn = b.build_load(brass::Type::ptr(), coords_shape, 80);
         lowerer.cpu_barrier_ctx = b.build_load(brass::Type::ptr(), coords_shape, 88);
-        if (mod.enable_probes && !fn.probes.empty()) {
+        if (mod.enable_probes && fn.has_unconditional_probes()) {
             lowerer.cpu_probe_ptr = b.build_load(brass::Type::ptr(), coords_shape, 96);
             lowerer.cpu_probe_active =
                 b.build_ne(b.build_load(brass::Type::i64(), coords_shape, 96), b.build_iconst_i64(0));
@@ -925,9 +947,11 @@ void lower_kernel_cpu_to_mir(
             lowerer.cpu_telemetry_cap = b.build_load(brass::Type::i64(), args_pack, slot * 8 + 8);
             slot += 2;
         }
+        lowerer.bind_diagnostic_cpu_params(args_pack, slot);
         lowerer.lower_stmt_list(fn.body);
         out.cpu_shared_bytes = lowerer.total_cpu_shared_bytes;
         if (lowerer.ret_val_var_id >= 0) {
+            lowerer.trap_non_finite_return(fn.return_type, lowerer.var_values[lowerer.ret_val_var_id]);
             lowerer.store_element_to_buffer(fn.return_type, {out_ret}, b.build_iconst_i32(0),
                                             lowerer.var_values[lowerer.ret_val_var_id]);
         }

@@ -1,4 +1,5 @@
 #include "brokernel/brokernel.h"
+#include "compile_internal.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -281,6 +282,12 @@ bool pack_cpu_args(
         const uint32_t cap = ptr ? std::min(kernel.telemetry_slots, kernel.telemetry_capacity_floats()) : 0u;
         slots_out.push_back(reinterpret_cast<uint64_t>(ptr));
         slots_out.push_back(static_cast<uint64_t>(cap));
+    }
+    if (kernel.probes_compiled && kernel.has_conditional_probes()) {
+        slots_out.push_back(reinterpret_cast<uint64_t>(detail::active_cpu_probe_if_buf()));
+    }
+    if (kernel.checks_compiled || kernel.trap_non_finite_compiled) {
+        slots_out.push_back(reinterpret_cast<uint64_t>(detail::active_cpu_check_buf()));
     }
     return true;
 }

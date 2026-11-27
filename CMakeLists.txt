@@ -16,6 +16,7 @@ endif()
 
 option(BROKERNEL_BUILD_TESTS "Build the brokernel test suite" ${PROJECT_IS_TOP_LEVEL})
 option(BROKERNEL_BUILD_BENCH "Build the brokernel hill-climb benchmark harness" ${PROJECT_IS_TOP_LEVEL})
+option(BROKERNEL_BUILD_TOOLS "Build brokernel CLI tools" ${PROJECT_IS_TOP_LEVEL})
 
 # brass: the code generator kernels lower into (MIR -> SPIR-V for the GPU,
 # x64 / arm64 for the CPU).
@@ -36,17 +37,20 @@ add_library(brokernel STATIC
     src/kernel_report.cpp
     src/kernel_verify.cpp
     src/runtime_cpu.cpp
+    src/runtime_checks.cpp
     src/runtime_knobs.cpp
     src/diagnostics.cpp
     src/types.cpp
     src/lexer.cpp
     src/parser.cpp
+    src/parser_decls.cpp
     src/stdlib_modules.cpp
     src/stdlib_domain.cpp
     src/stdlib_noise_core.cpp
     src/stdlib_noise_3d.cpp
     src/stdlib_noise_fractal_warp.cpp
     src/sema.cpp
+    src/sema_lang.cpp
     src/sema_const.cpp
     src/sema_check.cpp
     src/sema_ext.cpp
@@ -60,6 +64,7 @@ add_library(brokernel STATIC
     src/lowering_math.cpp
     src/lowering_ops.cpp
     src/lowering_block.cpp
+    src/lowering_checks.cpp
     src/lowering_store_place.cpp
     src/lowering_telemetry.cpp
     src/lowering_texture.cpp
@@ -84,6 +89,11 @@ endif()
 if(BROKERNEL_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(BROKERNEL_BUILD_TOOLS)
+    add_executable(brokernel-check tools/brokernel_check.cpp)
+    target_link_libraries(brokernel-check PRIVATE brokernel)
 endif()
 
 if(BROKERNEL_BUILD_BENCH)

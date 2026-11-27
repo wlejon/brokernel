@@ -81,6 +81,8 @@ public:
     brass::Value* iota_i32();
     // vany of a mask (an i32, nonzero when any lane is set); a uniform bool as it is.
     brass::Value* any(brass::Value* m);
+    // Scalar lane `i` of `v` (handles index markers, varying vectors, and uniforms).
+    brass::Value* lane_of(brass::Value* v, uint32_t i);
     // A mask over `t`'s lanes for select: 64-bit lanes take the i32 mask widened.
     brass::Value* mask_for(brass::Value* m, brass::Type t);
 
@@ -243,7 +245,6 @@ private:
     // `scalar_op` applied lane by lane to operands of which any may be varying.
     template <typename F>
     brass::Value* per_lane(brass::Type res_scalar, std::initializer_list<brass::Value*> operands, F scalar_op);
-    brass::Value* lane_of(brass::Value* v, uint32_t i);
     brass::Value* convert(brass::Type to_scalar, brass::Value* v);
     brass::Value* bitcast(brass::Type to_scalar, brass::Value* v);
     brass::Value* safe_divisor(brass::Value* a, brass::Value* d);

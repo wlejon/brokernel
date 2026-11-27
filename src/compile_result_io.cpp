@@ -19,6 +19,10 @@ void put(ByteWriter& w, const Type& t) {
     w.u8(static_cast<uint8_t>(t.access));
     w.u32(t.struct_id);
     w.str(t.struct_name);
+    w.u32(t.newtype_id);
+    w.str(t.newtype_name);
+    w.u32(t.enum_id);
+    w.str(t.enum_name);
     w.u8(static_cast<uint8_t>(t.elem_kind));
     w.u32(t.elem_lanes);
     w.u8(t.image_flags);
@@ -35,6 +39,10 @@ Type get_type(ByteReader& r, int depth = 0) {
     t.access = static_cast<AccessMode>(r.u8());
     t.struct_id = r.u32();
     t.struct_name = r.str();
+    t.newtype_id = r.u32();
+    t.newtype_name = r.str();
+    t.enum_id = r.u32();
+    t.enum_name = r.str();
     t.elem_kind = static_cast<TypeKind>(r.u8());
     t.elem_lanes = r.u32();
     t.image_flags = r.u8();
@@ -90,6 +98,7 @@ void put(ByteWriter& w, const ProbeInfo& p) {
     w.str(p.name);
     put(w, p.type);
     w.u32(p.index);
+    w.boolean(p.is_conditional);
 }
 
 ProbeInfo get_probe(ByteReader& r) {
@@ -97,6 +106,7 @@ ProbeInfo get_probe(ByteReader& r) {
     p.name = r.str();
     p.type = get_type(r);
     p.index = r.u32();
+    p.is_conditional = r.boolean();
     return p;
 }
 
@@ -210,6 +220,9 @@ void put(ByteWriter& w, const CompiledKernel& k) {
     });
     w.u64(k.code_hash);
     w.boolean(k.probes_compiled);
+    put_strings(w, k.check_labels);
+    w.boolean(k.checks_compiled);
+    w.boolean(k.trap_non_finite_compiled);
     put(w, k.return_type);
     w.u32(k.return_flat_leaves);
     w.u32(k.return_byte_size);
@@ -266,6 +279,9 @@ void get_kernel(ByteReader& r, CompiledKernel& k, uint8_t& had_cpu) {
     });
     k.code_hash = r.u64();
     k.probes_compiled = r.boolean();
+    get_strings(r, k.check_labels);
+    k.checks_compiled = r.boolean();
+    k.trap_non_finite_compiled = r.boolean();
     k.return_type = get_type(r);
     k.return_flat_leaves = r.u32();
     k.return_byte_size = r.u32();
@@ -355,6 +371,26 @@ bool get_types(ByteReader& r, TypeRegistry& types) {
             }
         }
     }
+    const size_t nnt = r.count();
+    for (size_t i = 0; i < nnt && r.ok(); ++i) {
+        NewtypeDef nt;
+        nt.id = r.u32();
+        nt.name = r.str();
+        nt.underlying = get_type(r);
+        if (!r.ok()) return false;
+        const uint32_t id = types.register_newtype(nt);
+        if (id != nt.id) return false;
+    }
+    const size_t nen = r.count();
+    for (size_t i = 0; i < nen && r.ok(); ++i) {
+        EnumDef ed;
+        ed.id = r.u32();
+        ed.name = r.str();
+        ed.underlying = static_cast<ScalarKind>(r.u8());
+        if (!r.ok()) return false;
+        const uint32_t id = types.register_enum(ed);
+        if (id != ed.id) return false;
+    }
     return r.ok();
 }
 
@@ -378,6 +414,8 @@ void encode_options(const CompileOptions& o, ByteWriter& w) {
     w.i32(o.opt_level);
     w.boolean(o.enable_probes);
     w.boolean(o.enable_fragment_probes);
+    w.boolean(o.enable_checks);
+    w.boolean(o.trap_non_finite);
     w.boolean(o.runtime_knobs);
     w.u32(o.telemetry_slots);
     std::vector<const std::pair<const std::string, ConstValue>*> knobs;
@@ -426,6 +464,16 @@ void encode_result(const CompileResult& res, ByteWriter& w) {
         w.str(d.line_text);
     });
     put_list(w, res.types.structs(), [&](const StructDef& s) { put(w, s); });
+    put_list(w, res.types.newtypes(), [&](const NewtypeDef& nt) {
+        w.u32(nt.id);
+        w.str(nt.name);
+        put(w, nt.underlying);
+    });
+    put_list(w, res.types.enums(), [&](const EnumDef& ed) {
+        w.u32(ed.id);
+        w.str(ed.name);
+        w.u8(static_cast<uint8_t>(ed.underlying));
+    });
     put_list(w, res.resources, [&](const ResourceInfo& ri) {
         w.str(ri.name);
         w.str(ri.module);
@@ -440,6 +488,15 @@ void encode_result(const CompileResult& res, ByteWriter& w) {
         put(w, c.type);
         put(w, c.value);
         w.boolean(c.is_knob);
+    });
+    put_list(w, res.enums, [&](const EnumInfo& ei) {
+        w.str(ei.name);
+        w.str(ei.module);
+        w.u8(static_cast<uint8_t>(ei.underlying));
+        put_list(w, ei.variants, [&](const std::pair<std::string, int64_t>& v) {
+            w.str(v.first);
+            w.i64(v.second);
+        });
     });
     put_list(w, res.probes, [&](const ProbeInfo& p) { put(w, p); });
     put_strings(w, res.exported_functions);
@@ -478,6 +535,18 @@ bool decode_result(ByteReader& r, CompileResult& res, std::vector<uint8_t>& had_
         c.value = get_const(r);
         c.is_knob = r.boolean();
         return c;
+    });
+    get_list(r, res.enums, [&] {
+        EnumInfo ei;
+        ei.name = r.str();
+        ei.module = r.str();
+        ei.underlying = static_cast<ScalarKind>(r.u8());
+        get_list(r, ei.variants, [&] {
+            std::string vn = r.str();
+            int64_t vv = r.i64();
+            return std::make_pair(std::move(vn), vv);
+        });
+        return ei;
     });
     get_list(r, res.probes, [&] { return get_probe(r); });
     get_strings(r, res.exported_functions);

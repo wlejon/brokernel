@@ -17,6 +17,8 @@ struct ModuleScope {
     bool has_transitive_knob = false;
     std::unordered_map<std::string, const FnDecl*> fn_by_name;
     std::unordered_map<std::string, const StructDecl*> struct_by_name;
+    std::unordered_map<std::string, const EnumDecl*> enum_by_name;
+    std::unordered_map<std::string, const NewtypeDecl*> newtype_by_name;
     std::unordered_map<std::string, const ConstDecl*> const_by_name;
     std::unordered_map<std::string, const BindingDecl*> binding_by_name;
     std::unordered_map<std::string, std::string> module_aliases; // alias -> canonical module name
@@ -47,6 +49,9 @@ struct SemaContext {
     std::vector<std::string> active_fn_stack;
     // Active module stack for circular import detection
     std::vector<std::string> active_import_stack;
+    // Active newtype stack for cyclic newtype detection
+    std::vector<std::string> active_newtype_stack;
+    std::unordered_map<std::string, EnumInfo> enum_info_by_key;
     bool runtime_knobs = false;
     std::unordered_map<std::string, uint32_t> knob_index_by_key;
     SemaContext(ModuleRegistry& reg, DiagnosticBag& d, std::filesystem::path dir, bool rt_knobs = false)
@@ -76,6 +81,26 @@ struct SemaContext {
     const StructDecl* find_struct_decl(const std::string& current_mod,
                                        const std::string& name,
                                        std::string* resolved_mod_out) const;
+    const EnumDecl* find_enum_in_module(const std::string& mod_name, const std::string& sym,
+                                        std::string* resolved_mod_out, std::set<std::string>& visited) const;
+    const EnumDecl* find_enum_decl(const std::string& current_mod, const std::string& name,
+                                   std::string* resolved_mod_out) const;
+    const NewtypeDecl* find_newtype_in_module(const std::string& mod_name, const std::string& sym,
+                                              std::string* resolved_mod_out, std::set<std::string>& visited) const;
+    const NewtypeDecl* find_newtype_decl(const std::string& current_mod, const std::string& name,
+                                         std::string* resolved_mod_out) const;
+    std::optional<ConstValue> find_enum_variant_const(const std::string& current_mod,
+                                                      const std::vector<std::string>& path,
+                                                      const std::string& name) const;
+    std::optional<Type> resolve_enum_or_newtype_type(const TypeExpr* texpr, const std::string& current_mod);
+    void evaluate_module_enums(const std::string& mod_name, const std::string& root_name);
+    void collect_exported_constants(const std::string& root_name);
+    void collect_exported_enums(const std::string& root_name);
+    std::optional<ConstValue> eval_sizeof_offsetof_query(
+        const Expr* e,
+        const std::string& current_mod,
+        const GenericEnv& genv,
+        DiagnosticBag* report_diags);
     std::optional<ConstValue> find_const(const std::string& current_mod,
                                          const std::vector<std::string>& path,
                                          const std::string& name,
@@ -152,7 +177,7 @@ struct FnCheckState {
     }
     void mark_type_usage(const Type& t) {
         if (t.scalar == ScalarKind::F64) { note_f64(nullptr); return; }
-        if (t.is_struct()) {
+        if (t.is_struct() || t.is_array()) {
             auto leaves = ctx.out->types.flatten_scalars(t);
             for (auto sk : leaves) {
                 if (sk == ScalarKind::F64) { note_f64(nullptr); return; }
@@ -196,4 +221,12 @@ struct FnCheckState {
     Type check_method_call(Expr* e);
     Type check_texture_method(Expr* e, const Type& recv_t);   // an image's or a sampler's method
 };
+
+// Phase 1 language feature helpers (src/sema_lang.cpp)
+uint32_t resolve_image_format(const CheckedParam& cp, const Attribute* attr, DiagnosticBag& diags);
+Type check_newtype_or_enum_cast(FnCheckState& st, Expr* e);
+Type check_newtype_unary(FnCheckState& st, Expr* e, const Type& sub);
+std::optional<Type> check_newtype_or_enum_binary(FnCheckState& st, Expr* e, Type lt, Type rt);
+std::optional<Type> check_newtype_constructor(FnCheckState& st, Expr* e, const std::string& qname);
+
 } // namespace brokernel::detail

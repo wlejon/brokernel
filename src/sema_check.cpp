@@ -269,6 +269,13 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
         }
         if (!seen) fn.probes.push_back(pr);
     }
+    for (const auto& lbl : inst->check_labels) {
+        bool seen = false;
+        for (const auto& existing : fn.check_labels) {
+            if (existing == lbl) { seen = true; break; }
+        }
+        if (!seen) fn.check_labels.push_back(lbl);
+    }
     // Coerce and validate arguments against instantiated parameter types, and propagate stencil offsets
     for (size_t i = 0; i < e->args.size() && i < inst_params.size(); ++i) {
         const auto& cparam = inst_params[i];
@@ -322,97 +329,6 @@ Type FnCheckState::check_user_call(Expr* e, const FnDecl& callee_decl, const std
     e->resolved_type = inst_ret;
     mark_type_usage(inst_ret);
     return inst_ret;
-}
-// A storage image's format (SPIR-V ImageFormat): `@format(name)` on its
-// parameter, else the one its texel stores whole. 0 after a diagnostic.
-static uint32_t resolve_image_format(const CheckedParam& cp, const Attribute* attr, DiagnosticBag& diags) {
-    static const struct { const char* name; uint32_t code; bool uint; } kFormats[] = {
-        {"rgba32f", 1, false}, {"rgba16f", 2, false},  {"r32f", 3, false},     {"rgba8", 4, false},
-        {"rgba8_snorm", 5, false}, {"rg32f", 6, false}, {"rg16f", 7, false},   {"r11g11b10f", 8, false},
-        {"r16f", 9, false},    {"rgba16", 10, false},   {"rgb10a2", 11, false}, {"rg16", 12, false},
-        {"rg8", 13, false},    {"r16", 14, false},      {"r8", 15, false},     {"rgba32ui", 30, true},
-        {"rgba16ui", 31, true}, {"rgba8ui", 32, true},  {"r32ui", 33, true},   {"rg32ui", 35, true},
-        {"rg16ui", 36, true},  {"rg8ui", 37, true},     {"r16ui", 38, true},   {"r8ui", 39, true},
-    };
-    bool uint = cp.type.scalar == ScalarKind::U32;
-    if (attr) {
-        if (attr->str_args.size() != 1) {
-            diags.error(attr->span, "@format takes one format name, e.g. @format(rgba16f)");
-            return 0;
-        }
-        for (const auto& f : kFormats) {
-            if (attr->str_args[0] != f.name) continue;
-            if (f.uint != uint) {
-                diags.error(attr->span, std::string("@format(") + f.name + ") does not hold " +
-                                            cp.type.element_type().to_string() + " texels");
-                return 0;
-            }
-            return f.code;
-        }
-        diags.error(attr->span, "unknown image format '" + attr->str_args[0] + "'");
-        return 0;
-    }
-    switch (cp.type.elem_lanes) {
-        case 1: return uint ? 33 : 3;
-        case 2: return uint ? 35 : 6;
-        case 4: return uint ? 30 : 1;
-        default:
-            diags.error(cp.span, "no image format holds " + cp.type.element_type().to_string() +
-                                     " texels: give one with @format");
-            return 0;
-    }
-}
-
-// A module's resources, each the bound parameter it stands for: its role
-// from its type, which must be one bound at a descriptor, and its
-// @binding(set, binding), which it must have.
-void SemaContext::resolve_globals() {
-    GenericEnv empty_env;
-    for (const auto& mod_name : module_order) {
-        const ModuleAst* ast = modules[mod_name].ast;
-        if (!ast) continue;
-        for (const auto& d : ast->bindings) {
-            CheckedParam cp;
-            cp.span = d.span;
-            cp.name = d.name;
-            cp.type = resolve_type(d.type.get(), mod_name, empty_env);
-            cp.access = cp.type.access;
-            if (d.is_shared) {
-                cp.role = ParamRole::Shared;
-                cp.access = AccessMode::ReadWrite;
-                if (!d.attributes.empty()) {
-                    diags.error(d.attributes.front().span, "module-level shared variable '" + d.name + "' cannot have attributes");
-                }
-                validate_shared_type(cp.type, out->types, diags, d.span, d.name);
-                out->global_index[mod_name + "::" + d.name] = out->globals.size();
-                out->globals.push_back(std::move(cp));
-                continue;
-            }
-            if (cp.type.is_image()) {
-                cp.role = ParamRole::Image;
-                cp.image_format = resolve_image_format(cp, d.find_attribute("format"), diags);
-            } else if (cp.type.is_sampler()) {
-                cp.role = ParamRole::Sampler;
-            } else if (cp.type.is_uniform()) {
-                cp.role = ParamRole::Uniform;
-            } else if (cp.type.is_buffer()) {
-                cp.role = ParamRole::Buffer;
-            } else {
-                diags.error(d.span, "module-level '" + d.name + "' is a resource at a descriptor (a texture, "
-                                    "sampler, image, uniform or buffer), not '" + cp.type.to_string() + "'");
-                continue;
-            }
-            const Attribute* at = d.find_attribute("binding");
-            if (!at || at->int_args.empty() || at->int_args.size() > 2) {
-                diags.error(d.span, "module-level '" + d.name + "' needs @binding(set, binding)");
-                continue;
-            }
-            cp.descriptor_set = at->int_args.size() == 2 ? static_cast<uint32_t>(at->int_args[0]) : 0;
-            cp.descriptor_binding = static_cast<uint32_t>(at->int_args.back());
-            out->global_index[mod_name + "::" + d.name] = out->globals.size();
-            out->globals.push_back(std::move(cp));
-        }
-    }
 }
 
 Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
@@ -529,6 +445,16 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         }
         case Expr::Kind::Unary: {
             Type sub = check_expr(e->lhs.get(), e->unary_op == UnaryOp::Not ? Type::bool_type() : expected);
+            if (sub.is_newtype()) {
+                Type r = check_newtype_unary(*this, e, sub);
+                if (!r.is_scalar() && !expr_has_runtime_knob(e)) {
+                    if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                        cv->type = r;
+                        fold_const_into_expr(e, *cv);
+                    }
+                }
+                return r;
+            }
             if (e->unary_op == UnaryOp::Not) {
                 if (!sub.is_bool()) ctx.diags.error(e->span, "logical '!' requires a bool operand");
                 return e->resolved_type = Type::bool_type();
@@ -592,6 +518,15 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 lt = e->lhs->resolved_type;
                 rt = e->rhs->resolved_type;
             }
+            if (auto nt_res = check_newtype_or_enum_binary(*this, e, lt, rt)) {
+                if (!nt_res->is_scalar() && !expr_has_runtime_knob(e)) {
+                    if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, {})) {
+                        cv->type = *nt_res;
+                        fold_const_into_expr(e, *cv);
+                    }
+                }
+                return *nt_res;
+            }
             if (lt != rt) {
                 if ((lt.is_f64() && rt.is_f32()) || (lt.is_f32() && rt.is_f64())) {
                     ctx.diags.error(e->span, "cannot mix 'f64' and 'f32' without an explicit cast");
@@ -643,15 +578,13 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             e->resolved_type = lt;
             return lt;
         }
-        case Expr::Kind::Cast: {
-            check_expr(e->lhs.get());
-            Type target = ctx.resolve_type(e->target_type.get(), fn.module_name, genv);
-            mark_type_usage(target);
-            e->resolved_type = target;
-            return target;
-        }
+        case Expr::Kind::Cast:
+            return check_newtype_or_enum_cast(*this, e);
         case Expr::Kind::Call: {
-            if (e->path.empty() && (e->name == "probe" || e->name == "__probe") && e->args.size() == 2 &&
+            if (e->path.empty() &&
+                (((e->name == "probe" || e->name == "__probe") && e->args.size() == 2) ||
+                 ((e->name == "check" || e->name == "__check") && e->args.size() == 2) ||
+                 ((e->name == "probe_if" || e->name == "__probe_if") && e->args.size() == 3)) &&
                 e->args[0] && e->args[0]->kind == Expr::Kind::StringLit) {
                 return check_ad_or_quadrature_call(e, expected);
             }
@@ -664,11 +597,15 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                 return check_grad_knob_call(e, expected);
             }
             if (e->path.empty() &&
-                (e->name == "probe" || e->name == "grad" || e->name == "expect" ||
+                (e->name == "probe" || e->name == "probe_if" || e->name == "check" ||
+                 e->name == "grad" || e->name == "expect" ||
                  e->name == "moments" || e->name == "cell_expect")) {
                 return check_ad_or_quadrature_call(e, expected);
             }
             if (!e->path.empty()) {
+                if (auto nt_t = check_newtype_constructor(*this, e, ModuleRegistry::format_module_path(e->path))) {
+                    return *nt_t;
+                }
                 ctx.diags.error(e->span, "unknown function '" + ModuleRegistry::format_module_path(e->path) + "'");
                 return Type::void_type();
             }
@@ -679,6 +616,17 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
         case Expr::Kind::Field: {
             Type recv = check_expr(e->lhs.get());
             const std::string& f = e->name;
+            if (recv.is_newtype()) {
+                if (f == "0") {
+                    Type u = ctx.out->types.unwrap_newtype(recv);
+                    e->resolved_type = u;
+                    mark_type_usage(u);
+                    return u;
+                }
+                ctx.diags.error(e->span, "cannot access field '" + f + "' directly on newtype '" +
+                                         recv.to_string() + "' (unwrap with '.0' first)");
+                return Type::void_type();
+            }
             // Allow .x on scalar (for D=1 generic vector code)
             if (recv.is_scalar() && (f == "x" || f == "r")) {
                 e->resolved_type = recv;
@@ -899,7 +847,9 @@ const CheckedFunction* SemaContext::instantiate_function(
         cp.name = pdecl.name;
         cp.type = resolve_type(pdecl.type.get(), decl_mod, genv);
         cp.access = cp.type.access;
-        if (cp.type.scalar == ScalarKind::F64) {
+        if (cp.type.scalar == ScalarKind::F64 ||
+            ((cp.type.is_struct() || cp.type.is_array()) &&
+             [&] { for (auto sk : out->types.flatten_scalars(cp.type)) if (sk == ScalarKind::F64) return true; return false; }())) {
             cfn.uses_f64 = true;
             if (!cfn.f64_site) cfn.f64_site = pdecl.type ? pdecl.type->span : cp.span;
         }
@@ -957,7 +907,9 @@ const CheckedFunction* SemaContext::instantiate_function(
         else if (cfn.grid_dim == 3) { cfn.local_size[0] = 4; cfn.local_size[1] = 4; cfn.local_size[2] = 4; }
     }
     cfn.return_type = decl.return_type ? resolve_type(decl.return_type.get(), decl_mod, genv) : Type::void_type();
-    if (cfn.return_type.scalar == ScalarKind::F64) {
+    if (cfn.return_type.scalar == ScalarKind::F64 ||
+        ((cfn.return_type.is_struct() || cfn.return_type.is_array()) &&
+         [&] { for (auto sk : out->types.flatten_scalars(cfn.return_type)) if (sk == ScalarKind::F64) return true; return false; }())) {
         cfn.uses_f64 = true;
         if (!cfn.f64_site) cfn.f64_site = decl.return_type ? decl.return_type->span : decl.span;
     }

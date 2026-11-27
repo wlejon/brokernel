@@ -264,6 +264,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (auto v = try_local_read(e)) return *v;
             ValueList recv = lower_expr(e->lhs.get());
             const Type& rt = e->lhs->resolved_type;
+            if (rt.is_newtype()) return recv;
             if (rt.is_scalar()) return recv;
             if (rt.is_vector()) {
                 ValueList out;
@@ -597,6 +598,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 emit_probe(static_cast<uint32_t>(e->args[0]->int_val), e->resolved_type, vals);
                 return vals;
             }
+            if (n == "__check") return lower_check_expr(e);
+            if (n == "__probe_if") return lower_probe_if_expr(e);
             if (n == "telemetry") {
                 ValueList slot = lower_expr(e->args[0].get());
                 ValueList val = lower_expr(e->args[1].get());
@@ -604,7 +607,10 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                                 val[0], e->args[1]->resolved_type.scalar);
                 return {};
             }
-            // 3. Scalar casts f32(x), f64(x), i32(x), u32(x), i64(x), u64(x), bool(x)
+            // 3. Newtype constructors Meters(x) and Scalar casts f32(x), ...
+            if (e->resolved_type.is_newtype() && e->args.size() == 1) {
+                return lower_expr(e->args[0].get());
+            }
             if (n == "f32" || n == "f64" || n == "i32" || n == "u32" || n == "i64" || n == "u64" || n == "bool") {
                 ValueList sv = lower_expr(e->args[0].get());
                 ScalarKind from_sk = e->args[0]->resolved_type.scalar;

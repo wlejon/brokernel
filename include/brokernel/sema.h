@@ -127,11 +127,20 @@ struct ConstInfo {
     bool is_knob = false;
 };
 
-/// Named probe metadata (`probe("label", expr)`).
+/// Exported `enum` declaration metadata.
+struct EnumInfo {
+    std::string name;
+    std::string module;
+    ScalarKind underlying = ScalarKind::I32;
+    std::vector<std::pair<std::string, int64_t>> variants;
+};
+
+/// Named probe metadata (`probe("label", expr)` or `probe_if("label", cond, expr)`).
 struct ProbeInfo {
     std::string name;
     Type type;
     uint32_t index = 0;
+    bool is_conditional = false;
 };
 
 /// Captured runtime value for a named probe at a single invocation/cell.
@@ -172,7 +181,17 @@ struct CheckedFunction {
     int32_t max_stencil_radius = 0;
     int32_t stencil_halo[3] = {0, 0, 0};
     std::vector<ProbeInfo> probes;
+    std::vector<std::string> check_labels;
     std::vector<StmtPtr> body;         // Deep-cloned, type-annotated & const-specialized body
+
+    bool has_unconditional_probes() const noexcept {
+        for (const auto& p : probes) if (!p.is_conditional) return true;
+        return false;
+    }
+    bool has_conditional_probes() const noexcept {
+        for (const auto& p : probes) if (p.is_conditional) return true;
+        return false;
+    }
 };
 
 /// Layout metadata for one `@knob` when compiled with runtime_knobs enabled.
@@ -192,13 +211,17 @@ struct CheckedModule {
     TypeRegistry types;
     std::unordered_map<std::string, ConstValue> constants;
     std::vector<ConstInfo> exported_constants;
+    std::vector<EnumInfo> exported_enums;
     std::vector<RuntimeKnobLayout> runtime_knobs;
     uint32_t runtime_knob_bytes = 0;
     uint32_t telemetry_slots = 0;
     std::vector<ProbeInfo> probes;
+    std::vector<std::string> check_labels;
     std::vector<std::string> exported_functions;
     bool enable_probes = false;
     bool enable_fragment_probes = false;
+    bool enable_checks = false;
+    bool trap_non_finite = false;
     // Module-level resources at descriptors (`@binding(s, b) var name: T;`),
     // each as the bound parameter it stands for, keyed "module::name".
     std::vector<CheckedParam> globals;

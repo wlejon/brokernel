@@ -211,6 +211,23 @@ private:
     std::vector<int32_t> i32_vals_;
 };
 
+/// Result of runtime `check(...)` or `trap_non_finite` diagnostics.
+struct CheckReport {
+    bool ok = true;
+    uint32_t kind = 0; // 0 = ok, 1 = CheckFailed, 2 = NonFinite
+    int32_t coord[3] = {0, 0, 0};
+    std::string label;
+    double value = 0.0;
+    std::string message;
+};
+
+/// One captured runtime sample from `probe_if("label", cond, expr)`.
+struct ConditionalProbeSample {
+    int32_t coord[3] = {0, 0, 0};
+    std::string label;
+    std::vector<double> values;
+};
+
 /// Result of comparing a kernel's CPU build against its GPU (SPIR-V) build.
 struct ParityReport {
     bool ran_gpu = false;
@@ -219,6 +236,9 @@ struct ParityReport {
     double max_abs_diff = 0.0;
     double max_rel_diff = 0.0;
     uint64_t max_ulp_diff = 0;
+    int32_t worst_coord[3] = {0, 0, 0};
+    double cpu_val = 0.0;
+    double gpu_val = 0.0;
     std::string message;
 };
 
@@ -248,6 +268,8 @@ struct CompileOptions {
     int opt_level = 2;
     bool enable_probes = false;
     bool enable_fragment_probes = false;
+    bool enable_checks = false;
+    bool trap_non_finite = false;
     bool runtime_knobs = false;
     uint32_t telemetry_slots = 0;
     std::unordered_map<std::string, ConstValue> knob_overrides;
@@ -307,6 +329,8 @@ struct GpuLaunch {
     uint32_t groups[3] = {1, 1, 1};
     uint32_t local_size[3] = {1, 1, 1};
     size_t probe_arg_index = static_cast<size_t>(-1);
+    size_t probe_if_arg_index = static_cast<size_t>(-1);
+    size_t check_arg_index = static_cast<size_t>(-1);
     size_t telemetry_arg_index = static_cast<size_t>(-1);
 };
 
@@ -335,9 +359,22 @@ public:
     // with one hash are the same kernel (bro.kernel.reload's `kernels`).
     uint64_t code_hash = 0;
     bool probes_compiled = false;
+    std::vector<std::string> check_labels;
+    bool checks_compiled = false;
+    bool trap_non_finite_compiled = false;
     std::function<std::shared_ptr<const CompiledKernel>()> build_probed_variant;
+    std::function<std::shared_ptr<const CompiledKernel>(bool trap_nf)> build_checked_variant;
     std::function<std::string(std::string* err)> build_ptx_variant;
     std::function<MslArtifact(std::string* err)> build_msl_variant;
+
+    bool has_unconditional_probes() const noexcept {
+        for (const auto& p : probes) if (!p.is_conditional) return true;
+        return false;
+    }
+    bool has_conditional_probes() const noexcept {
+        for (const auto& p : probes) if (p.is_conditional) return true;
+        return false;
+    }
     Type return_type = Type::void_type();
     uint32_t return_flat_leaves = 0;
     uint32_t return_byte_size = 0;
@@ -363,6 +400,8 @@ public:
 
     const std::string& ensure_ptx(std::string* err = nullptr) const;
     const MslArtifact& ensure_msl(std::string* err = nullptr) const;
+    std::shared_ptr<const CompiledKernel> ensure_probed_variant() const;
+    std::shared_ptr<const CompiledKernel> ensure_checked_variant(bool trap_non_finite) const;
 
     KernelVerifyReport verify() const;
     KernelSandboxReport verify_sandbox() const;
@@ -601,12 +640,74 @@ public:
         return probe_gpu(gx, gy, gz, shape, std::span<const KernelArg>(args.begin(), args.size()), out, err);
     }
 
+    // -----------------------------------------------------------------------
+    // Runtime Checks (`check("label", cond)` / `trap_non_finite`) & `probe_if`
+    // -----------------------------------------------------------------------
+
+    CheckReport check_cpu(
+        GridShape shape,
+        std::span<const KernelArg> args,
+        bool trap_non_finite = true,
+        std::string* err = nullptr) const;
+    CheckReport check_cpu(
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        bool trap_non_finite = true,
+        std::string* err = nullptr) const {
+        return check_cpu(shape, std::span<const KernelArg>(args.begin(), args.size()), trap_non_finite, err);
+    }
+
+    CheckReport check_gpu(
+        GridShape shape,
+        std::span<const KernelArg> args,
+        bool trap_non_finite = true,
+        std::string* err = nullptr) const;
+    CheckReport check_gpu(
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        bool trap_non_finite = true,
+        std::string* err = nullptr) const {
+        return check_gpu(shape, std::span<const KernelArg>(args.begin(), args.size()), trap_non_finite, err);
+    }
+
+    bool probe_if_cpu(
+        GridShape shape,
+        std::span<const KernelArg> args,
+        std::vector<ConditionalProbeSample>& out,
+        uint32_t max_samples = 32,
+        std::string* err = nullptr) const;
+    bool probe_if_cpu(
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        std::vector<ConditionalProbeSample>& out,
+        uint32_t max_samples = 32,
+        std::string* err = nullptr) const {
+        return probe_if_cpu(shape, std::span<const KernelArg>(args.begin(), args.size()), out, max_samples, err);
+    }
+
+    bool probe_if_gpu(
+        GridShape shape,
+        std::span<const KernelArg> args,
+        std::vector<ConditionalProbeSample>& out,
+        uint32_t max_samples = 32,
+        std::string* err = nullptr) const;
+    bool probe_if_gpu(
+        GridShape shape,
+        std::initializer_list<KernelArg> args,
+        std::vector<ConditionalProbeSample>& out,
+        uint32_t max_samples = 32,
+        std::string* err = nullptr) const {
+        return probe_if_gpu(shape, std::span<const KernelArg>(args.begin(), args.size()), out, max_samples, err);
+    }
+
 private:
     // The Vulkan pipeline, built on the first GPU dispatch and shared by copies.
     struct GpuCache {
         std::mutex mu;
         std::unique_ptr<brass::gpu::VulkanModule> module;
         std::shared_ptr<const CompiledKernel> probed_variant;
+        std::shared_ptr<const CompiledKernel> checked_variant_no_nf;
+        std::shared_ptr<const CompiledKernel> checked_variant_nf;
         bool ptx_tried = false;
         std::string ptx_cached;
         std::string ptx_error;
@@ -638,6 +739,7 @@ struct CompileResult {
     TypeRegistry types;
     std::vector<ResourceInfo> resources;   // by set, then binding
     std::vector<ConstInfo> constants;      // root module's pub consts and @knob consts
+    std::vector<EnumInfo> enums;           // root module's pub enums (and re-exported pub enums)
     std::vector<ProbeInfo> probes;         // distinct probes across compiled functions
     std::vector<std::string> exported_functions; // root module's pub fn names
     std::vector<CompiledKernel> kernels;

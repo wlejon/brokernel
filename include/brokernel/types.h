@@ -51,6 +51,10 @@ struct Type {
     AccessMode access = AccessMode::ReadWrite;
     uint32_t struct_id = UINT32_MAX;
     std::string struct_name;
+    uint32_t newtype_id = UINT32_MAX;
+    std::string newtype_name;
+    uint32_t enum_id = UINT32_MAX;
+    std::string enum_name;
 
     // For composite stores/stencils/arrays whose element is a vector, struct, or nested array:
     TypeKind elem_kind = TypeKind::Scalar;
@@ -99,7 +103,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
-        if (elem.is_array()) t.nested_elem = std::make_shared<Type>(elem);
+        if (elem.is_array() || elem.is_newtype() || elem.is_enum()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -115,6 +119,20 @@ struct Type {
         t.kind = TypeKind::Struct;
         t.struct_id = id;
         t.struct_name = std::move(name);
+        return t;
+    }
+
+    static Type make_newtype(uint32_t id, std::string name, const Type& underlying) {
+        Type t = underlying;
+        t.newtype_id = id;
+        t.newtype_name = std::move(name);
+        return t;
+    }
+
+    static Type make_enum(uint32_t id, std::string name, ScalarKind underlying = ScalarKind::I32) {
+        Type t = scalar_type(underlying);
+        t.enum_id = id;
+        t.enum_name = std::move(name);
         return t;
     }
 
@@ -136,6 +154,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
+        if (elem.is_array() || elem.is_newtype() || elem.is_enum()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -149,6 +168,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
+        if (elem.is_array() || elem.is_newtype() || elem.is_enum()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -189,7 +209,7 @@ struct Type {
         t.elem_lanes = elem.is_vector() ? elem.dimension : 1;
         t.struct_id = elem.struct_id;
         t.struct_name = elem.struct_name;
-        if (elem.is_array()) t.nested_elem = std::make_shared<Type>(elem);
+        if (elem.is_array() || elem.is_newtype() || elem.is_enum()) t.nested_elem = std::make_shared<Type>(elem);
         return t;
     }
 
@@ -210,6 +230,15 @@ struct Type {
         return kind == TypeKind::Array && (image_flags & kMatrix) != 0 && elem_kind == TypeKind::Vector;
     }
     bool is_struct() const noexcept { return kind == TypeKind::Struct; }
+    bool is_newtype() const noexcept { return newtype_id != UINT32_MAX; }
+    bool is_enum() const noexcept { return enum_id != UINT32_MAX; }
+    Type unwrapped() const {
+        if (!is_newtype()) return *this;
+        Type t = *this;
+        t.newtype_id = UINT32_MAX;
+        t.newtype_name.clear();
+        return t;
+    }
     bool is_grid() const noexcept { return kind == TypeKind::Grid; }
     bool is_stencil() const noexcept { return kind == TypeKind::Stencil; }
     bool is_store() const noexcept { return kind == TypeKind::Store; }
@@ -285,12 +314,35 @@ struct StructDef {
     const StructField* find_field(std::string_view fname) const noexcept;
 };
 
+struct NewtypeDef {
+    uint32_t id = 0;
+    std::string name;
+    Type underlying;
+};
+
+struct EnumDef {
+    uint32_t id = 0;
+    std::string name;
+    ScalarKind underlying = ScalarKind::I32;
+};
+
 class TypeRegistry {
 public:
     uint32_t register_struct(StructDef def);
     const StructDef* find_struct(uint32_t id) const noexcept;
     const StructDef* find_struct(std::string_view name) const noexcept;
     const std::vector<StructDef>& structs() const noexcept { return structs_; }
+
+    uint32_t register_newtype(NewtypeDef def);
+    const NewtypeDef* find_newtype(uint32_t id) const noexcept;
+    const NewtypeDef* find_newtype(std::string_view name) const noexcept;
+    const std::vector<NewtypeDef>& newtypes() const noexcept { return newtypes_; }
+    Type unwrap_newtype(const Type& t) const;
+
+    uint32_t register_enum(EnumDef def);
+    const EnumDef* find_enum(uint32_t id) const noexcept;
+    const EnumDef* find_enum(std::string_view name) const noexcept;
+    const std::vector<EnumDef>& enums() const noexcept { return enums_; }
 
     /// Flattens any scalar, vector, array, or struct type into its primitive ScalarKind leaves.
     std::vector<ScalarKind> flatten_scalars(const Type& t) const;
@@ -310,6 +362,8 @@ public:
 
 private:
     std::vector<StructDef> structs_;
+    std::vector<NewtypeDef> newtypes_;
+    std::vector<EnumDef> enums_;
 };
 
 const char* scalar_name(ScalarKind s) noexcept;

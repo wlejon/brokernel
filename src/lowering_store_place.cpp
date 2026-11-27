@@ -98,6 +98,11 @@ bool MirBodyLowerer::store_place(const Expr* e, StorePlace& p) {
     }
     if (e->kind == Expr::Kind::Field) {
         if (!store_place(e->lhs.get(), p) || !p.lanes.empty()) return false;
+        if (p.type.is_newtype()) {
+            if (e->name != "0") return false;
+            p.type = mod.types.unwrap_newtype(p.type);
+            return true;
+        }
         if (p.type.is_scalar()) return true;
         if (p.type.is_struct()) {
             const StructDef* sdef = mod.types.find_struct(p.type.struct_id);
@@ -205,6 +210,11 @@ void MirBodyLowerer::store_place_store(const StorePlace& p, const ValueList& val
                                 ? b.build_and(value[i], b.build_iconst_i32(1))
                                 : value[i];
         b.build_store_indexed(mt, base_ptr, byte_idx, 1, 0, val, bound);
+    }
+    if (mod.trap_non_finite && !p.store.empty()) {
+        if (auto it = store_param.find(p.store[0]); it != store_param.end() && it->second < root_fn.params.size()) {
+            emit_trap_non_finite(root_fn.params[it->second].name, kinds, value, bound);
+        }
     }
 }
 

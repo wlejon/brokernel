@@ -59,6 +59,8 @@ uint32_t Type::size_in_bytes() const noexcept {
 }
 
 std::string Type::to_string() const {
+    if (is_newtype()) return newtype_name;
+    if (is_enum()) return enum_name;
     std::ostringstream oss;
     switch (kind) {
         case TypeKind::Void:
@@ -108,6 +110,8 @@ std::string Type::to_string() const {
 
 bool Type::operator==(const Type& o) const noexcept {
     if (kind != o.kind) return false;
+    if (newtype_id != o.newtype_id) return false;
+    if (enum_id != o.enum_id) return false;
     switch (kind) {
         case TypeKind::Void:
             return true;
@@ -126,11 +130,15 @@ bool Type::operator==(const Type& o) const noexcept {
         case TypeKind::Grid:
             return dimension == o.dimension;
         case TypeKind::Stencil:
+            if (static_cast<bool>(nested_elem) != static_cast<bool>(o.nested_elem)) return false;
+            if (nested_elem && *nested_elem != *o.nested_elem) return false;
             return scalar == o.scalar && dimension == o.dimension &&
                    elem_kind == o.elem_kind && elem_lanes == o.elem_lanes &&
                    struct_id == o.struct_id &&
                    (stencil_radius < 0 || o.stencil_radius < 0 || stencil_radius == o.stencil_radius);
         case TypeKind::Store:
+            if (static_cast<bool>(nested_elem) != static_cast<bool>(o.nested_elem)) return false;
+            if (nested_elem && *nested_elem != *o.nested_elem) return false;
             return scalar == o.scalar && dimension == o.dimension &&
                    access == o.access && elem_kind == o.elem_kind &&
                    elem_lanes == o.elem_lanes && struct_id == o.struct_id;
@@ -187,6 +195,54 @@ const StructDef* TypeRegistry::find_struct(uint32_t id) const noexcept {
 const StructDef* TypeRegistry::find_struct(std::string_view name) const noexcept {
     for (const auto& s : structs_) {
         if (s.name == name) return &s;
+    }
+    return nullptr;
+}
+
+uint32_t TypeRegistry::register_newtype(NewtypeDef def) {
+    for (const auto& existing : newtypes_) {
+        if (existing.name == def.name) return existing.id;
+    }
+    uint32_t id = static_cast<uint32_t>(newtypes_.size());
+    def.id = id;
+    newtypes_.push_back(std::move(def));
+    return id;
+}
+
+const NewtypeDef* TypeRegistry::find_newtype(uint32_t id) const noexcept {
+    return id < newtypes_.size() ? &newtypes_[id] : nullptr;
+}
+
+const NewtypeDef* TypeRegistry::find_newtype(std::string_view name) const noexcept {
+    for (const auto& n : newtypes_) {
+        if (n.name == name) return &n;
+    }
+    return nullptr;
+}
+
+Type TypeRegistry::unwrap_newtype(const Type& t) const {
+    if (!t.is_newtype()) return t;
+    if (const NewtypeDef* def = find_newtype(t.newtype_id)) return def->underlying;
+    return t.unwrapped();
+}
+
+uint32_t TypeRegistry::register_enum(EnumDef def) {
+    for (const auto& existing : enums_) {
+        if (existing.name == def.name) return existing.id;
+    }
+    uint32_t id = static_cast<uint32_t>(enums_.size());
+    def.id = id;
+    enums_.push_back(std::move(def));
+    return id;
+}
+
+const EnumDef* TypeRegistry::find_enum(uint32_t id) const noexcept {
+    return id < enums_.size() ? &enums_[id] : nullptr;
+}
+
+const EnumDef* TypeRegistry::find_enum(std::string_view name) const noexcept {
+    for (const auto& e : enums_) {
+        if (e.name == name) return &e;
     }
     return nullptr;
 }

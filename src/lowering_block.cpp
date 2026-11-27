@@ -67,6 +67,11 @@ bool MirBodyLowerer::block_place(const Expr* e, BlockPlace& p) {
         }
         case Expr::Kind::Field: {
             if (!block_place(e->lhs.get(), p) || !p.lanes.empty()) return false;
+            if (p.type.is_newtype()) {
+                if (e->name != "0") return false;
+                p.type = mod.types.unwrap_newtype(p.type);
+                return true;
+            }
             if (p.type.is_buffer() && p.type.element_type().is_struct()) {
                 p.type = p.type.element_type();
             }
@@ -264,6 +269,7 @@ void MirBodyLowerer::block_store(const Expr* e, const BlockPlace& p, const Value
     } else {
         block_words(p.type, p.std140, p.offset, words, kinds);
     }
+    emit_trap_non_finite(param->name, kinds, value);
     if (!is_gpu) {
         auto it = cpu_block_ptrs.find(p.param);
         brass::Value* base_ptr = it != cpu_block_ptrs.end() ? it->second.first : b.build_iconst_i64(0);
@@ -618,6 +624,11 @@ bool MirBodyLowerer::shared_place(const Expr* e, SharedPlace& p) {
         }
         case Expr::Kind::Field: {
             if (!shared_place(e->lhs.get(), p) || !p.lanes.empty()) return false;
+            if (p.type.is_newtype()) {
+                if (e->name != "0") return false;
+                p.type = mod.types.unwrap_newtype(p.type);
+                return true;
+            }
             if (p.type.is_struct()) {
                 const StructDef* sdef = mod.types.find_struct(p.type.struct_id);
                 const StructField* sf = sdef ? sdef->find_field(e->name) : nullptr;

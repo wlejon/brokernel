@@ -81,6 +81,13 @@ struct MirBodyLowerer {
     brass::Value* cpu_probe_ptr = nullptr;
     brass::Value* cpu_probe_active = nullptr;
     brass::Value* gpu_probe_ptr = nullptr;
+    brass::Value* cpu_probe_if_ptr = nullptr;
+    brass::Value* cpu_probe_if_active = nullptr;
+    brass::Value* gpu_probe_if_ptr = nullptr;
+    brass::Value* cpu_check_ptr = nullptr;
+    brass::Value* cpu_check_active = nullptr;
+    brass::Value* gpu_check_ptr = nullptr;
+    std::vector<std::string> check_labels;
     std::unordered_map<size_t, std::pair<brass::Value*, brass::Value*>> cpu_block_ptrs;
     std::set<size_t> used_block_params;
 
@@ -303,6 +310,23 @@ struct MirBodyLowerer {
 
     ValueList lower_expr(const Expr* e);
     void emit_probe(uint32_t probe_idx, const Type& val_type, const ValueList& vals);
+    // Runtime checks, trap_non_finite, and conditional probe_if (lowering_checks.cpp).
+    uint32_t register_check_label(const std::string& label);
+    void emit_check(const std::string& label, brass::Value* cond);
+    void emit_probe_if(uint32_t probe_idx, brass::Value* cond, const Type& val_type, const ValueList& vals);
+    ValueList lower_check_expr(const Expr* e);
+    ValueList lower_probe_if_expr(const Expr* e);
+    void emit_trap_non_finite(const std::string& label, const std::vector<ScalarKind>& kinds, const ValueList& vals,
+                              const Ops::Bound* bound = nullptr);
+    void trap_non_finite_type(const std::string& label, const Type& t, const ValueList& vals,
+                              const Ops::Bound* bound = nullptr);
+    void trap_non_finite_store(const Type& elem_type, const ValueList& store, const ValueList& vals,
+                               const Ops::Bound* bound);
+    void trap_non_finite_return(const Type& ret_type, const ValueList& vals);
+    void bind_diagnostic_gpu_params(LoweredKernelMir& out, uint32_t& mir_idx);
+    void bind_diagnostic_cpu_params(brass::Value* args_pack, int32_t& slot);
+    void copy_diagnostic_cpu_ptrs(brass::Value* check_p, brass::Value* check_act, brass::Value* pif_p,
+                                  brass::Value* pif_act);
     void lower_stmt(const Stmt* s);
     void lower_stmt_list(const std::vector<StmtPtr>& stmts);
 

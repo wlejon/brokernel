@@ -33,6 +33,17 @@ Type FnCheckState::check_store_lvalue(Expr* e, bool is_compound) {
     if (e->kind == Expr::Kind::Field) {
         Type recv = check_store_lvalue(e->lhs.get(), is_compound);
         const std::string& f = e->name;
+        if (recv.is_newtype()) {
+            if (f == "0") {
+                Type u = ctx.out->types.unwrap_newtype(recv);
+                e->resolved_type = u;
+                mark_type_usage(u);
+                return u;
+            }
+            ctx.diags.error(e->span, "cannot access field '" + f + "' directly on newtype '" +
+                                     recv.to_string() + "' (unwrap with '.0' first)");
+            return Type::void_type();
+        }
         if (recv.is_scalar() && (f == "x" || f == "r")) {
             e->resolved_type = recv;
             return recv;

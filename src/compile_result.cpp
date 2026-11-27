@@ -28,6 +28,25 @@ std::function<std::shared_ptr<const CompiledKernel>()> probed_variant_builder(co
     };
 }
 
+std::function<std::shared_ptr<const CompiledKernel>(bool trap_nf)> checked_variant_builder(
+    const CompileResult& res, const std::string& kernel) {
+    CompileOptions base_opts = res.options;
+    base_opts.entry_name = kernel;
+    return [src = res.source, fname = res.file_name, base_opts, mods = res.loaded_modules, sps = res.search_paths,
+            resolver = res.module_resolver](bool trap_nf) -> std::shared_ptr<const CompiledKernel> {
+        CompileOptions copts = base_opts;
+        copts.enable_checks = true;
+        copts.trap_non_finite = trap_nf;
+        Compiler c;
+        for (const auto& sp : sps) c.add_search_path(sp);
+        for (const auto& [mn, ms] : mods) c.register_module(mn, ms);
+        if (resolver) c.set_module_resolver(resolver);
+        auto cres = c.compile_source(src, fname, copts);
+        if (!cres.ok || cres.kernels.empty()) return nullptr;
+        return std::make_shared<CompiledKernel>(std::move(cres.kernels.front()));
+    };
+}
+
 std::function<std::string(std::string* err)> ptx_variant_builder(const CompileResult& res,
                                                                  const std::string& kernel) {
     CompileOptions popts = res.options;
@@ -195,6 +214,28 @@ const MslArtifact& CompiledKernel::ensure_msl(std::string* err) const {
         *err = gpu_cache_->msl_error.empty() ? ("kernel '" + name + "' MSL compilation failed") : gpu_cache_->msl_error;
     }
     return gpu_cache_->msl_cached;
+}
+
+std::shared_ptr<const CompiledKernel> CompiledKernel::ensure_probed_variant() const {
+    if (probes_compiled || probes.empty() || !build_probed_variant) return nullptr;
+    if (!gpu_cache_) return build_probed_variant();
+    std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+    if (!gpu_cache_->probed_variant) {
+        gpu_cache_->probed_variant = build_probed_variant();
+    }
+    return gpu_cache_->probed_variant;
+}
+
+std::shared_ptr<const CompiledKernel> CompiledKernel::ensure_checked_variant(bool trap_non_finite) const {
+    if (checks_compiled && trap_non_finite_compiled == trap_non_finite) return nullptr;
+    if (!build_checked_variant) return nullptr;
+    if (!gpu_cache_) return build_checked_variant(trap_non_finite);
+    std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+    auto& slot = trap_non_finite ? gpu_cache_->checked_variant_nf : gpu_cache_->checked_variant_no_nf;
+    if (!slot) {
+        slot = build_checked_variant(trap_non_finite);
+    }
+    return slot;
 }
 
 } // namespace brokernel

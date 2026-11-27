@@ -302,6 +302,101 @@ Type FnCheckState::check_ad_or_quadrature_call(Expr* e, std::optional<Type> expe
         return vt;
     }
 
+    // 1b. Runtime assertion: check("label", cond) -> bool
+    if (n == "check" || n == "__check") {
+        if (e->args.size() != 2 || !e->args[0] || e->args[0]->kind != Expr::Kind::StringLit) {
+            ctx.diags.error(sp, "'check(\"label\", cond)' expects a string literal label and a bool condition");
+            if (e->args.size() >= 2) return check_expr(e->args[1].get(), Type::bool_type());
+            return Type::bool_type();
+        }
+        const std::string& label = e->args[0]->name;
+        Type ct = check_expr(e->args[1].get(), Type::bool_type());
+        if (!ct.is_bool()) {
+            ctx.diags.error(e->args[1]->span, "'check' condition must be bool, got '" + ct.to_string() + "'");
+        }
+        uint32_t label_id = 0;
+        bool found_mod = false;
+        for (size_t i = 0; i < ctx.out->check_labels.size(); ++i) {
+            if (ctx.out->check_labels[i] == label) {
+                label_id = static_cast<uint32_t>(i);
+                found_mod = true;
+                break;
+            }
+        }
+        if (!found_mod) {
+            label_id = static_cast<uint32_t>(ctx.out->check_labels.size());
+            ctx.out->check_labels.push_back(label);
+        }
+        bool found_fn = false;
+        for (const auto& existing : fn.check_labels) {
+            if (existing == label) { found_fn = true; break; }
+        }
+        if (!found_fn) fn.check_labels.push_back(label);
+        e->args[0]->int_val = static_cast<int64_t>(label_id);
+        e->args[0]->resolved_type = Type::i32();
+        e->resolved_type = Type::bool_type();
+        e->name = "__check";
+        return Type::bool_type();
+    }
+
+    // 1c. Conditional probe: probe_if("label", cond, expr) -> typeof(expr)
+    if (n == "probe_if" || n == "__probe_if") {
+        if (e->args.size() != 3 || !e->args[0] || e->args[0]->kind != Expr::Kind::StringLit) {
+            ctx.diags.error(sp, "'probe_if(\"label\", cond, expr)' expects a string literal label, bool condition, and value expression");
+            if (e->args.size() >= 3) return check_expr(e->args[2].get(), expected);
+            return Type::f32();
+        }
+        const std::string& label = e->args[0]->name;
+        Type ct = check_expr(e->args[1].get(), Type::bool_type());
+        if (!ct.is_bool()) {
+            ctx.diags.error(e->args[1]->span, "'probe_if' condition must be bool, got '" + ct.to_string() + "'");
+        }
+        Type vt = check_expr(e->args[2].get(), expected);
+        if (is_unsuffixed_literal(e->args[2].get())) {
+            coerce_expr_to_type(e->args[2].get(), expected && expected->is_scalar() ? *expected : Type::f32());
+            vt = e->args[2]->resolved_type;
+        }
+        auto valid_scalar = [](ScalarKind sk) {
+            return sk == ScalarKind::F32 || sk == ScalarKind::F64 || sk == ScalarKind::I32 ||
+                   sk == ScalarKind::U32 || sk == ScalarKind::Bool;
+        };
+        if ((!vt.is_scalar() && !vt.is_vector()) || !valid_scalar(vt.scalar)) {
+            ctx.diags.error(e->args[2]->span,
+                            "probe_if value must be a scalar or vec2..4 of f32/f64/i32/u32/bool, got '" + vt.to_string() + "'");
+        }
+        mark_type_usage(vt);
+        uint32_t probe_idx = 0;
+        bool found_mod = false;
+        for (auto& p : ctx.out->probes) {
+            if (p.name == label) {
+                probe_idx = p.index;
+                p.is_conditional = true;
+                found_mod = true;
+                break;
+            }
+        }
+        if (!found_mod) {
+            probe_idx = static_cast<uint32_t>(ctx.out->probes.size());
+            ctx.out->probes.push_back(ProbeInfo{label, vt, probe_idx, /*is_conditional=*/true});
+        }
+        bool found_fn = false;
+        for (auto& p : fn.probes) {
+            if (p.name == label) {
+                p.is_conditional = true;
+                found_fn = true;
+                break;
+            }
+        }
+        if (!found_fn) {
+            fn.probes.push_back(ProbeInfo{label, vt, probe_idx, /*is_conditional=*/true});
+        }
+        e->args[0]->int_val = static_cast<int64_t>(probe_idx);
+        e->args[0]->resolved_type = Type::i32();
+        e->resolved_type = vt;
+        e->name = "__probe_if";
+        return vt;
+    }
+
     // 2. Higher-order constructs: grad, expect, moments, cell_expect
     size_t min_args = (n == "grad") ? 2 : (n == "cell_expect" ? 4 : 3);
     if (e->args.size() < min_args) {

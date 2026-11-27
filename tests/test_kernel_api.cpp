@@ -5,8 +5,10 @@
 // settleAsyncCompiles; a realm destroyed with a compile pending drops it.
 // CPU only.
 #include "api.h"
+#include "brokernel/brokernel.h"
 #include "embed/embed.h"
 #include "embed/embed_object_builder.h"
+#include "embed/embed_typed_array.h"
 
 #include <atomic>
 #include <chrono>
@@ -379,6 +381,175 @@ void test_realm_destroy() {
     std::cout << "  realm destroyed with a pending compile: ok\n";
 }
 
+void test_diag_constants_and_enums() {
+    setThreadWaitPump(nullptr, 0);
+    ev::Persistent kobj(kernelObj());
+
+    // 1. registerConstants: numbers, booleans, vectors, arrays, [type, val] tuples, and __enum
+    ev::ObjectBuilder decls;
+    decls.set("SCALE", 2);
+    decls.set("FLAG", true);
+    ev::ArrayBuilder vecArr(3);
+    vecArr.set(0, 1.0);
+    vecArr.set(1, 2.5);
+    vecArr.set(2, -3.0);
+    decls.set("OFFSET", vecArr.get());
+
+    ev::ArrayBuilder tupI32(2);
+    tupI32.set(0, "i32");
+    tupI32.set(1, 64);
+    decls.set("COUNT", tupI32.get());
+
+    ev::ArrayBuilder tupU32(2);
+    tupU32.set(0, "u32");
+    tupU32.set(1, 7);
+    decls.set("MASK", tupU32.get());
+
+    ev::ArrayBuilder vecList(2);
+    ev::ArrayBuilder v0(4);
+    v0.set(0, 1.0); v0.set(1, 0.0); v0.set(2, 0.0); v0.set(3, 1.0);
+    ev::ArrayBuilder v1(4);
+    v1.set(0, 0.0); v1.set(1, 1.0); v1.set(2, 0.0); v1.set(3, 1.0);
+    vecList.set(0, v0.get());
+    vecList.set(1, v1.get());
+    ev::ArrayBuilder tupVecArr(2);
+    tupVecArr.set(0, "vec4<f32>");
+    tupVecArr.set(1, vecList.get());
+    decls.set("BASIS", tupVecArr.get());
+
+    ev::ObjectBuilder enumDecl;
+    enumDecl.set("__enum", "u32");
+    enumDecl.set("Grass", 1);
+    enumDecl.set("Rock", 2);
+    decls.set("Biome", enumDecl.get());
+
+    ev::Persistent modName(ev::fromUtf8("test::consts"));
+    ev::Persistent declsVal(decls.get());
+    auto regRes = callMethod(kobj.get(), "registerConstants", {modName.get(), declsVal.get()});
+    CHECK(!regRes.thrown && ev::isString(regRes.value) && ev::toUtf8(regRes.value) == "test::consts");
+
+    const std::string src = R"(
+        import test::consts::*;
+        pub enum Mode : i32 {
+            Off = 0,
+            On = 3,
+        }
+        @kernel @grid(2)
+        fn k_diag(g: grid<2>, inp: read_store<f32, 2>, out: write_store<f32, 2>) -> f32 {
+            let x = inp[g.x(), g.y()];
+            check("nonneg", x >= 0.0);
+            let k = probe_if("big", x > 5.0, vec2<f32>(x, f32(g.x())));
+            let b: u32 = u32(Biome::Rock);
+            let res = k.x * SCALE + OFFSET.y + BASIS[1].y + f32(COUNT) * 0.0 + f32(b) * 0.0;
+            out[g.x(), g.y()] = res;
+            return res;
+        }
+        @kernel fn k_pt(x: f32) -> f32 {
+            check("ok", x > 0.0);
+            return 1.0 / x;
+        }
+    )";
+
+    ev::ObjectBuilder copts;
+    copts.set("enableChecks", true);
+    copts.set("trapNonFinite", true);
+    ev::Persistent coptsVal(copts.get());
+    auto compRes = compileJs("compile", src, coptsVal.get());
+    if (compRes.thrown) std::cerr << messageOf(compRes.value) << "\n";
+    CHECK(!compRes.thrown);
+    ev::Persistent mod(compRes.value);
+
+    // 2. mod.enums reflection
+    ev::Persistent enumsObj(ev::getProperty(mod.get(), "enums"));
+    CHECK(ev::isObject(enumsObj.get()));
+    ev::Persistent modeObj(ev::getProperty(enumsObj.get(), "Mode"));
+    CHECK(ev::isObject(modeObj.get()));
+    CHECK(ev::toDouble(ev::getProperty(modeObj.get(), "Off")) == 0.0);
+    CHECK(ev::toDouble(ev::getProperty(modeObj.get(), "On")) == 3.0);
+
+    // 3. kernel.check & kernel.probeIf on 2D grid kernel
+    ev::Persistent kName(ev::fromUtf8("k_diag"));
+    auto kRes = callMethod(mod.get(), "kernel", {kName.get()});
+    CHECK(!kRes.thrown);
+    ev::Persistent kern(kRes.value);
+
+    constexpr uint32_t W = 4, H = 3;
+    ev::Persistent inp(ev::createTypedArray(ev::elements::Float32, W * H));
+    ev::Persistent out(ev::createTypedArray(ev::elements::Float32, W * H));
+    {
+        auto info = ev::typedArrayInfo(inp.get());
+        auto* fp = reinterpret_cast<float*>(info.data);
+        for (uint32_t i = 0; i < W * H; ++i) fp[i] = 1.0f;
+        fp[1 * W + 2] = 8.0f;
+        fp[2 * W + 3] = -2.0f;
+    }
+
+    ev::ArrayBuilder grid(2);
+    grid.set(0, static_cast<int32_t>(W));
+    grid.set(1, static_cast<int32_t>(H));
+    ev::Persistent gridVal(grid.get());
+
+    auto chk = callMethod(kern.get(), "check", {gridVal.get(), inp.get(), out.get()});
+    CHECK(!chk.thrown && ev::isObject(chk.value));
+    ev::Persistent chkObj(chk.value);
+    CHECK(!ev::toBool(ev::getProperty(chkObj.get(), "ok")));
+    CHECK(ev::toUtf8(ev::getProperty(chkObj.get(), "kind")) == "check");
+    CHECK(ev::toUtf8(ev::getProperty(chkObj.get(), "label")) == "nonneg");
+    ev::Persistent coord(ev::getProperty(chkObj.get(), "coord"));
+    CHECK(ev::toDouble(ev::getElement(coord.get(), 0)) == 3.0);
+    CHECK(ev::toDouble(ev::getElement(coord.get(), 1)) == 2.0);
+    CHECK(ev::toDouble(ev::getElement(coord.get(), 2)) == 0.0);
+
+    ev::ObjectBuilder pifOpts;
+    pifOpts.set("maxSamples", 8);
+    ev::Persistent pifOptsVal(pifOpts.get());
+    auto pif = callMethod(kern.get(), "probeIf", {gridVal.get(), inp.get(), out.get(), pifOptsVal.get()});
+    CHECK(!pif.thrown && ev::isObject(pif.value));
+    ev::Persistent pifArr(pif.value);
+    CHECK(ev::toDouble(ev::getProperty(pifArr.get(), "length")) == 1.0);
+    ev::Persistent s0(ev::getElement(pifArr.get(), 0));
+    CHECK(ev::toUtf8(ev::getProperty(s0.get(), "label")) == "big");
+    ev::Persistent s0Coord(ev::getProperty(s0.get(), "coord"));
+    CHECK(ev::toDouble(ev::getElement(s0Coord.get(), 0)) == 2.0);
+    CHECK(ev::toDouble(ev::getElement(s0Coord.get(), 1)) == 1.0);
+    ev::Persistent s0Val(ev::getProperty(s0.get(), "value"));
+    CHECK(ev::toDouble(ev::getElement(s0Val.get(), 0)) == 8.0);
+    CHECK(ev::toDouble(ev::getElement(s0Val.get(), 1)) == 2.0);
+
+    // 4. point kernel check (trapNonFinite on 1.0 / 0.0)
+    ev::Persistent ptName(ev::fromUtf8("k_pt"));
+    auto ptRes = callMethod(mod.get(), "kernel", {ptName.get()});
+    CHECK(!ptRes.thrown);
+    ev::Persistent ptKern(ptRes.value);
+    auto ptChk = callMethod(ptKern.get(), "check", {ev::fromDouble(0.0)});
+    CHECK(!ptChk.thrown && ev::isObject(ptChk.value));
+    ev::Persistent ptChkObj(ptChk.value);
+    CHECK(!ev::toBool(ev::getProperty(ptChkObj.get(), "ok")));
+    CHECK(ev::toUtf8(ev::getProperty(ptChkObj.get(), "kind")) == "check");
+
+    ev::ObjectBuilder noCheckNf;
+    noCheckNf.set("trapNonFinite", true);
+    ev::Persistent noCheckNfVal(noCheckNf.get());
+    auto ptInf = callMethod(ptKern.get(), "check", {ev::fromDouble(0.0), noCheckNfVal.get()});
+    CHECK(!ptInf.thrown);
+
+    // 5. compareCpuGpu (works with or without Vulkan, checking fields)
+    ev::ObjectBuilder cmpOpts;
+    cmpOpts.set("relTol", 1e-4);
+    cmpOpts.set("absTol", 1e-5);
+    ev::Persistent cmpOptsVal(cmpOpts.get());
+    auto cmp = callMethod(kern.get(), "compareCpuGpu", {gridVal.get(), inp.get(), out.get(), cmpOptsVal.get()});
+    CHECK(!cmp.thrown && ev::isObject(cmp.value));
+    ev::Persistent cmpObj(cmp.value);
+    ev::Persistent wc(ev::getProperty(cmpObj.get(), "worstCoord"));
+    CHECK(ev::toDouble(ev::getProperty(wc.get(), "length")) == 3.0);
+    if (ev::toBool(ev::getProperty(cmpObj.get(), "ranGpu"))) {
+        CHECK(ev::toBool(ev::getProperty(cmpObj.get(), "ok")));
+    }
+
+    std::cout << "  diag, constants, enums, check, probeIf, compareCpuGpu: ok\n";
+}
+
 } // namespace
 
 int main() {
@@ -388,6 +559,7 @@ int main() {
     test_resolver_channel();
     test_async();
     test_realm_destroy();
+    test_diag_constants_and_enums();
     setThreadWaitPump(nullptr, 0);
     std::cout << "test_kernel_api: all passed\n";
     return 0;

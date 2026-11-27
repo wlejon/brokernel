@@ -13,6 +13,25 @@ namespace brokernel::detail {
 // the kernel named `kernel` alone.
 std::function<std::shared_ptr<const CompiledKernel>()> probed_variant_builder(const CompileResult& res,
                                                                               const std::string& kernel);
+std::function<std::shared_ptr<const CompiledKernel>(bool trap_nf)> checked_variant_builder(const CompileResult& res,
+                                                                                           const std::string& kernel);
+
+// Thread-local CPU diagnostic buffers & runtime formatting helpers (runtime_checks.cpp).
+uint32_t* active_cpu_check_buf();
+uint32_t* active_cpu_probe_if_buf();
+struct ScopedCpuCheckBuf {
+    uint32_t* prev;
+    explicit ScopedCpuCheckBuf(uint32_t* buf);
+    ~ScopedCpuCheckBuf();
+};
+struct ScopedCpuProbeIfBuf {
+    uint32_t* prev;
+    explicit ScopedCpuProbeIfBuf(uint32_t* buf);
+    ~ScopedCpuProbeIfBuf();
+};
+CheckReport decode_check_report(const CompiledKernel& k, const uint32_t words[8]);
+void decode_probe_if_samples(const CompiledKernel& k, const std::vector<uint32_t>& words, uint32_t max_samples,
+                             std::vector<ConditionalProbeSample>& out);
 
 std::function<std::string(std::string* err)> ptx_variant_builder(const CompileResult& res,
                                                                  const std::string& kernel);
@@ -39,5 +58,19 @@ void finish_gpu_telemetry_bounce(const TelemetryVkBounce& bounce);
 // Emits optional PTX/MSL text targets onto `ck` (kernel_verify.cpp).
 void emit_optional_gpu_targets(const CompileOptions& opts, const CheckedFunction& fn,
                                const brass::Function& gpu_fn, CompiledKernel& ck);
+
+inline size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
+    size_t c = 0;
+    for (const auto& p : params) if (!is_bound_param(p.role)) ++c;
+    return c;
+}
+
+inline size_t count_param_blocks(const std::vector<KernelParamInfo>& params) noexcept {
+    size_t c = 0;
+    for (const auto& p : params) {
+        if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) ++c;
+    }
+    return c;
+}
 
 } // namespace brokernel::detail

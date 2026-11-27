@@ -81,12 +81,31 @@ rapid world iteration by a coding agent:
     (and `Compiler::set_module_resolver` in C++) resolve imported modules on
     demand by name (`"world::fields"`), so callers never have to thread a
     `{ modules }` map by hand.
-- **Shared declarations with JS (`mod.consts`, `mod.structLayout`).**
+- **Shared declarations with JS (`mod.consts`, `mod.enums`, `mod.structLayout`, `bro.kernel.registerConstants`).**
   - Every `pub const` (and re-exported `pub const`) in a module is reflected on
     `mod.consts` as a JS number, boolean, or array (`CompileResult::constants`
     in C++).
+  - `pub enum Name : i32|u32 { ... }` declarations (and `pub newtype Name = T;`,
+    compile-time `sizeof<T>()` / `offsetof<S, field>()`) provide strong nominal
+    types, reflected on `mod.enums` (`CompileResult::enums` in C++).
+  - `bro.kernel.registerConstants(name, decls)` generates and registers a `.bk`
+    constants/enums module from JS values, `[type, value]` tuples, or
+    `{ __enum: 'i32'|'u32', ...variants }` objects.
   - `mod.structLayout(name)` returns `{ name, byteSize, std140Size, std140Align, std430Size, std430Align, fields: [{ name, type, byteOffset, std140Offset, std430Offset }] }`
     so host code and kernels share one source of truth for buffer layouts.
+- **Runtime diagnostics & parity (`check`, `trap_non_finite`, `probe_if`, `compare_cpu_gpu`).**
+  - `check("label", cond)` returns `cond` as a `bool` and records the first
+    failing `(x, y, z)` cell coordinate when compiled with `enable_checks` /
+    `{ enableChecks: true }` or inspected via `kernel.check(...)` /
+    `CompiledKernel::check_cpu` / `check_gpu` (which also traps NaN/Inf store
+    and return writes when `trap_non_finite` / `trapNonFinite` is enabled).
+  - `probe_if("label", cond, expr)` captures up to `maxSamples` conditional
+    samples with coordinates via `kernel.probeIf(...)` / `probe_if_cpu` / `probe_if_gpu`.
+  - `compare_cpu_gpu` / `kernel.compareCpuGpu(grid, ...args, { relTol, absTol, ulpTol })`
+    reports `worst_coord` (`worstCoord`), `cpu_val` (`cpuVal`), and `gpu_val` (`gpuVal`).
+- **Standalone CLI checker (`brokernel-check`).**
+  - Type-checks and compiles `.bk` files or directories (`-I <dir>`,
+    `--resolve <prefix>=<dir>`, `--verify`, `--no-spirv`, `--enable-checks`, `--json`).
 
 ## Core execution model
 

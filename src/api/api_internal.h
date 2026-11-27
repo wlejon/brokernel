@@ -297,6 +297,7 @@ bool threadHasJsResolver();
 std::optional<std::string> resolveFromTables(std::string_view name, bool withHostModules);
 std::optional<std::string> resolveWithJs(std::string_view name, ev::Persistent& thrown, bool& threw);
 void registerModulesInto(Compiler& compiler);
+void registerNamedModuleSource(std::string_view name, std::string source);
 void decorateModuleRegistry(ev::ObjectBuilder& b);   // resolve, registerModule, clearModules
 void decorateAsync(ev::ObjectBuilder& b);            // compileAsync
 void installAsyncRealmHook();
@@ -306,6 +307,9 @@ void decorateModuleExtras(ev::ObjectBuilder& b);
 void decorateKernelExtras(ev::ObjectBuilder& b);
 void decorateBroKernelExtras(ev::ObjectBuilder& b);
 void decorateReload(ev::ObjectBuilder& b);   // bro.kernel.reload (api_reload.cpp)
+void decorateKernelDiagExtras(ev::ObjectBuilder& b);
+void decorateModuleDiagExtras(ev::ObjectBuilder& b);
+void decorateBroKernelDiagExtras(ev::ObjectBuilder& b);
 
 // Dual-residency buffers & structView (api_buffer.cpp).
 Value js_createBuffer(Value self, std::span<const Value> args);

@@ -700,6 +700,7 @@ void decorateKernelExtras(ev::ObjectBuilder& b) {
     b.def("stats", 0, js_kernelStats);
     b.def("exportNative", 1, js_kernelExportNative);
     decorateKernelTargetExtras(b);
+    decorateKernelDiagExtras(b);
 }
 
 void decorateModuleExtras(ev::ObjectBuilder& b) {
@@ -831,11 +832,13 @@ void decorateModuleExtras(ev::ObjectBuilder& b) {
         }
         return g_fnClass.createInstance(std::move(fn_handle));
     });
+    decorateModuleDiagExtras(b);
 }
 
 void decorateBroKernelExtras(ev::ObjectBuilder& b) {
     decorateModuleRegistry(b);
     decorateReload(b);
+    decorateBroKernelDiagExtras(b);
 }
 
 void configureCompilerModulesAndOptions(
@@ -879,6 +882,10 @@ void configureCompilerModulesAndOptions(
         if (ev::isBool(ep)) compile_opts.enable_probes = ev::toBool(ep);
         const Value efp = ev::getProperty(opts.get(), "enableFragmentProbes");
         if (ev::isBool(efp)) compile_opts.enable_fragment_probes = ev::toBool(efp);
+        const Value ec = ev::getProperty(opts.get(), "enableChecks");
+        if (ev::isBool(ec)) compile_opts.enable_checks = ev::toBool(ec);
+        const Value tnf = ev::getProperty(opts.get(), "trapNonFinite");
+        if (ev::isBool(tnf)) compile_opts.trap_non_finite = ev::toBool(tnf);
         const Value rtk = ev::getProperty(opts.get(), "runtimeKnobs");
         if (ev::isBool(rtk)) compile_opts.runtime_knobs = ev::toBool(rtk);
         const Value tsl = ev::getProperty(opts.get(), "telemetrySlots");

@@ -475,6 +475,12 @@ struct AdSynthesizer {
         if ((n == "probe" || n == "__probe") && e->args.size() == 2) {
             return diff_expr(e->args[1].get());
         }
+        if ((n == "probe_if" || n == "__probe_if") && e->args.size() == 3) {
+            return diff_expr(e->args[2].get());
+        }
+        if ((n == "check" || n == "__check") && e->args.size() == 2) {
+            return make_zero_expr(t, ctx.out->types, sp);
+        }
         if (n == "__splat" && e->args.size() == 1) {
             std::vector<ExprPtr> a;
             a.push_back(diff_expr(e->args[0].get()));

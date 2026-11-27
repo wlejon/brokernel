@@ -150,6 +150,14 @@ void registerModulesInto(Compiler& compiler) {
     for (const auto& [name, src] : g_registeredModules) compiler.register_module(name, src);
 }
 
+void registerNamedModuleSource(std::string_view name, std::string source) {
+    const Keys k(name);
+    std::lock_guard<std::mutex> lock(g_registeredModulesMu);
+    g_registeredModules[k.exact] = source;
+    g_registeredModules[k.norm] = source;
+    g_registeredModules[k.canon] = std::move(source);
+}
+
 void decorateModuleRegistry(ev::ObjectBuilder& b) {
     b.def("resolve", 1, [](Value, std::span<const Value> args) -> Value {
         if (args.empty() || ev::isNull(args[0]) || ev::isUndefined(args[0])) {

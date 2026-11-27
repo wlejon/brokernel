@@ -32,6 +32,7 @@ TokenKind classify_keyword(std::string_view text) noexcept {
     if (text == "pub")      return TokenKind::KwPub;
     if (text == "fn")       return TokenKind::KwFn;
     if (text == "struct")   return TokenKind::KwStruct;
+    if (text == "enum")     return TokenKind::KwEnum;
     if (text == "const")    return TokenKind::KwConst;
     if (text == "let")      return TokenKind::KwLet;
     if (text == "var")      return TokenKind::KwVar;

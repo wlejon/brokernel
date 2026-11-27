@@ -79,10 +79,13 @@ CompileResult Compiler::compile_uncached(
     }
     checked->enable_probes = opts.enable_probes;
     checked->enable_fragment_probes = opts.enable_fragment_probes;
+    checked->enable_checks = opts.enable_checks;
+    checked->trap_non_finite = opts.trap_non_finite;
 
     res.module_name = checked->module_name;
     res.types = checked->types;
     res.constants = checked->exported_constants;
+    res.enums = checked->exported_enums;
     res.probes = checked->probes;
     res.exported_functions = checked->exported_functions;
     for (const auto& [key, index] : checked->global_index) {
@@ -165,7 +168,11 @@ CompileResult Compiler::compile_uncached(
         ck.block_bindings = lowered.block_bindings;
         ck.probes = fn->probes;
         ck.probes_compiled = opts.enable_probes && !fn->probes.empty();
+        ck.check_labels = std::move(lowered.check_labels);
+        ck.checks_compiled = opts.enable_checks;
+        ck.trap_non_finite_compiled = opts.trap_non_finite;
         if (!opts.enable_probes && !fn->probes.empty()) ck.build_probed_variant = detail::probed_variant_builder(res, ck.name);
+        ck.build_checked_variant = detail::checked_variant_builder(res, ck.name);
         if (!opts.emit_ptx && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
             ck.build_ptx_variant = detail::ptx_variant_builder(res, ck.name);
         }
@@ -258,10 +265,12 @@ CompileResult Compiler::compile_uncached(
             if (opts.compile_cpu && has_cpu_lowering(*fn)) {
                 auto cpu = detail::new_cpu_build(opts);
                 // The CPU functions from the checked module, into the build.
-                auto lower = [checked, fn, bindings = lowered.block_bindings](CompiledKernel::CpuBuild& b,
-                                                                             DiagnosticBag& diags) {
+                auto lower = [checked, fn, bindings = lowered.block_bindings,
+                              labels = ck.check_labels](CompiledKernel::CpuBuild& b,
+                                                        DiagnosticBag& diags) {
                     LoweredKernelMir cpu_mir;
                     cpu_mir.block_bindings = bindings;
+                    cpu_mir.check_labels = labels;
                     lower_kernel_cpu_to_mir(*checked, *fn, cpu_mir, diags);
                     b.module = std::move(cpu_mir.cpu_module);
                     b.point = cpu_mir.cpu_point_function;

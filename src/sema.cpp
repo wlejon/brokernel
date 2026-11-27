@@ -48,6 +48,7 @@ bool SemaContext::symbol_exists_in_module(
     if (it == modules.end() || !it->second.ast) return false;
     const auto& scope = it->second;
     if (scope.fn_by_name.count(sym) || scope.struct_by_name.count(sym) ||
+        scope.enum_by_name.count(sym) || scope.newtype_by_name.count(sym) ||
         scope.const_by_name.count(sym) || scope.binding_by_name.count(sym)) {
         if (resolved_mod_out) *resolved_mod_out = mod_name;
         if (resolved_sym_out) *resolved_sym_out = sym;
@@ -174,6 +175,10 @@ bool SemaContext::load_and_index_module(
     for (const auto& fn : ast.functions) scope.fn_by_name.emplace(fn.name, &fn);
     scope.struct_by_name.reserve(ast.structs.size());
     for (const auto& st : ast.structs) scope.struct_by_name.emplace(st.name, &st);
+    scope.enum_by_name.reserve(ast.enums.size());
+    for (const auto& ed : ast.enums) scope.enum_by_name.emplace(ed.name, &ed);
+    scope.newtype_by_name.reserve(ast.newtypes.size());
+    for (const auto& nt : ast.newtypes) scope.newtype_by_name.emplace(nt.name, &nt);
     scope.const_by_name.reserve(ast.consts.size());
     for (const auto& c : ast.consts) {
         scope.const_by_name.emplace(c.name, &c);
@@ -188,7 +193,27 @@ bool SemaContext::load_and_index_module(
         std::string target_key = !imp.file_path.empty()
                                      ? imp.file_path
                                      : ModuleRegistry::format_module_path(imp.module_path);
-        const ModuleAst* imported = registry.load_module(target_key, imp.span, diags, file_dir);
+        std::vector<std::string> eff_symbols = imp.symbols;
+        const ModuleAst* imported = nullptr;
+        if (imp.file_path.empty() && imp.symbols.empty() && !imp.wildcard && imp.alias.empty() &&
+            imp.module_path.size() >= 2) {
+            DiagnosticBag probe_diags;
+            imported = registry.load_module(target_key, imp.span, probe_diags, file_dir);
+            if (!imported) {
+                std::vector<std::string> parent_path(imp.module_path.begin(), imp.module_path.end() - 1);
+                std::string parent_key = ModuleRegistry::format_module_path(parent_path);
+                DiagnosticBag parent_diags;
+                if (const ModuleAst* parent_mod = registry.load_module(parent_key, imp.span, parent_diags, file_dir)) {
+                    imported = parent_mod;
+                    target_key = parent_key;
+                    eff_symbols.push_back(imp.module_path.back());
+                } else {
+                    diags.merge_from(probe_diags);
+                }
+            }
+        } else {
+            imported = registry.load_module(target_key, imp.span, diags, file_dir);
+        }
         if (!imported) continue;
 
         std::string target_canon = !imported->module_name.empty() ? imported->module_name : target_key;
@@ -205,7 +230,9 @@ bool SemaContext::load_and_index_module(
         }
         std::string local_mod_name = imp.alias;
         if (local_mod_name.empty()) {
-            if (!imp.module_path.empty()) {
+            if (imp.symbols.empty() && !eff_symbols.empty() && imp.module_path.size() >= 2) {
+                local_mod_name = imp.module_path[imp.module_path.size() - 2];
+            } else if (!imp.module_path.empty()) {
                 local_mod_name = imp.module_path.back();
             } else {
                 local_mod_name = target_canon;
@@ -213,8 +240,11 @@ bool SemaContext::load_and_index_module(
         }
         cur_scope.module_aliases[local_mod_name] = target_canon;
         cur_scope.module_aliases[target_canon] = target_canon;
-        if (!imp.module_path.empty()) {
+        if (!imp.module_path.empty() && eff_symbols.empty()) {
             cur_scope.module_aliases[ModuleRegistry::format_module_path(imp.module_path)] = target_canon;
+        } else if (!imp.module_path.empty()) {
+            std::vector<std::string> parent_path(imp.module_path.begin(), imp.module_path.end() - 1);
+            cur_scope.module_aliases[ModuleRegistry::format_module_path(parent_path)] = target_canon;
         }
 
         if (imp.wildcard) {
@@ -222,11 +252,11 @@ bool SemaContext::load_and_index_module(
             if (imp.is_pub) {
                 cur_scope.pub_wildcard_modules.push_back(target_canon);
             }
-        } else if (imp.is_pub && imp.symbols.empty() && imp.alias.empty()) {
+        } else if (imp.is_pub && eff_symbols.empty() && imp.alias.empty()) {
             cur_scope.wildcard_modules.push_back(target_canon);
             cur_scope.pub_wildcard_modules.push_back(target_canon);
         }
-        for (const auto& sym : imp.symbols) {
+        for (const auto& sym : eff_symbols) {
             std::string orig_mod;
             std::string orig_sym;
             std::set<std::string> visited;
@@ -387,9 +417,10 @@ std::optional<ConstValue> SemaContext::find_const(
         auto single_it = mscope.module_aliases.find(mod_parts[0]);
         if (single_it != mscope.module_aliases.end()) target_mod = single_it->second;
     }
-    if (target_mod.empty()) return std::nullopt;
+    if (target_mod.empty()) return find_enum_variant_const(current_mod, path, name);
     std::set<std::string> visited;
-    return find_const_in_module(target_mod, path.back(), visited);
+    if (auto cv = find_const_in_module(target_mod, path.back(), visited)) return cv;
+    return find_enum_variant_const(current_mod, path, name);
 }
 
 int32_t SemaContext::find_global(const std::string& current_mod, const std::vector<std::string>& path,
@@ -710,7 +741,10 @@ Type SemaContext::resolve_type(
         }
     }
 
-    // 9. User-defined or imported Struct (possibly generic)
+    // 9. User-defined or imported Enum / Newtype / Struct (possibly generic)
+    if (auto nt_or_enum = resolve_enum_or_newtype_type(texpr, current_mod)) {
+        return *nt_or_enum;
+    }
     std::string st_mod;
     const StructDecl* sdecl = find_struct_decl(current_mod, n, &st_mod);
     if (sdecl) {
@@ -807,22 +841,26 @@ std::unique_ptr<CheckedModule> check_module(
         const ModuleAst* ast = mod_scope.ast;
         if (!ast) continue;
 
-        if (!mod_scope.has_transitive_knob && detail::lookup_cached_module_consts(ast, cached_consts)) {
+        const bool can_use_const_cache = !mod_scope.has_transitive_knob && ast->enums.empty() && ast->newtypes.empty();
+        if (can_use_const_cache && detail::lookup_cached_module_consts(ast, cached_consts)) {
             for (const auto& [cname, cv] : cached_consts) {
                 ctx.out->constants[mod_name + "::" + cname] = cv;
                 if (mod_name == root_name) {
                     ctx.out->constants[cname] = cv;
                 }
             }
+            ctx.evaluate_module_enums(mod_name, root_name);
         } else {
             cached_consts.clear();
-            bool store_consts = !mod_scope.has_transitive_knob && !ast->consts.empty();
-            for (const auto& const_decl : ast->consts) {
+            bool store_consts = can_use_const_cache && !ast->consts.empty();
+            auto apply_const_decl = [&](const ConstDecl& const_decl, bool emit_err) -> bool {
                 auto cv_opt = ctx.eval_const_expr(const_decl.value.get(), mod_name, empty_env, {});
                 if (!cv_opt) {
-                    diags.error(const_decl.span, "constant '" + const_decl.name + "' initializer must be a compile-time constant expression");
-                    store_consts = false;
-                    continue;
+                    if (emit_err) {
+                        diags.error(const_decl.span, "constant '" + const_decl.name + "' initializer must be a compile-time constant expression");
+                        store_consts = false;
+                    }
+                    return false;
                 }
                 ConstValue cv = *cv_opt;
                 if (const_decl.type) {
@@ -836,17 +874,43 @@ std::unique_ptr<CheckedModule> check_module(
                         cv = detail::convert_const_value(oit->second, cv.type, ctx.out->types);
                     }
                 }
+                if (cv.type.is_enum() || cv.type.is_newtype()) store_consts = false;
                 ctx.out->constants[mod_name + "::" + const_decl.name] = cv;
                 if (mod_name == root_name) {
                     ctx.out->constants[const_decl.name] = cv;
                 }
                 if (store_consts) cached_consts.emplace_back(const_decl.name, cv);
+                return true;
+            };
+            std::vector<size_t> deferred_consts;
+            for (size_t ci = 0; ci < ast->consts.size(); ++ci) {
+                if (!apply_const_decl(ast->consts[ci], false)) deferred_consts.push_back(ci);
+            }
+            ctx.evaluate_module_enums(mod_name, root_name);
+            bool progress = true;
+            while (!deferred_consts.empty() && progress) {
+                progress = false;
+                std::vector<size_t> next_deferred;
+                for (size_t ci : deferred_consts) {
+                    if (apply_const_decl(ast->consts[ci], false)) progress = true;
+                    else next_deferred.push_back(ci);
+                }
+                deferred_consts = std::move(next_deferred);
+            }
+            for (size_t ci : deferred_consts) {
+                apply_const_decl(ast->consts[ci], true);
             }
             if (store_consts) {
                 detail::store_cached_module_consts(ast, std::move(cached_consts));
             }
         }
 
+        for (const auto& ntdecl : ast->newtypes) {
+            TypeExpr te;
+            te.span = ntdecl.span;
+            te.name = ntdecl.name;
+            ctx.resolve_type(&te, mod_name, empty_env);
+        }
         for (const auto& sdecl : ast->structs) {
             if (!sdecl.generic_params.empty()) continue; // Instantiated on demand
             TypeExpr te;
@@ -856,52 +920,8 @@ std::unique_ptr<CheckedModule> check_module(
         }
     }
     ctx.init_knobs_layout();
-
-    // Collect exported constants (`pub const`, `@knob const`, and re-exported `pub const`s)
-    // and exported functions (`pub fn`).
-    {
-        std::set<std::string> seen_consts;
-        std::set<std::string> visited_mods;
-        auto add_const_info = [&](const std::string& exported_name, const std::string& mod_name, const ConstDecl& cd) {
-            if (!seen_consts.insert(exported_name).second) return;
-            auto cit = ctx.out->constants.find(mod_name + "::" + cd.name);
-            if (cit == ctx.out->constants.end()) return;
-            ctx.out->exported_constants.push_back(ConstInfo{
-                exported_name, mod_name, cit->second.type, cit->second, cd.is_knob});
-        };
-        std::function<void(const std::string&)> collect_mod_exports = [&](const std::string& mname) {
-            if (!visited_mods.insert(mname).second) return;
-            auto mit = ctx.modules.find(mname);
-            if (mit == ctx.modules.end() || !mit->second.ast) return;
-            const auto& mscope = mit->second;
-            for (const auto& cd : mscope.ast->consts) {
-                if (cd.is_pub || cd.is_knob) {
-                    add_const_info(cd.name, mname, cd);
-                }
-            }
-            for (const auto& [local_sym, target] : mscope.pub_imported_symbols) {
-                auto tmit = ctx.modules.find(target.first);
-                if (tmit != ctx.modules.end()) {
-                    if (auto cit = tmit->second.const_by_name.find(target.second);
-                        cit != tmit->second.const_by_name.end()) {
-                        add_const_info(local_sym, target.first, *cit->second);
-                    }
-                }
-            }
-            for (const auto& wmod : mscope.pub_wildcard_modules) {
-                collect_mod_exports(wmod);
-            }
-        };
-        collect_mod_exports(root_name);
-        // Also expose any `@knob` from imported modules
-        for (const auto& mod_name : ctx.module_order) {
-            const ModuleAst* ast = ctx.modules[mod_name].ast;
-            if (!ast) continue;
-            for (const auto& cd : ast->consts) {
-                if (cd.is_knob) add_const_info(cd.name, mod_name, cd);
-            }
-        }
-    }
+    ctx.collect_exported_constants(root_name);
+    ctx.collect_exported_enums(root_name);
 
     ctx.resolve_globals();
 

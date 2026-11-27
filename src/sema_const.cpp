@@ -45,7 +45,9 @@ static void flatten_const_leaves(const ConstValue& cv, std::vector<ConstValue>& 
 static ConstValue unflatten_const_value(const Type& t, const std::vector<ConstValue>& leaves, size_t& idx) {
     if (t.is_scalar()) {
         ConstValue src = (idx < leaves.size()) ? leaves[idx++] : ConstValue{};
-        return convert_const_scalar(src, t.scalar);
+        ConstValue out = convert_const_scalar(src, t.scalar);
+        out.type = t;
+        return out;
     }
     ConstValue out;
     out.type = t;
@@ -58,6 +60,12 @@ static ConstValue unflatten_const_value(const Type& t, const std::vector<ConstVa
 }
 
 ConstValue convert_const_value(const ConstValue& cv, const Type& target, const TypeRegistry& types) {
+    if (target.is_newtype() || target.is_enum()) {
+        Type u = target.is_newtype() ? types.unwrap_newtype(target) : Type::scalar_type(target.scalar);
+        ConstValue res = convert_const_value(cv, u, types);
+        res.type = target;
+        return res;
+    }
     if (target.is_scalar()) {
         return convert_const_scalar(cv, target.scalar);
     }
@@ -238,7 +246,9 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
     switch (e->kind) {
         case Expr::Kind::IntLit: {
             ConstValue cv;
-            cv.type = (e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::i32();
+            cv.type = !e->resolved_type.is_void()
+                          ? e->resolved_type
+                          : ((e->literal_suffix != ScalarKind::Void) ? Type::scalar_type(e->literal_suffix) : Type::i32());
             cv.int_val = e->int_val;
             cv.float_val = static_cast<double>(e->int_val);
             cv.bool_val = (e->int_val != 0);
@@ -286,6 +296,12 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
         case Expr::Kind::Field: {
             auto sub = eval_const_expr(e->lhs.get(), current_mod, genv, scopes);
             if (!sub) return std::nullopt;
+            if (sub->type.is_newtype()) {
+                if (e->name != "0") return std::nullopt;
+                ConstValue res = *sub;
+                res.type = out->types.unwrap_newtype(sub->type);
+                return res;
+            }
             if (sub->type.is_scalar() && (e->name == "x" || e->name == "r")) {
                 return sub;
             }
@@ -343,7 +359,7 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
                 TypeExpr te{e->span, n, {}};
                 return convert_const_value(*sub, resolve_type(&te, current_mod, genv), out->types);
             }
-            if ((n == "is_f64" || n == "sizeof") && e->generic_args.size() == 1 && e->args.empty()) {
+            if (n == "is_f64" && e->generic_args.size() == 1 && e->args.empty()) {
                 Type t = Type::f32();
                 const auto& ga = e->generic_args[0];
                 if (ga.type_arg) {
@@ -352,12 +368,23 @@ std::optional<ConstValue> SemaContext::eval_const_expr(
                     TypeExpr tmp{ga.span, ga.ident_or_const_name, {}};
                     t = resolve_type(&tmp, current_mod, genv);
                 }
-                if (n == "is_f64") {
-                    bool b = (t.scalar == ScalarKind::F64);
-                    return ConstValue{Type::bool_type(), b ? 1 : 0, b ? 1.0 : 0.0, b};
+                bool b = (t.scalar == ScalarKind::F64);
+                return ConstValue{Type::bool_type(), b ? 1 : 0, b ? 1.0 : 0.0, b};
+            }
+            if (n == "sizeof" || n == "std430_sizeof" || n == "std140_sizeof" ||
+                n == "offsetof" || n == "std430_offsetof" || n == "std140_offsetof") {
+                return eval_sizeof_offsetof_query(e, current_mod, genv, nullptr);
+            }
+            if (e->generic_args.empty() && e->args.size() == 1) {
+                std::string qname = e->path.empty() ? n : ModuleRegistry::format_module_path(e->path);
+                std::string nt_mod;
+                if (find_newtype_decl(current_mod, qname, &nt_mod)) {
+                    auto av = eval_const_expr(e->args[0].get(), current_mod, genv, scopes);
+                    if (!av) return std::nullopt;
+                    TypeExpr te{e->span, qname, {}};
+                    Type nt_type = resolve_type(&te, current_mod, genv);
+                    return convert_const_value(*av, nt_type, out->types);
                 }
-                int64_t sz = static_cast<int64_t>(out->types.byte_size(t));
-                return ConstValue{Type::i32(), sz, static_cast<double>(sz), false};
             }
             if (n == "vec2" || n == "vec3" || n == "vec4" ||
                 n == "vec2f" || n == "vec3f" || n == "vec4f" ||
@@ -735,6 +762,10 @@ void FnCheckState::check_stmt(Stmt* s) {
             }
             if (s->compound_op.has_value() && !target_t.is_numeric()) {
                 ctx.diags.error(s->span, "compound assignment requires a numeric scalar or vector target, got '" + target_t.to_string() + "'");
+            }
+            if (s->compound_op.has_value() && target_t.is_newtype() &&
+                *s->compound_op != BinaryOp::Add && *s->compound_op != BinaryOp::Sub) {
+                ctx.diags.error(s->span, "compound operator not allowed on newtype '" + target_t.to_string() + "' (unwrap with '.0' first)");
             }
             check_expr(s->assign_value.get(), target_t);
             if (s->compound_op.has_value() && target_t.is_vector()) {

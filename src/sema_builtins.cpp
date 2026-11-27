@@ -38,22 +38,30 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = target;
         return target;
     }
-    if (n == "is_f64" || n == "sizeof") {
+    if (n == "is_f64") {
         if (auto cv = ctx.eval_const_expr(e, fn.module_name, genv, scopes)) {
-            if (cv->type.is_bool()) {
-                e->kind = Expr::Kind::BoolLit;
-                e->bool_val = cv->bool_val;
-            } else {
-                e->kind = Expr::Kind::IntLit;
-                e->int_val = cv->int_val;
-            }
+            e->kind = Expr::Kind::BoolLit;
+            e->bool_val = cv->bool_val;
             e->generic_args.clear();
             e->args.clear();
             e->resolved_type = cv->type;
             return cv->type;
         }
-        ctx.diags.error(e->span, "'" + n + "<T>()' expects 1 type argument and 0 value arguments");
+        ctx.diags.error(e->span, "'is_f64<T>()' expects 1 type argument and 0 value arguments");
         return Type::bool_type();
+    }
+    if (n == "sizeof" || n == "std430_sizeof" || n == "std140_sizeof" ||
+        n == "offsetof" || n == "std430_offsetof" || n == "std140_offsetof") {
+        if (auto cv = ctx.eval_sizeof_offsetof_query(e, fn.module_name, genv, &ctx.diags)) {
+            e->kind = Expr::Kind::IntLit;
+            e->int_val = cv->int_val;
+            e->literal_suffix = ScalarKind::I32;
+            e->generic_args.clear();
+            e->args.clear();
+            e->target_type.reset();
+        }
+        e->resolved_type = Type::i32();
+        return Type::i32();
     }
     if (n == "bitcast") {
         if (e->generic_args.size() != 1 || e->args.size() != 1) {
@@ -455,6 +463,10 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         if (!coerce_expr_to_type(e->args[2].get(), e->args[1]->resolved_type)) {
             coerce_expr_to_type(e->args[1].get(), e->args[2]->resolved_type);
         }
+        if (e->args[1]->resolved_type != e->args[2]->resolved_type) {
+            ctx.diags.error(e->span, "'select' branch types must match ('" + e->args[1]->resolved_type.to_string() +
+                                     "' vs '" + e->args[2]->resolved_type.to_string() + "')");
+        }
         Type res = e->args[1]->resolved_type;
         mark_type_usage(res);
         e->resolved_type = res;
@@ -564,7 +576,10 @@ Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
         e->resolved_type = Type::void_type();
         return Type::void_type();
     }
-    // 5. Struct constructor syntax `StructName(field0, field1, ...)`
+    // 5. Newtype constructor `Meters(x)` or Struct constructor `StructName(field0, field1, ...)`
+    if (auto nt_t = check_newtype_constructor(*this, e, n)) {
+        return *nt_t;
+    }
     std::string st_mod;
     if (const StructDecl* sdecl = ctx.find_struct_decl(fn.module_name, n, &st_mod)) {
         TypeExpr te;
@@ -637,6 +652,7 @@ static void retype_literal(Expr* e, const Type& t) {
 bool coerce_expr_to_type(Expr* e, const Type& target_type) {
     if (!e) return false;
     if (e->resolved_type == target_type) return true;
+    if (target_type.is_newtype() || target_type.is_enum()) return false;
     // Unsuffixed float literal adapts to f32 or f64
     if (is_unsuffixed_float(e) && target_type.is_float_scalar()) {
         retype_literal(e, target_type);

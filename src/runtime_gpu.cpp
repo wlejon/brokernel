@@ -13,20 +13,6 @@ const char* version() { return "0.1.0"; }
 
 namespace {
 
-size_t count_non_grid_params(const std::vector<KernelParamInfo>& params) noexcept {
-    size_t c = 0;
-    for (const auto& p : params) if (!is_bound_param(p.role)) ++c;
-    return c;
-}
-
-size_t count_param_blocks(const std::vector<KernelParamInfo>& params) noexcept {
-    size_t c = 0;
-    for (const auto& p : params) {
-        if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) ++c;
-    }
-    return c;
-}
-
 uint64_t store_count(const KernelParamInfo& p, const KernelArg& a) {
     return p.element_bytes ? a.buffer_bytes() / p.element_bytes : 0;
 }
@@ -67,8 +53,8 @@ bool prepare_gpu_args_and_descriptors(
     bound_buffers.reserve(params.size() + block_bindings.size() + 1);
     dev_args.assign(args.begin(), args.end());
 
-    const size_t non_grid = count_non_grid_params(params);
-    const size_t param_blocks = count_param_blocks(params);
+    const size_t non_grid = detail::count_non_grid_params(params);
+    const size_t param_blocks = detail::count_param_blocks(params);
     const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
     const size_t expected_with_blocks = non_grid + block_bindings.size();
     const size_t expected_full = params.size() + global_blocks;
@@ -176,8 +162,8 @@ bool CompiledKernel::gpu_launch(
         return false;
     }
 
-    const size_t non_grid = count_non_grid_params(params);
-    const size_t param_blocks = count_param_blocks(params);
+    const size_t non_grid = detail::count_non_grid_params(params);
+    const size_t param_blocks = detail::count_param_blocks(params);
     const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
     const size_t expected_with_blocks = non_grid + block_bindings.size();
     const size_t expected_full = params.size() + global_blocks;
@@ -285,12 +271,20 @@ bool CompiledKernel::gpu_launch(
         }
         vk_args.emplace_back(return_address);
     }
-    if (probes_compiled && stage == Stage::Compute && !probes.empty()) {
+    if (probes_compiled && stage == Stage::Compute && has_unconditional_probes()) {
         out.probe_arg_index = vk_args.size();
         vk_args.emplace_back(uint64_t(0));
     }
     detail::append_gpu_runtime_knob_args(*this, vk_args);
     detail::append_gpu_telemetry_args(*this, out, vk_args);
+    if (probes_compiled && stage == Stage::Compute && has_conditional_probes()) {
+        out.probe_if_arg_index = vk_args.size();
+        vk_args.emplace_back(uint64_t(0));
+    }
+    if ((checks_compiled || trap_non_finite_compiled) && stage == Stage::Compute) {
+        out.check_arg_index = vk_args.size();
+        vk_args.emplace_back(uint64_t(0));
+    }
 
     for (int i = 0; i < 3; ++i) out.local_size[i] = std::max(1u, local_size[i]);
     out.groups[0] = (w + out.local_size[0] - 1) / out.local_size[0];
@@ -355,13 +349,27 @@ bool CompiledKernel::dispatch_gpu(
 
         GpuLaunch launch;
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
-        if (probes_compiled && stage == Stage::Compute && !probes.empty() && launch.probe_arg_index < launch.args.size()) {
+        if (launch.probe_arg_index < launch.args.size()) {
             const int32_t inactive_target[4] = {-1, -1, -1, 0};
             GpuBoundBuffer pbb;
             pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
             pbb.dev_buf.upload(inactive_target, 16);
             launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
             bound_buffers.push_back(std::move(pbb));
+        }
+        if (launch.probe_if_arg_index < launch.args.size()) {
+            GpuBoundBuffer pif_bb;
+            pif_bb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pif_bb.dev_buf.zero();
+            launch.args[launch.probe_if_arg_index] = brass::gpu::VulkanArg(pif_bb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pif_bb));
+        }
+        if (launch.check_arg_index < launch.args.size()) {
+            GpuBoundBuffer cbb;
+            cbb.dev_buf = brass::gpu::VulkanBuffer::alloc(32);
+            cbb.dev_buf.zero();
+            launch.args[launch.check_arg_index] = brass::gpu::VulkanArg(cbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(cbb));
         }
         detail::TelemetryVkBounce telem_bounce;
         detail::setup_gpu_telemetry_bounce(*this, launch, telem_bounce);
@@ -405,194 +413,6 @@ double CompiledKernel::eval_gpu_f64(std::span<const KernelArg> args, std::string
     double res = 0.0;
     eval_gpu(args, &res, err);
     return res;
-}
-
-// ---------------------------------------------------------------------------
-// CPU vs GPU Target Agreement Check
-// ---------------------------------------------------------------------------
-
-ParityReport CompiledKernel::compare_cpu_gpu(
-    GridShape shape,
-    std::span<const KernelArg> args,
-    double rel_tol,
-    double abs_tol) const {
-    ParityReport rep;
-    if (!brass::gpu::vulkan_available()) {
-        rep.ran_gpu = false;
-        rep.ok = false;
-        rep.message = "no Vulkan compute device: the GPU build did not run";
-        return rep;
-    }
-
-    const size_t non_grid = count_non_grid_params(params);
-    const size_t param_blocks = count_param_blocks(params);
-    const size_t global_blocks = block_bindings.size() >= param_blocks ? block_bindings.size() - param_blocks : 0;
-    const size_t expected_with_blocks = non_grid + block_bindings.size();
-    const size_t expected_full = params.size() + global_blocks;
-    const bool skip_all_bound = (args.size() == non_grid && block_bindings.empty());
-    const bool skip_non_block_bound = (args.size() == expected_with_blocks && expected_with_blocks != expected_full);
-
-    std::vector<std::vector<uint8_t>> cpu_bufs(args.size());
-    std::vector<std::vector<uint8_t>> gpu_bufs(args.size());
-    std::vector<KernelArg> cpu_args(args.begin(), args.end());
-    std::vector<KernelArg> gpu_args(args.begin(), args.end());
-
-    for (size_t i = 0; i < args.size(); ++i) {
-        if (args[i].kind() == KernelArg::Kind::Buffer && args[i].buffer_ptr() && args[i].buffer_bytes() > 0) {
-            const auto* src = static_cast<const uint8_t*>(args[i].buffer_ptr());
-            cpu_bufs[i].assign(src, src + args[i].buffer_bytes());
-            gpu_bufs[i].assign(src, src + args[i].buffer_bytes());
-            cpu_args[i] = KernelArg::buffer(cpu_bufs[i].data(), cpu_bufs[i].size());
-            gpu_args[i] = KernelArg::buffer(gpu_bufs[i].data(), gpu_bufs[i].size());
-        }
-    }
-
-    size_t ret_bytes = 0;
-    if (!return_type.is_void()) {
-        size_t num_pts = (grid_dim > 0) ? shape.total_points() : 1;
-        ret_bytes = num_pts * std::max<size_t>(return_byte_size, 4);
-    }
-    std::vector<uint8_t> cpu_ret(ret_bytes, 0);
-    std::vector<uint8_t> gpu_ret(ret_bytes, 0);
-
-    std::string err;
-    if (!dispatch_cpu(shape, cpu_args, ret_bytes > 0 ? cpu_ret.data() : nullptr, &err)) {
-        rep.ok = false;
-        rep.message = "CPU dispatch failed: " + err;
-        return rep;
-    }
-    if (!dispatch_gpu(shape, gpu_args, ret_bytes > 0 ? gpu_ret.data() : nullptr, &err)) {
-        rep.ok = false;
-        rep.message = "GPU dispatch failed: " + err;
-        return rep;
-    }
-    rep.ran_gpu = true;
-    rep.ok = true;
-
-    auto compare_float = [&](double x, double y, uint64_t ulps) {
-        ++rep.elements_compared;
-        if (std::isnan(x) || std::isnan(y)) {
-            if (std::isnan(x) != std::isnan(y)) {
-                rep.ok = false;
-                rep.max_abs_diff = std::numeric_limits<double>::infinity();
-            }
-            return;
-        }
-        if (x == y) return;
-        double diff = std::abs(x - y);
-        double rdiff = diff / std::max({std::abs(x), std::abs(y), 1e-300});
-        rep.max_abs_diff = std::max(rep.max_abs_diff, diff);
-        rep.max_rel_diff = std::max(rep.max_rel_diff, rdiff);
-        rep.max_ulp_diff = std::max(rep.max_ulp_diff, ulps);
-        if (!(diff <= abs_tol || rdiff <= rel_tol)) rep.ok = false;
-    };
-    auto ulp_distance = [](auto x, auto y) -> uint64_t {
-        using F = decltype(x);
-        using I = std::conditional_t<sizeof(F) == 8, int64_t, int32_t>;
-        auto ordered = [](F v) {
-            I i;
-            std::memcpy(&i, &v, sizeof(v));
-            return i < 0 ? static_cast<int64_t>(std::numeric_limits<I>::min()) - i : static_cast<int64_t>(i);
-        };
-        int64_t a = ordered(x), b = ordered(y);
-        return a > b ? static_cast<uint64_t>(a) - static_cast<uint64_t>(b)
-                     : static_cast<uint64_t>(b) - static_cast<uint64_t>(a);
-    };
-    auto compare_int = [&](int64_t x, int64_t y) {
-        ++rep.elements_compared;
-        if (x == y) return;
-        rep.ok = false;
-        rep.max_abs_diff = std::max(rep.max_abs_diff, std::abs(static_cast<double>(x) - static_cast<double>(y)));
-    };
-    auto compare_bytes = [&](const uint8_t* a, const uint8_t* b, size_t nbytes, ScalarKind sk) {
-        if (sk == ScalarKind::F64) {
-            for (size_t off = 0; off + 8 <= nbytes; off += 8) {
-                double x, y;
-                std::memcpy(&x, a + off, 8);
-                std::memcpy(&y, b + off, 8);
-                compare_float(x, y, std::isfinite(x) && std::isfinite(y) ? ulp_distance(x, y) : 0);
-            }
-        } else if (sk == ScalarKind::F32) {
-            for (size_t off = 0; off + 4 <= nbytes; off += 4) {
-                float x, y;
-                std::memcpy(&x, a + off, 4);
-                std::memcpy(&y, b + off, 4);
-                compare_float(x, y, std::isfinite(x) && std::isfinite(y) ? ulp_distance(x, y) : 0);
-            }
-        } else if (sk == ScalarKind::I64 || sk == ScalarKind::U64) {
-            for (size_t off = 0; off + 8 <= nbytes; off += 8) {
-                int64_t x, y;
-                std::memcpy(&x, a + off, 8);
-                std::memcpy(&y, b + off, 8);
-                compare_int(x, y);
-            }
-        } else {
-            for (size_t off = 0; off + 4 <= nbytes; off += 4) {
-                int32_t x, y;
-                std::memcpy(&x, a + off, 4);
-                std::memcpy(&y, b + off, 4);
-                compare_int(x, y);
-            }
-        }
-    };
-
-    std::vector<size_t> param_block_arg_idx(params.size(), SIZE_MAX);
-    size_t arg_idx = 0;
-    for (size_t p_i = 0; p_i < params.size(); ++p_i) {
-        const auto& p = params[p_i];
-        if (is_bound_param(p.role)) {
-            if (p.role == ParamRole::Uniform || p.role == ParamRole::Buffer) {
-                if (!skip_all_bound && arg_idx < args.size()) {
-                    param_block_arg_idx[p_i] = arg_idx++;
-                }
-            } else if (!skip_all_bound && !skip_non_block_bound) {
-                ++arg_idx;
-            }
-            continue;
-        }
-        size_t cur = arg_idx++;
-        if (p.role == ParamRole::Store && can_Write(p.access) && cur < cpu_bufs.size() && !cpu_bufs[cur].empty()) {
-            compare_bytes(cpu_bufs[cur].data(), gpu_bufs[cur].data(), cpu_bufs[cur].size(), p.type.scalar);
-            if (!args[cur].is_read_only() && args[cur].buffer_ptr()) {
-                std::memcpy(args[cur].buffer_ptr(), gpu_bufs[cur].data(), gpu_bufs[cur].size());
-            }
-        }
-    }
-    for (const auto& binfo : block_bindings) {
-        size_t bi = SIZE_MAX;
-        if (binfo.mir_param_index < params.size()) {
-            bi = param_block_arg_idx[binfo.mir_param_index];
-        } else if (arg_idx < args.size()) {
-            bi = arg_idx++;
-        }
-        if (binfo.role == ParamRole::Buffer && can_Write(binfo.access) && bi < cpu_bufs.size() && !cpu_bufs[bi].empty()) {
-            compare_bytes(cpu_bufs[bi].data(), gpu_bufs[bi].data(), cpu_bufs[bi].size(), binfo.type.scalar);
-            if (!args[bi].is_read_only() && args[bi].buffer_ptr()) {
-                std::memcpy(args[bi].buffer_ptr(), gpu_bufs[bi].data(), gpu_bufs[bi].size());
-            }
-        }
-    }
-
-    if (ret_bytes > 0) {
-        const size_t stride = std::max<size_t>(return_byte_size, 4);
-        for (size_t base = 0; base + stride <= ret_bytes; base += stride) {
-            size_t off = 0;
-            for (ScalarKind sk : return_leaf_kinds) {
-                size_t sz = (sk == ScalarKind::F64 || sk == ScalarKind::I64 || sk == ScalarKind::U64) ? 8 : 4;
-                if (off + sz > stride) break;
-                compare_bytes(cpu_ret.data() + base + off, gpu_ret.data() + base + off, sz, sk);
-                off += sz;
-            }
-        }
-    }
-
-    if (!rep.ok) {
-        std::ostringstream oss;
-        oss << "CPU/GPU mismatch: max_abs_diff=" << rep.max_abs_diff
-            << ", max_rel_diff=" << rep.max_rel_diff;
-        rep.message = oss.str();
-    }
-    return rep;
 }
 
 bool CompiledKernel::probe_gpu(
@@ -670,8 +490,22 @@ bool CompiledKernel::probe_gpu(
 
         GpuLaunch launch;
         if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
-        if (probes_compiled && stage == Stage::Compute && !probes.empty() && launch.probe_arg_index < launch.args.size()) {
+        if (launch.probe_arg_index < launch.args.size()) {
             launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(probe_buf.device_address());
+        }
+        if (launch.probe_if_arg_index < launch.args.size()) {
+            GpuBoundBuffer pif_bb;
+            pif_bb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pif_bb.dev_buf.zero();
+            launch.args[launch.probe_if_arg_index] = brass::gpu::VulkanArg(pif_bb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pif_bb));
+        }
+        if (launch.check_arg_index < launch.args.size()) {
+            GpuBoundBuffer cbb;
+            cbb.dev_buf = brass::gpu::VulkanBuffer::alloc(32);
+            cbb.dev_buf.zero();
+            launch.args[launch.check_arg_index] = brass::gpu::VulkanArg(cbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(cbb));
         }
 
         brass::gpu::VulkanDispatch disp;
@@ -706,6 +540,240 @@ bool CompiledKernel::probe_gpu(
         return true;
     } catch (const std::exception& ex) {
         if (err) *err = std::string("Vulkan probe error: ") + ex.what();
+        return false;
+    }
+}
+
+CheckReport CompiledKernel::check_gpu(
+    GridShape shape,
+    std::span<const KernelArg> args,
+    bool trap_non_finite,
+    std::string* err) const {
+    if (auto variant = ensure_checked_variant(trap_non_finite)) {
+        return variant->check_gpu(shape, args, trap_non_finite, err);
+    }
+    CheckReport rep;
+    if (!checks_compiled && !trap_non_finite_compiled) {
+        if (err) *err = "kernel '" + name + "' has no checked variant available";
+        rep.ok = false;
+        rep.message = err ? *err : "kernel has no checked variant available";
+        return rep;
+    }
+    if (spirv.words.empty()) {
+        if (err) *err = "kernel '" + name + (cpu_only ? "' is a @cpu kernel: it has no GPU build" : "' has no compiled SPIR-V binary");
+        rep.ok = false;
+        rep.message = err ? *err : "no SPIR-V binary";
+        return rep;
+    }
+    if (!brass::gpu::vulkan_available()) {
+        if (err) *err = "no Vulkan compute device available";
+        rep.ok = false;
+        rep.message = "no Vulkan compute device available";
+        return rep;
+    }
+    try {
+        std::string vk_err;
+        const brass::gpu::VulkanModule* vk_module = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+            if (!gpu_cache_->module) {
+                auto loaded = brass::gpu::VulkanModule::load(spirv, &vk_err);
+                if (!loaded.valid()) {
+                    if (err) *err = vk_err.empty() ? "failed to load Vulkan module" : vk_err;
+                    rep.ok = false;
+                    rep.message = err ? *err : "failed to load Vulkan module";
+                    return rep;
+                }
+                gpu_cache_->module = std::make_unique<brass::gpu::VulkanModule>(std::move(loaded));
+            }
+            vk_module = gpu_cache_->module.get();
+        }
+        const brass::gpu::VulkanModule& vk = *vk_module;
+
+        std::vector<std::vector<uint8_t>> host_copies(args.size());
+        std::vector<KernelArg> copy_args(args.begin(), args.end());
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i].kind() == KernelArg::Kind::Buffer && args[i].buffer_ptr() && args[i].buffer_bytes() > 0) {
+                const auto* src = static_cast<const uint8_t*>(args[i].buffer_ptr());
+                host_copies[i].assign(src, src + args[i].buffer_bytes());
+                copy_args[i] = KernelArg::buffer(host_copies[i].data(), host_copies[i].size());
+            }
+        }
+
+        std::vector<GpuBoundBuffer> bound_buffers;
+        std::vector<KernelArg> dev_args;
+        std::vector<brass::gpu::VulkanDescriptorBuffer> vk_descriptors;
+        if (!prepare_gpu_args_and_descriptors(params, block_bindings, shape, copy_args,
+                                              /*check_coverage=*/true,
+                                              /*record_writeback=*/false,
+                                              /*allow_device_store_args=*/true,
+                                              dev_args, bound_buffers, vk_descriptors, err)) {
+            rep.ok = false;
+            rep.message = err ? *err : "invalid check arguments";
+            return rep;
+        }
+
+        uint64_t return_address = 0;
+        if (const size_t ret_bytes = gpu_return_bytes(shape)) {
+            GpuBoundBuffer rbb;
+            rbb.dev_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_bytes, 16));
+            rbb.dev_buf.zero();
+            return_address = rbb.dev_buf.device_address();
+            bound_buffers.push_back(std::move(rbb));
+        }
+
+        GpuLaunch launch;
+        if (!gpu_launch(shape, dev_args, return_address, launch, err)) {
+            rep.ok = false;
+            rep.message = err ? *err : "gpu_launch failed";
+            return rep;
+        }
+
+        auto check_buf = brass::gpu::VulkanBuffer::alloc(32);
+        check_buf.zero();
+        if (launch.check_arg_index < launch.args.size()) {
+            launch.args[launch.check_arg_index] = brass::gpu::VulkanArg(check_buf.device_address());
+        }
+        if (launch.probe_arg_index < launch.args.size()) {
+            const int32_t inactive_target[4] = {-1, -1, -1, 0};
+            GpuBoundBuffer pbb;
+            pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pbb.dev_buf.upload(inactive_target, 16);
+            launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pbb));
+        }
+        if (launch.probe_if_arg_index < launch.args.size()) {
+            GpuBoundBuffer pif_bb;
+            pif_bb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pif_bb.dev_buf.zero();
+            launch.args[launch.probe_if_arg_index] = brass::gpu::VulkanArg(pif_bb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pif_bb));
+        }
+
+        brass::gpu::VulkanDispatch disp;
+        for (int i = 0; i < 3; ++i) {
+            disp.grid[i] = launch.groups[i];
+            disp.block[i] = launch.local_size[i];
+        }
+        disp.descriptors = std::move(vk_descriptors);
+        if (!vk.launch(disp, launch.args, &vk_err)) {
+            if (err) *err = vk_err;
+            rep.ok = false;
+            rep.message = vk_err;
+            return rep;
+        }
+
+        uint32_t check_words[8] = {};
+        check_buf.download(check_words, sizeof(check_words));
+        return detail::decode_check_report(*this, check_words);
+    } catch (const std::exception& ex) {
+        if (err) *err = std::string("Vulkan check error: ") + ex.what();
+        rep.ok = false;
+        rep.message = err ? *err : "Vulkan check error";
+        return rep;
+    }
+}
+
+bool CompiledKernel::probe_if_gpu(
+    GridShape shape,
+    std::span<const KernelArg> args,
+    std::vector<ConditionalProbeSample>& out,
+    uint32_t max_samples,
+    std::string* err) const {
+    out.clear();
+    if (auto variant = ensure_probed_variant()) {
+        return variant->probe_if_gpu(shape, args, out, max_samples, err);
+    }
+    if (!has_conditional_probes()) return true;
+    if (spirv.words.empty()) {
+        if (err) *err = "kernel '" + name + "' has no compiled SPIR-V binary";
+        return false;
+    }
+    if (!brass::gpu::vulkan_available()) {
+        if (err) *err = "no Vulkan compute device available";
+        return false;
+    }
+    try {
+        std::string vk_err;
+        const brass::gpu::VulkanModule* vk_module = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(gpu_cache_->mu);
+            if (!gpu_cache_->module) {
+                auto loaded = brass::gpu::VulkanModule::load(spirv, &vk_err);
+                if (!loaded.valid()) {
+                    if (err) *err = vk_err.empty() ? "failed to load Vulkan module" : vk_err;
+                    return false;
+                }
+                gpu_cache_->module = std::make_unique<brass::gpu::VulkanModule>(std::move(loaded));
+            }
+            vk_module = gpu_cache_->module.get();
+        }
+        const brass::gpu::VulkanModule& vk = *vk_module;
+
+        std::vector<GpuBoundBuffer> bound_buffers;
+        std::vector<KernelArg> dev_args;
+        std::vector<brass::gpu::VulkanDescriptorBuffer> vk_descriptors;
+        if (!prepare_gpu_args_and_descriptors(params, block_bindings, shape, args,
+                                              /*check_coverage=*/false,
+                                              /*record_writeback=*/false,
+                                              /*allow_device_store_args=*/true,
+                                              dev_args, bound_buffers, vk_descriptors, err)) {
+            return false;
+        }
+
+        uint64_t return_address = 0;
+        if (const size_t ret_bytes = gpu_return_bytes(shape)) {
+            GpuBoundBuffer rbb;
+            rbb.dev_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(ret_bytes, 16));
+            rbb.dev_buf.zero();
+            return_address = rbb.dev_buf.device_address();
+            bound_buffers.push_back(std::move(rbb));
+        }
+
+        const size_t buf_words = 2 + static_cast<size_t>(max_samples) * 9;
+        std::vector<uint32_t> host_buf(buf_words, 0);
+        host_buf[0] = 0;
+        host_buf[1] = max_samples;
+        auto pif_buf = brass::gpu::VulkanBuffer::alloc(std::max<size_t>(buf_words * sizeof(uint32_t), 16));
+        pif_buf.upload(host_buf.data(), buf_words * sizeof(uint32_t));
+
+        GpuLaunch launch;
+        if (!gpu_launch(shape, dev_args, return_address, launch, err)) return false;
+        if (launch.probe_if_arg_index < launch.args.size()) {
+            launch.args[launch.probe_if_arg_index] = brass::gpu::VulkanArg(pif_buf.device_address());
+        }
+        if (launch.probe_arg_index < launch.args.size()) {
+            const int32_t inactive_target[4] = {-1, -1, -1, 0};
+            GpuBoundBuffer pbb;
+            pbb.dev_buf = brass::gpu::VulkanBuffer::alloc(16);
+            pbb.dev_buf.upload(inactive_target, 16);
+            launch.args[launch.probe_arg_index] = brass::gpu::VulkanArg(pbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(pbb));
+        }
+        if (launch.check_arg_index < launch.args.size()) {
+            GpuBoundBuffer cbb;
+            cbb.dev_buf = brass::gpu::VulkanBuffer::alloc(32);
+            cbb.dev_buf.zero();
+            launch.args[launch.check_arg_index] = brass::gpu::VulkanArg(cbb.dev_buf.device_address());
+            bound_buffers.push_back(std::move(cbb));
+        }
+
+        brass::gpu::VulkanDispatch disp;
+        for (int i = 0; i < 3; ++i) {
+            disp.grid[i] = launch.groups[i];
+            disp.block[i] = launch.local_size[i];
+        }
+        disp.descriptors = std::move(vk_descriptors);
+        if (!vk.launch(disp, launch.args, &vk_err)) {
+            if (err) *err = vk_err;
+            return false;
+        }
+
+        pif_buf.download(host_buf.data(), buf_words * sizeof(uint32_t));
+        detail::decode_probe_if_samples(*this, host_buf, max_samples, out);
+        return true;
+    } catch (const std::exception& ex) {
+        if (err) *err = std::string("Vulkan probe_if error: ") + ex.what();
         return false;
     }
 }

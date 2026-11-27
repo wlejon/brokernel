@@ -30,6 +30,7 @@ enum class TokenKind : uint8_t {
     KwPub,
     KwFn,
     KwStruct,
+    KwEnum,
     KwConst,
     KwLet,
     KwVar,
@@ -307,6 +308,27 @@ struct StructDecl {
     std::vector<StructFieldDecl> fields;
 };
 
+struct EnumVariantDecl {
+    SourceSpan span;
+    std::string name;
+    ExprPtr value; // Optional explicit `= expr`
+};
+
+struct EnumDecl {
+    SourceSpan span;
+    bool is_pub = true;
+    std::string name;
+    TypeExprPtr underlying; // Optional `: i32` or `: u32`
+    std::vector<EnumVariantDecl> variants;
+};
+
+struct NewtypeDecl {
+    SourceSpan span;
+    bool is_pub = true;
+    std::string name;
+    TypeExprPtr target;
+};
+
 struct ConstDecl {
     SourceSpan span;
     bool is_pub = true;
@@ -399,6 +421,8 @@ struct ModuleAst {
     std::vector<ConstDecl> consts;
     std::vector<BindingDecl> bindings;
     std::vector<StructDecl> structs;
+    std::vector<EnumDecl> enums;
+    std::vector<NewtypeDecl> newtypes;
     std::vector<FnDecl> functions;
 };
 
