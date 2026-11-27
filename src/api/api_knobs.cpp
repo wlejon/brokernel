@@ -164,9 +164,16 @@ Value js_kernelVerifySandbox(Value self, std::span<const Value>) {
     out.set("spirvParsed", rep.spirv_parsed);
     out.set("memorySafe", rep.memory_safe);
     out.set("barrierUniform", rep.barrier_uniform);
+    out.set("globalBoundsProven", rep.global_bounds_proven);
+    out.set("proofTier", static_cast<int>(rep.proof_tier));
+    out.set("hardeningTier", static_cast<int>(rep.hardening_tier));
     out.set("sharedAccessesProven", static_cast<double>(rep.shared_accesses_proven));
     out.set("globalAccessesProven", static_cast<double>(rep.global_accesses_proven));
     out.set("barriersProven", static_cast<double>(rep.barriers_proven));
+    out.set("collectivesProven", static_cast<double>(rep.collectives_proven));
+    out.set("clampedGlobalLoads", static_cast<double>(rep.clamped_global_loads));
+    out.set("clampedGlobalStores", static_cast<double>(rep.clamped_global_stores));
+    out.set("loopsFuelInstrumented", static_cast<double>(rep.loops_fuel_instrumented));
     out.set("violations", violArr.get());
     out.set("diagnostic", rep.diagnostic);
     return out.get();

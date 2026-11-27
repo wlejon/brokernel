@@ -13,6 +13,8 @@
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/gpu/vulkan_driver.hpp>
 #include <brass/target/spirv_target.hpp>
+#include <brass/verify/gpu_kernel_sandbox.hpp>
+#include <brass/verify/gpu_sandbox_instrument.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -21,6 +23,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -271,6 +274,8 @@ struct CompileOptions {
     bool enable_checks = false;
     bool trap_non_finite = false;
     bool runtime_knobs = false;
+    bool harden_sandbox = false;
+    uint32_t sandbox_max_loop_iterations = 1000000;
     uint32_t telemetry_slots = 0;
     std::unordered_map<std::string, ConstValue> knob_overrides;
 };
@@ -305,9 +310,16 @@ struct KernelSandboxReport {
     bool spirv_parsed = false;
     bool memory_safe = false;
     bool barrier_uniform = false;
+    bool global_bounds_proven = false;
+    brass::SandboxProofTier proof_tier = brass::SandboxProofTier::None;
+    brass::HardeningTier hardening_tier = brass::HardeningTier::Rejected;
     size_t shared_accesses_proven = 0;
     size_t global_accesses_proven = 0;
     size_t barriers_proven = 0;
+    size_t collectives_proven = 0;
+    size_t clamped_global_loads = 0;
+    size_t clamped_global_stores = 0;
+    size_t loops_fuel_instrumented = 0;
     std::vector<std::string> violations;
     std::string diagnostic;
 };
@@ -405,6 +417,12 @@ public:
 
     KernelVerifyReport verify() const;
     KernelSandboxReport verify_sandbox() const;
+    brass::GpuProverOptions build_gpu_prover_options(const brass::Function* mir_fn = nullptr) const;
+    bool verify_dispatch_bounds(GridShape shape, std::span<const KernelArg> args, std::string* err = nullptr) const;
+
+    std::shared_ptr<brass::Module> gpu_mir_module_;
+    std::string gpu_mir_entry_;
+    std::optional<KernelSandboxReport> precomputed_sandbox_;
 
     std::vector<RuntimeKnobInfo> runtime_knobs;
     uint32_t runtime_knob_bytes = 0;

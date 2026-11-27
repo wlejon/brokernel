@@ -902,6 +902,15 @@ void configureCompilerModulesAndOptions(
         if (ev::isBool(eptx)) compile_opts.emit_ptx = ev::toBool(eptx);
         const Value edis = ev::getProperty(opts.get(), "emitSpirvDisassembly");
         if (ev::isBool(edis)) compile_opts.emit_spirv_disassembly = ev::toBool(edis);
+        const Value hsb = ev::getProperty(opts.get(), "hardenSandbox");
+        if (ev::isBool(hsb)) compile_opts.harden_sandbox = ev::toBool(hsb);
+        const Value sml = ev::getProperty(opts.get(), "sandboxMaxLoopIterations");
+        if (ev::isNumber(sml)) {
+            const double v = ev::toDouble(sml);
+            if (v >= 1.0 && v <= 4294967295.0) {
+                compile_opts.sandbox_max_loop_iterations = static_cast<uint32_t>(v);
+            }
+        }
     }
 }
 

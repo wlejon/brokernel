@@ -64,6 +64,47 @@ static void test_formal_verify_and_multitarget() {
     CHECK(sb.portability_ok);
     CHECK(sb.memory_safe);
     CHECK(sb.barrier_uniform);
+    CHECK(sb.proof_tier == brass::SandboxProofTier::FullSmt);
+    CHECK(sb.hardening_tier == brass::HardeningTier::PureSmtZeroOverhead);
+    CHECK(sb.global_bounds_proven);
+
+    // Verify dispatch bounds enforcement against prover dimension caps on `smooth_copy`
+    // and proved grid-cover store length on a `@grid(1)` kernel without barriers.
+    {
+        std::vector<float> buf_in(64, 1.0f);
+        std::vector<float> buf_out(64, 0.0f);
+        std::vector<KernelArg> ok_args = {
+            KernelArg::buffer(buf_in.data(), buf_in.size() * sizeof(float)),
+            KernelArg::buffer(buf_out.data(), buf_out.size() * sizeof(float)),
+        };
+        std::string berr;
+        CHECK(k->verify_dispatch_bounds(GridShape(64), ok_args, &berr));
+        berr.clear();
+        std::vector<KernelArg> huge_args = {
+            KernelArg::buffer(buf_in.data(), (brass::kMaxProverDim1D + 1) * sizeof(float)),
+            KernelArg::buffer(buf_out.data(), (brass::kMaxProverDim1D + 1) * sizeof(float)),
+        };
+        CHECK(!k->verify_dispatch_bounds(GridShape(4), huge_args, &berr));
+        CHECK(!berr.empty());
+
+        const char* grid_src = R"(
+            @kernel @grid(1) fn grid_copy(g: grid1d, inp: read_store<f32, 1>, out: write_store<f32, 1>) {
+                let i: i32 = g.x();
+                out[i] = inp[i];
+            }
+        )";
+        CompileOptions g_opts;
+        g_opts.emit_spirv = true;
+        auto gres = compile_source(grid_src, "verify_grid_bounds.bk", g_opts);
+        CHECK(gres.ok);
+        const CompiledKernel* gk = gres.find_kernel("grid_copy");
+        CHECK(gk != nullptr && gk->verify_sandbox().passed);
+        berr.clear();
+        CHECK(gk->verify_dispatch_bounds(GridShape(64), ok_args, &berr));
+        berr.clear();
+        CHECK(!gk->verify_dispatch_bounds(GridShape(65), ok_args, &berr));
+        CHECK(!berr.empty());
+    }
 
     // Verify lazy ensure_msl() when emit_msl = false
     CompileOptions lazy_opts;
@@ -113,6 +154,45 @@ static void test_formal_verify_and_multitarget() {
     CHECK(hk->msl == miss_res.kernels[0].msl);
     CHECK(hk->ptx == miss_res.kernels[0].ptx);
     CHECK(hk->verify().memory_safe);
+
+    // Verify harden_sandbox compiles & caches a dynamic-index kernel with HybridSmtClamped.
+    const char* dyn_src = R"(
+        @kernel fn scatter_add(g: grid1d, idx_buf: read_store<i32, 1>, inp: read_store<f32, 1>,
+                              out: rw_store<f32, 1>, n: i32) {
+            let tid: i32 = g.x();
+            let target: i32 = idx_buf[tid];
+            var acc: f32 = 0.0;
+            for (var k: i32 = 0; k < n; k = k + 1) {
+                acc = acc + inp[k];
+            }
+            out[target] = acc;
+        }
+    )";
+    CompileOptions h_opts;
+    h_opts.emit_spirv = true;
+    h_opts.harden_sandbox = true;
+    h_opts.sandbox_max_loop_iterations = 4096;
+    auto h_miss = compile_source(dyn_src, "verify_harden_cache.bk", h_opts);
+    CHECK(h_miss.ok);
+    CHECK(h_miss.cache_status == CacheStatus::Miss);
+    const CompiledKernel* dk = h_miss.find_kernel("scatter_add");
+    CHECK(dk != nullptr);
+    const KernelSandboxReport dsb = dk->verify_sandbox();
+    CHECK(dsb.passed);
+    CHECK(dsb.hardening_tier == brass::HardeningTier::HybridSmtClamped);
+    CHECK((dsb.clamped_global_loads + dsb.clamped_global_stores + dsb.loops_fuel_instrumented) > 0);
+
+    auto h_hit = compile_source(dyn_src, "verify_harden_cache.bk", h_opts);
+    CHECK(h_hit.ok);
+    CHECK(h_hit.cache_status == CacheStatus::Hit);
+    const CompiledKernel* dkh = h_hit.find_kernel("scatter_add");
+    CHECK(dkh != nullptr);
+    const KernelSandboxReport dsb_hit = dkh->verify_sandbox();
+    CHECK(dsb_hit.passed);
+    CHECK(dsb_hit.hardening_tier == brass::HardeningTier::HybridSmtClamped);
+    CHECK(dsb_hit.clamped_global_loads == dsb.clamped_global_loads);
+    CHECK(dsb_hit.clamped_global_stores == dsb.clamped_global_stores);
+    CHECK(dsb_hit.loops_fuel_instrumented == dsb.loops_fuel_instrumented);
 
     set_compile_cache(CompileCacheConfig{});
     fs::remove_all(tmp_dir);

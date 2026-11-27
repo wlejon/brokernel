@@ -256,6 +256,27 @@ void put(ByteWriter& w, const CompiledKernel& k) {
     });
     w.u32(k.telemetry_slots);
     w.boolean(k.uses_telemetry);
+    w.boolean(k.precomputed_sandbox_.has_value());
+    if (k.precomputed_sandbox_.has_value()) {
+        const KernelSandboxReport& sb = *k.precomputed_sandbox_;
+        w.boolean(sb.passed);
+        w.boolean(sb.portability_ok);
+        w.boolean(sb.spirv_parsed);
+        w.boolean(sb.memory_safe);
+        w.boolean(sb.barrier_uniform);
+        w.boolean(sb.global_bounds_proven);
+        w.u8(static_cast<uint8_t>(sb.proof_tier));
+        w.u8(static_cast<uint8_t>(sb.hardening_tier));
+        w.u64(sb.shared_accesses_proven);
+        w.u64(sb.global_accesses_proven);
+        w.u64(sb.barriers_proven);
+        w.u64(sb.collectives_proven);
+        w.u64(sb.clamped_global_loads);
+        w.u64(sb.clamped_global_stores);
+        w.u64(sb.loops_fuel_instrumented);
+        put_strings(w, sb.violations);
+        w.str(sb.diagnostic);
+    }
     w.boolean(k.has_cpu_build());
 }
 
@@ -319,6 +340,27 @@ void get_kernel(ByteReader& r, CompiledKernel& k, uint8_t& had_cpu) {
     k.telemetry_slots = r.u32();
     k.uses_telemetry = r.boolean();
     k.init_telemetry();
+    if (r.boolean()) {
+        KernelSandboxReport sb;
+        sb.passed = r.boolean();
+        sb.portability_ok = r.boolean();
+        sb.spirv_parsed = r.boolean();
+        sb.memory_safe = r.boolean();
+        sb.barrier_uniform = r.boolean();
+        sb.global_bounds_proven = r.boolean();
+        sb.proof_tier = static_cast<brass::SandboxProofTier>(r.u8());
+        sb.hardening_tier = static_cast<brass::HardeningTier>(r.u8());
+        sb.shared_accesses_proven = static_cast<size_t>(r.u64());
+        sb.global_accesses_proven = static_cast<size_t>(r.u64());
+        sb.barriers_proven = static_cast<size_t>(r.u64());
+        sb.collectives_proven = static_cast<size_t>(r.u64());
+        sb.clamped_global_loads = static_cast<size_t>(r.u64());
+        sb.clamped_global_stores = static_cast<size_t>(r.u64());
+        sb.loops_fuel_instrumented = static_cast<size_t>(r.u64());
+        get_strings(r, sb.violations);
+        sb.diagnostic = r.str();
+        k.precomputed_sandbox_ = std::move(sb);
+    }
     had_cpu = r.boolean() ? 1 : 0;
 }
 
@@ -417,6 +459,8 @@ void encode_options(const CompileOptions& o, ByteWriter& w) {
     w.boolean(o.enable_checks);
     w.boolean(o.trap_non_finite);
     w.boolean(o.runtime_knobs);
+    w.boolean(o.harden_sandbox);
+    w.u32(o.sandbox_max_loop_iterations);
     w.u32(o.telemetry_slots);
     std::vector<const std::pair<const std::string, ConstValue>*> knobs;
     for (const auto& kv : o.knob_overrides) knobs.push_back(&kv);

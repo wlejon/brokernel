@@ -216,6 +216,57 @@ CompileResult Compiler::compile_uncached(
                 brass::optimize_gpu_function(*lowered.gpu_function, *lowered.gpu_module, gpu_opts);
                 res.timings.gpu_opt_ms += ms_since(t_opt0, clock::now());
             }
+            const auto t_spv0 = clock::now();
+            brass::target::SpirvOptions spv_opts;
+            spv_opts.stage = ck.stage;
+            spv_opts.local_size_x = ck.local_size[0];
+            spv_opts.local_size_y = ck.local_size[1];
+            spv_opts.local_size_z = ck.local_size[2];
+            spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
+            spv_opts.spirv_version = opts.spirv_version;
+            spv_opts.loads_through_variable = opts.spirv_loads_through_variable;
+
+            if (opts.harden_sandbox && lowered.gpu_function && lowered.gpu_module &&
+                ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64 &&
+                (gpu_build || emit_text_now)) {
+                brass::GpuHardenOptions hopts;
+                hopts.sandbox_opts.spirv_opts = spv_opts;
+                hopts.sandbox_opts.prover_opts = ck.build_gpu_prover_options(lowered.gpu_function);
+                hopts.sandbox_opts.verify_spirv = true;
+                hopts.sandbox_opts.run_smt_prover = true;
+                hopts.sandbox_opts.max_smt_spirv_words = 3072;
+                hopts.sandbox_opts.debug_ctx = &lowered.gpu_module->debug_context();
+                hopts.fuel_opts.max_loop_iterations = opts.sandbox_max_loop_iterations;
+                hopts.fuel_opts.debug_ctx = &lowered.gpu_module->debug_context();
+                hopts.clamp_opts.debug_ctx = &lowered.gpu_module->debug_context();
+
+                const brass::GpuHardenResult hres =
+                    brass::harden_and_verify_gpu_sandbox(*lowered.gpu_function, hopts);
+                const brass::GpuSandboxResult& sr =
+                    hres.passed() ? hres.final_sandbox :
+                    (hres.final_sandbox.spirv_checked() ? hres.final_sandbox : hres.initial_sandbox);
+                KernelSandboxReport sb;
+                sb.passed = hres.passed();
+                sb.portability_ok = sr.portability_ok;
+                sb.spirv_parsed = sr.spirv_parsed;
+                sb.memory_safe = sr.memory_safe;
+                sb.barrier_uniform = sr.barrier_uniform;
+                sb.global_bounds_proven = sr.global_bounds_proven;
+                sb.proof_tier = sr.proof_tier;
+                sb.hardening_tier = hres.tier;
+                sb.shared_accesses_proven = sr.shared_accesses_proven;
+                sb.global_accesses_proven = sr.global_accesses_proven;
+                sb.barriers_proven = sr.barriers_proven;
+                sb.collectives_proven = sr.collectives_proven;
+                sb.clamped_global_loads = hres.clamp.clamped_global_loads;
+                sb.clamped_global_stores = hres.clamp.clamped_global_stores;
+                sb.loops_fuel_instrumented = hres.fuel.loops_fuel_instrumented;
+                sb.violations = hres.violations;
+                if (sb.violations.empty() && !hres.passed()) sb.violations = sr.violations;
+                sb.diagnostic = hres.diagnostic.empty() ? sr.diagnostic : hres.diagnostic;
+                ck.precomputed_sandbox_ = std::move(sb);
+            }
+
             if (lowered.gpu_function && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
                 brass::DiagnosticReporter port_diag;
                 ck.gpu_portability_ok = brass::verify_gpu_portability(*lowered.gpu_function, {}, &port_diag);
@@ -224,16 +275,6 @@ CompileResult Compiler::compile_uncached(
                 }
             }
             if (gpu_build) {
-                const auto t_spv0 = clock::now();
-                brass::target::SpirvOptions spv_opts;
-                spv_opts.stage = ck.stage;
-                spv_opts.local_size_x = ck.local_size[0];
-                spv_opts.local_size_y = ck.local_size[1];
-                spv_opts.local_size_z = ck.local_size[2];
-                spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
-                spv_opts.spirv_version = opts.spirv_version;
-                spv_opts.loads_through_variable = opts.spirv_loads_through_variable;
-
                 ck.spirv = brass::target::SpirvTarget::compile(*lowered.gpu_function, spv_opts);
                 res.timings.spirv_ms += ms_since(t_spv0, clock::now());
                 ck.function_costs = detail::function_costs(*lowered.gpu_function, lowered.gpu_module->debug_context(), ck.name);
@@ -260,6 +301,10 @@ CompileResult Compiler::compile_uncached(
 
             if (lowered.gpu_function) {
                 detail::emit_optional_gpu_targets(opts, *fn, *lowered.gpu_function, ck);
+                if (lowered.gpu_module && ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64) {
+                    ck.gpu_mir_entry_ = lowered.gpu_function->name();
+                    ck.gpu_mir_module_ = std::shared_ptr<brass::Module>(std::move(lowered.gpu_module));
+                }
             }
 
             if (opts.compile_cpu && has_cpu_lowering(*fn)) {
