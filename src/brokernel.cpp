@@ -225,6 +225,7 @@ CompileResult Compiler::compile_uncached(
             spv_opts.local_size_spec_constants = opts.local_size_spec_constants;
             spv_opts.spirv_version = opts.spirv_version;
             spv_opts.loads_through_variable = opts.spirv_loads_through_variable;
+            spv_opts.preserve_signed_zero_inf_nan = opts.trap_non_finite;
 
             if (opts.harden_sandbox && lowered.gpu_function && lowered.gpu_module &&
                 ck.stage == Stage::Compute && !fn->cpu_only && !fn->uses_f64 &&
