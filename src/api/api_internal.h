@@ -338,6 +338,16 @@ bool packJsStructValue(const TypeRegistry& types, const Type& type, Value v,
                        uint8_t* dst, size_t dstBytes, const std::string& ctx, std::string& err);
 
 // Zero-alloc fast CPU eval, bound closures & Bronze native export (api_fast.cpp, api_bind.cpp).
+inline bool isPointEvalKernel(const CompiledKernel& k) {
+    if (k.uses_grid_coords) return false;
+    if (k.grid_dim == 0) return true;
+    if (!k.has_return_value()) return false;
+    for (const auto& p : k.params) {
+        if (p.role == ParamRole::Stencil) return false;
+    }
+    return true;
+}
+
 struct FastEvalPlan;
 const std::atomic<uint64_t>& reloadEpochCounter();
 uint64_t currentReloadEpoch();

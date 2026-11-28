@@ -291,7 +291,7 @@ Value evalFastPlanSlots(const FastEvalPlan& plan, const CompiledKernel& k, const
 }
 
 bool tryFastEval(KernelHandle& h, std::span<const Value> args, Value& out) {
-    if (!h.kernel || h.kernel->grid_dim != 0 || !h.kernel->cpu_built()) return false;
+    if (!h.kernel || !isPointEvalKernel(*h.kernel) || !h.kernel->cpu_built()) return false;
     initFastPlan(h);
     const FastEvalPlan* plan = h.fast_eval.get();
     if (!plan || !plan->eligible) return false;

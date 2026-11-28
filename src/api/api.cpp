@@ -377,7 +377,7 @@ const CompileResult* unwrapModule(Value self) {
 Value evalResolvedKernel(KernelHandle& h, std::span<const Value> args, const char* what) {
     const CompiledKernel* k = h.kernel.get();
     if (!k) return ev::throwTypeError(std::string(what) + ": invalid receiver");
-    if (k->grid_dim != 0) return ev::throwTypeError(std::string(what) + ": '" + k->name + "' is a grid kernel; use run()");
+    if (!isPointEvalKernel(*k)) return ev::throwTypeError(std::string(what) + ": '" + k->name + "' is a grid kernel; use run()");
     ensureCpuBuilt(*k);
     Value fastOut;
     if (tryFastEval(h, args, fastOut)) return fastOut;

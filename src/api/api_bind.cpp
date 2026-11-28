@@ -144,7 +144,7 @@ Value invokeBound(BoundClosure& closure, std::span<const Value> callArgs) {
     KernelHandle* kh = kernelHandle(closure.target.get());
     if (!kh || !kh->kernel) return ev::throwTypeError("Kernel.bind: target Kernel is invalid");
     const CompiledKernel* k = kh->kernel.get();
-    if (k->grid_dim == 0) {
+    if (isPointEvalKernel(*k)) {
         if (!k->cpu_built()) ensureCpuBuilt(*k);
         Value fastOut;
         if (evalFastBound(closure, k, callArgs, fastOut)) {
@@ -166,7 +166,7 @@ Value invokeBound(BoundClosure& closure, std::span<const Value> callArgs) {
         }
     }
     while (ci < callArgs.size()) merged.push_back(callArgs[ci++]);
-    if (k->grid_dim != 0) return runResolvedKernel(*kh, merged);
+    if (!isPointEvalKernel(*k)) return runResolvedKernel(*kh, merged);
     return evalResolvedKernel(*kh, merged, "Kernel.bind");
 }
 

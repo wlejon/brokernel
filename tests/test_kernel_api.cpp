@@ -688,6 +688,17 @@ void test_cross_lang_features() {
             throw new Error('KernelFn.bind mismatch: ' + fBound(2.0, 3.0));
         }
 
+        // Non-grid kernel with 1D read_store parameter must support direct .eval() and .bind() fast path
+        const sampleArr = new Float32Array([1.0, 2.0, 3.0, 4.0]);
+        const kStoreEval = mod.kernel('store_accum');
+        if (Math.abs(kStoreEval.eval(sampleArr, 2.0, 4) - 20.0) > 1e-6) {
+            throw new Error('store_accum.eval mismatch');
+        }
+        const kStoreBound = kStoreEval.bind(sampleArr, undefined, 4);
+        if (Math.abs(kStoreBound(3.0) - 30.0) > 1e-6) {
+            throw new Error('store_accum.bind mismatch');
+        }
+
         // 4. exportNative with store + scalar + df32, and StructView.exportFieldNative
         mod.kernel('store_accum').exportNative('bro.test.storeAccum');
         mod.kernel('df_diff').exportNative('bro.test.dfDiff');
