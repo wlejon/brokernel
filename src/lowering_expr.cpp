@@ -94,6 +94,9 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (e->resolved_type.scalar == ScalarKind::F64) {
                 return {b.build_fconst_f64(e->float_val)};
             }
+            if (e->resolved_type.scalar == ScalarKind::DF32) {
+                return lower_df32_const(e->float_val);
+            }
             return {b.build_fconst_f32(static_cast<float>(e->float_val))};
         }
         case Expr::Kind::BoolLit:
@@ -219,6 +222,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 }
                 return out;
             }
+            if (lt.scalar == ScalarKind::DF32) return lower_df32_binary(e->binary_op, lv, rv);
             size_t n = std::max(lv.size(), rv.size());
             ValueList out;
             out.reserve(n);
@@ -239,6 +243,7 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             }
             ValueList lv = lower_expr(e->lhs.get());
             ValueList rv = lower_expr(e->rhs.get());
+            if (e->resolved_type.scalar == ScalarKind::DF32) return lower_df32_math("select", {cv, lv, rv});
             ValueList out;
             out.reserve(lv.size());
             for (size_t i = 0; i < lv.size() && i < rv.size(); ++i) {
@@ -250,6 +255,9 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             ValueList sub = lower_expr(e->lhs.get());
             ScalarKind from_sk = e->lhs->resolved_type.scalar;
             ScalarKind to_sk = e->resolved_type.scalar;
+            if (from_sk == ScalarKind::DF32 || to_sk == ScalarKind::DF32) {
+                return lower_df32_cast_expr(sub, from_sk, to_sk);
+            }
             ValueList out;
             out.reserve(sub.size());
             for (brass::Value* v : sub) {
@@ -265,6 +273,9 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             ValueList recv = lower_expr(e->lhs.get());
             const Type& rt = e->lhs->resolved_type;
             if (rt.is_newtype()) return recv;
+            if (rt.scalar == ScalarKind::DF32 && !rt.is_struct() && !rt.is_array()) {
+                return lower_df32_field(recv, rt, e->name);
+            }
             if (rt.is_scalar()) return recv;
             if (rt.is_vector()) {
                 ValueList out;
@@ -587,11 +598,11 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
                 }
                 return lower_inlined_call(*callee, arg_vals, arg_places, arg_local_places);
             }
+            if (auto df = try_lower_df32_call(e)) return *df;
             // 2. Internal splat helper inserted by Sema
             if (n == "__splat") {
                 ValueList sv = lower_expr(e->args[0].get());
-                uint32_t count = mod.types.flat_leaf_count(e->resolved_type);
-                return ValueList(count, sv[0]);
+                return ValueList(mod.types.flat_leaf_count(e->resolved_type), sv[0]);
             }
             if (n == "__probe") {
                 ValueList vals = lower_expr(e->args[1].get());
@@ -601,10 +612,8 @@ ValueList MirBodyLowerer::lower_expr(const Expr* e) {
             if (n == "__check") return lower_check_expr(e);
             if (n == "__probe_if") return lower_probe_if_expr(e);
             if (n == "telemetry") {
-                ValueList slot = lower_expr(e->args[0].get());
-                ValueList val = lower_expr(e->args[1].get());
-                lower_telemetry(slot[0], e->args[0]->resolved_type.scalar,
-                                val[0], e->args[1]->resolved_type.scalar);
+                ValueList slot = lower_expr(e->args[0].get()), val = lower_expr(e->args[1].get());
+                lower_telemetry(slot[0], e->args[0]->resolved_type.scalar, val[0], e->args[1]->resolved_type.scalar);
                 return {};
             }
             // 3. Newtype constructors Meters(x) and Scalar casts f32(x), ...

@@ -260,6 +260,7 @@ Value js_kernelKnobs(Value self, std::span<const Value> args) {
     h->kernel = std::shared_ptr<const CompiledKernel>(next_res, nk);
     h->fast_eval.reset();
     h->program.reset();
+    bumpReloadEpoch();
     if (nk->grid_dim > 0 && !nk->spirv.words.empty()) {
         if (GpuDevice* dev = currentDevice()) {
             std::string err;
@@ -680,6 +681,20 @@ void decorateFnClass(ev::ObjectBuilder& b) {
     b.def("run", 1, js_fnRun);
     b.def("dispatch", 1, js_fnDispatch);
     b.def("knobs", 1, js_fnKnobs);
+    b.def("exportNative", 1, [](Value self, std::span<const Value> args) -> Value {
+        FnHandle* h = fnHandle(self);
+        if (!h || !h->point_kernel) return ev::throwTypeError("KernelFn.exportNative: invalid receiver");
+        if (args.empty() || !ev::isString(args[0])) {
+            return ev::throwTypeError("KernelFn.exportNative: requires a JS dotted path string");
+        }
+        ensureCpuBuilt(*h->point_kernel);
+        std::string err;
+        if (!exportKernelAsBronzeNative(*h->point_kernel, ev::toUtf8(args[0]), &err)) {
+            return ev::throwError("KernelFn.exportNative: " + err);
+        }
+        return ev::undefined();
+    });
+    decorateBind(b, true);
     b.accessor("name", [](Value self, std::span<const Value>) -> Value {
         FnHandle* h = fnHandle(self);
         return h ? ev::fromUtf8(h->fn_name) : ev::undefined();
@@ -699,8 +714,19 @@ void decorateKernelExtras(ev::ObjectBuilder& b) {
     b.def("setKnobs", 1, js_kernelSetKnobs);
     b.def("stats", 0, js_kernelStats);
     b.def("exportNative", 1, js_kernelExportNative);
+    decorateBind(b, false);
     decorateKernelTargetExtras(b);
     decorateKernelDiagExtras(b);
+}
+
+Value evalFnWithArgs(Value self, std::span<const Value> args) {
+    return js_fnEval(self, args);
+}
+
+std::shared_ptr<const CompiledKernel> unwrapFnPointKernelShared(Value self) {
+    FnHandle* h = fnHandle(self);
+    if (!h || !h->point_result || !h->point_kernel) return nullptr;
+    return std::shared_ptr<const CompiledKernel>(h->point_result, h->point_kernel);
 }
 
 void decorateModuleExtras(ev::ObjectBuilder& b) {
@@ -839,6 +865,7 @@ void decorateBroKernelExtras(ev::ObjectBuilder& b) {
     decorateModuleRegistry(b);
     decorateReload(b);
     decorateBroKernelDiagExtras(b);
+    decorateBroKernelBatch(b);
 }
 
 void configureCompilerModulesAndOptions(

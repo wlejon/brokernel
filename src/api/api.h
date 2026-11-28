@@ -171,6 +171,17 @@ public:
         if (err) *err = "this GPU device has no counted dispatch";
         return false;
     }
+    /// Begin/end a batch of GPU compute dispatches recorded on a single command buffer.
+    virtual void beginBatch() {}
+    virtual bool endBatch(std::string* err = nullptr) {
+        (void)err;
+        return true;
+    }
+    /// Acquire/release transient GPU scratch buffers pooled by size bucket.
+    virtual std::shared_ptr<GpuBuffer> acquireScratchBuffer(size_t bytes, std::string* err = nullptr) {
+        return createBuffer(bytes, err);
+    }
+    virtual void releaseScratchBuffer(std::shared_ptr<GpuBuffer> buf) { (void)buf; }
 };
 
 /// The device the current thread's realms dispatch on (null: none). Set it

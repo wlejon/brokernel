@@ -65,6 +65,8 @@ add_library(brokernel STATIC
     src/lowering_ops.cpp
     src/lowering_block.cpp
     src/lowering_checks.cpp
+    src/lowering_df32.cpp
+    src/lowering_direct_cpu.cpp
     src/lowering_store_place.cpp
     src/lowering_telemetry.cpp
     src/lowering_texture.cpp

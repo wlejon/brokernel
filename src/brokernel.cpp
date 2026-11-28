@@ -84,6 +84,7 @@ CompileResult Compiler::compile_uncached(
 
     res.module_name = checked->module_name;
     res.types = checked->types;
+    auto types_ref = std::make_shared<const TypeRegistry>(res.types);
     res.constants = checked->exported_constants;
     res.enums = checked->exported_enums;
     res.probes = checked->probes;
@@ -156,6 +157,7 @@ CompileResult Compiler::compile_uncached(
 
         CompiledKernel ck;
         ck.name = fn->source_name;
+        ck.types = types_ref;
         ck.is_entry_kernel = fn->is_entry_kernel;
         ck.is_pub = fn->is_pub;
         ck.stage = fn->stage;
@@ -338,6 +340,15 @@ CompileResult Compiler::compile_uncached(
                         res.ok = false;
                         return res;
                     }
+                }
+                if (!fn->uses_barriers_or_shared && !fn->uses_grid_coords &&
+                    !fn->uses_telemetry && ck.runtime_knobs.empty() &&
+                    !ck.checks_compiled && !ck.trap_non_finite_compiled && !ck.probes_compiled) {
+                    cpu->lower_direct_mir = [checked, fn](std::shared_ptr<const brass::Module>& out_mod,
+                                                          std::string& out_entry,
+                                                          std::string& out_err) {
+                        lower_kernel_direct_cpu_mir(*checked, *fn, out_mod, out_entry, &out_err);
+                    };
                 }
                 ck.cpu_ = std::move(cpu);
             }

@@ -74,22 +74,8 @@ const char* accessName(AccessMode m) {
 // kernel.eval(...args): a point kernel at one point, on the CPU.
 Value js_eval(Value self, std::span<const Value> args) {
     KernelHandle* h = kernelHandle(self);
-    const CompiledKernel* k = h ? h->kernel.get() : nullptr;
-    if (!k) return ev::throwTypeError("Kernel.eval: invalid receiver");
-    if (k->grid_dim != 0) return ev::throwTypeError("Kernel.eval: '" + k->name + "' is a grid kernel; use run()");
-    ensureCpuBuilt(*k);
-    Value fastOut;
-    if (tryFastEval(*h, args, fastOut)) return fastOut;
-    if (!k->cpu_point_fn().is_valid()) return ev::throwTypeError("Kernel.eval: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
-    ArgPack pack(*k, args, "Kernel.eval");
-    alignas(16) uint8_t ret[256] = {};
-    std::string err;
-    syncKernelTelemetry(*h, /*gpu=*/false);
-    const bool ok = k->eval_cpu(pack.bind(args), k->return_byte_size <= sizeof ret ? ret : nullptr, &err);
-    finishKernelTelemetry(*h, /*gpu=*/false);
-    if (!ok) return ev::throwError("Kernel.eval: " + err);
-    if (!k->has_return_value() || k->return_byte_size > sizeof ret) return ev::undefined();
-    return decodeLeaves(*k, ret);
+    if (!h) return ev::throwTypeError("Kernel.eval: invalid receiver");
+    return evalResolvedKernel(*h, args, "Kernel.eval");
 }
 
 // kernel.run(grid, ...args): a grid kernel over its grid, on the CPU. Its
@@ -97,46 +83,8 @@ Value js_eval(Value self, std::span<const Value> args) {
 // cell, in a typed array.
 Value js_run(Value self, std::span<const Value> args) {
     KernelHandle* h = kernelHandle(self);
-    const CompiledKernel* k = h ? h->kernel.get() : nullptr;
-    if (!k) return ev::throwTypeError("Kernel.run: invalid receiver");
-    if (k->grid_dim == 0) return ev::throwTypeError("Kernel.run: '" + k->name + "' is a point kernel; use eval()");
-    ensureCpuBuilt(*k);
-    if (!k->cpu_grid_fn().is_valid()) return ev::throwTypeError("Kernel.run: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
-    if (args.empty()) return ev::throwTypeError("Kernel.run: the first argument is the grid");
-    const GridShape shape = shapeArg(args[0], *k, "Kernel.run");
-    const std::span<const Value> kargs = args.subspan(1);
-    ArgPack pack(*k, kargs, "Kernel.run");
-
-    // The returns' typed array is allocated before the stores are bound.
-    ev::Persistent out;
-    if (k->has_return_value()) {
-        const auto& kinds = k->return_leaf_kinds;
-        bool uniform = !kinds.empty();
-        for (ScalarKind sk : kinds) uniform = uniform && sk == kinds[0];
-        const auto kind = uniform ? elementKindOf(kinds[0]) : std::nullopt;
-        const size_t cells = shape.total_points();
-        const size_t count = kind ? cells * kinds.size() : cells * k->return_byte_size;
-        if (count > 0xffffffffull) return ev::throwRangeError("Kernel.run: the grid's returns do not fit a typed array");
-        HeldArgs held(kargs);
-        out.set(ev::createTypedArray(kind ? *kind : ev::elements::Uint8, static_cast<uint32_t>(count)));
-        const std::vector<Value> current = held.current();
-        std::span<const KernelArg> bound = pack.bind(current);
-        std::string err;
-        const auto info = ev::typedArrayInfo(out.get());
-        syncKernelTelemetry(*h, /*gpu=*/false);
-        const bool ok = k->dispatch_cpu(shape, bound, info.data, &err);
-        finishKernelTelemetry(*h, /*gpu=*/false);
-        if (!ok) return ev::throwError("Kernel.run: " + err);
-        pack.finishCpu();
-        return out.get();
-    }
-    std::string err;
-    syncKernelTelemetry(*h, /*gpu=*/false);
-    const bool ok = k->dispatch_cpu(shape, pack.bind(kargs), nullptr, &err);
-    finishKernelTelemetry(*h, /*gpu=*/false);
-    if (!ok) return ev::throwError("Kernel.run: " + err);
-    pack.finishCpu();
-    return ev::undefined();
+    if (!h) return ev::throwTypeError("Kernel.run: invalid receiver");
+    return runResolvedKernel(*h, args);
 }
 
 // kernel.dispatch(grid, ...args): a grid kernel over its grid, on the GPU,
@@ -344,6 +292,7 @@ void decorateBuffer(ev::ObjectBuilder& b) {
     b.def("write", 1, js_bufferWrite);
     b.def("read", 1, js_bufferRead);
     b.def("readLater", 0, js_bufferReadLater);
+    decorateBufferBatch(b);
     b.def("destroy", 0, js_bufferDestroy);
     b.accessor("byteLength", [](Value self, std::span<const Value>) -> Value {
         auto* h = static_cast<BufferHandle*>(g_bufferClass.unwrap(self));
@@ -424,6 +373,67 @@ const CompileResult* unwrapModule(Value self) {
 }
 
 } // namespace
+
+Value evalResolvedKernel(KernelHandle& h, std::span<const Value> args, const char* what) {
+    const CompiledKernel* k = h.kernel.get();
+    if (!k) return ev::throwTypeError(std::string(what) + ": invalid receiver");
+    if (k->grid_dim != 0) return ev::throwTypeError(std::string(what) + ": '" + k->name + "' is a grid kernel; use run()");
+    ensureCpuBuilt(*k);
+    Value fastOut;
+    if (tryFastEval(h, args, fastOut)) return fastOut;
+    if (!k->cpu_point_fn().is_valid()) return ev::throwTypeError(std::string(what) + ": '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
+    ArgPack pack(*k, args, what);
+    alignas(16) uint8_t ret[256] = {};
+    std::string err;
+    syncKernelTelemetry(h, /*gpu=*/false);
+    const bool ok = k->eval_cpu(pack.bind(args), k->return_byte_size <= sizeof ret ? ret : nullptr, &err);
+    finishKernelTelemetry(h, /*gpu=*/false);
+    if (!ok) return ev::throwError(std::string(what) + ": " + err);
+    if (!k->has_return_value() || k->return_byte_size > sizeof ret) return ev::undefined();
+    return decodeLeaves(*k, ret);
+}
+
+Value runResolvedKernel(KernelHandle& h, std::span<const Value> args) {
+    const CompiledKernel* k = h.kernel.get();
+    if (!k) return ev::throwTypeError("Kernel.run: invalid receiver");
+    if (k->grid_dim == 0) return ev::throwTypeError("Kernel.run: '" + k->name + "' is a point kernel; use eval()");
+    ensureCpuBuilt(*k);
+    if (!k->cpu_grid_fn().is_valid()) return ev::throwTypeError("Kernel.run: '" + k->name + "' has no CPU build" + (k->cpu_error().empty() ? std::string() : ": " + k->cpu_error()));
+    if (args.empty()) return ev::throwTypeError("Kernel.run: the first argument is the grid");
+    const GridShape shape = shapeArg(args[0], *k, "Kernel.run");
+    const std::span<const Value> kargs = args.subspan(1);
+    ArgPack pack(*k, kargs, "Kernel.run");
+
+    ev::Persistent out;
+    if (k->has_return_value()) {
+        const auto& kinds = k->return_leaf_kinds;
+        bool uniform = !kinds.empty();
+        for (ScalarKind sk : kinds) uniform = uniform && sk == kinds[0];
+        const auto kind = uniform ? elementKindOf(kinds[0]) : std::nullopt;
+        const size_t cells = shape.total_points();
+        const size_t count = kind ? cells * kinds.size() : cells * k->return_byte_size;
+        if (count > 0xffffffffull) return ev::throwRangeError("Kernel.run: the grid's returns do not fit a typed array");
+        HeldArgs held(kargs);
+        out.set(ev::createTypedArray(kind ? *kind : ev::elements::Uint8, static_cast<uint32_t>(count)));
+        const std::vector<Value> current = held.current();
+        std::span<const KernelArg> bound = pack.bind(current);
+        std::string err;
+        const auto info = ev::typedArrayInfo(out.get());
+        syncKernelTelemetry(h, /*gpu=*/false);
+        const bool ok = k->dispatch_cpu(shape, bound, info.data, &err);
+        finishKernelTelemetry(h, /*gpu=*/false);
+        if (!ok) return ev::throwError("Kernel.run: " + err);
+        pack.finishCpu();
+        return out.get();
+    }
+    std::string err;
+    syncKernelTelemetry(h, /*gpu=*/false);
+    const bool ok = k->dispatch_cpu(shape, pack.bind(kargs), nullptr, &err);
+    finishKernelTelemetry(h, /*gpu=*/false);
+    if (!ok) return ev::throwError("Kernel.run: " + err);
+    pack.finishCpu();
+    return ev::undefined();
+}
 
 Value makeKernelValue(std::shared_ptr<ModuleCell> cell, const std::string& name, const char* what) {
     const std::shared_ptr<const CompileResult>& result = cell->result;
@@ -624,8 +634,21 @@ Value makeBuffer(std::shared_ptr<GpuBuffer> buffer) {
 }
 
 Value decodeLeaves(const CompiledKernel& k, const uint8_t* raw) {
-    auto leaf = [&](size_t i, size_t& off) -> Value {
+    std::vector<Value> decoded;
+    decoded.reserve(k.return_leaf_kinds.size());
+    size_t off = 0;
+    for (size_t i = 0; i < k.return_leaf_kinds.size(); ++i) {
         const ScalarKind sk = k.return_leaf_kinds[i];
+        if (sk == ScalarKind::DF32 && i + 1 < k.return_leaf_kinds.size() &&
+            k.return_leaf_kinds[i + 1] == ScalarKind::DF32) {
+            float hi = 0.0f, lo = 0.0f;
+            std::memcpy(&hi, raw + off, 4);
+            std::memcpy(&lo, raw + off + 4, 4);
+            off += 8;
+            ++i;
+            decoded.push_back(ev::fromDouble(static_cast<double>(hi) + static_cast<double>(lo)));
+            continue;
+        }
         double d = 0.0;
         switch (sk) {
             case ScalarKind::F64: { double x; std::memcpy(&x, raw + off, 8); d = x; off += 8; break; }
@@ -633,19 +656,98 @@ Value decodeLeaves(const CompiledKernel& k, const uint8_t* raw) {
             case ScalarKind::I64: { int64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
             case ScalarKind::U64: { uint64_t x; std::memcpy(&x, raw + off, 8); d = static_cast<double>(x); off += 8; break; }
             case ScalarKind::U32: { uint32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
-            case ScalarKind::Bool: { int32_t x; std::memcpy(&x, raw + off, 4); off += 4; return ev::fromBool(x != 0); }
+            case ScalarKind::Bool: { int32_t x; std::memcpy(&x, raw + off, 4); off += 4; decoded.push_back(ev::fromBool(x != 0)); continue; }
             default: { int32_t x; std::memcpy(&x, raw + off, 4); d = x; off += 4; break; }
         }
-        return ev::fromDouble(d);
-    };
-    size_t off = 0;
-    if (k.return_leaf_kinds.size() == 1) return leaf(0, off);
-    ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(k.return_leaf_kinds.size())));
-    for (size_t i = 0; i < k.return_leaf_kinds.size(); ++i) {
-        ev::Persistent v(leaf(i, off));
+        decoded.push_back(ev::fromDouble(d));
+    }
+    if (decoded.size() == 1) return decoded[0];
+    ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(decoded.size())));
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        ev::Persistent v(decoded[i]);
         arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), v.get()));
     }
     return arr.get();
+}
+
+Value js_packDF32(Value, std::span<const Value> args) {
+    if (args.empty()) return ev::throwTypeError("bro.kernel.packDF32: expected number, Array, or Float64Array");
+    const Value src = args[0];
+    auto writePair = [](double d, float* dst) {
+        const float hi = static_cast<float>(d);
+        const float lo = static_cast<float>(d - static_cast<double>(hi));
+        dst[0] = hi;
+        dst[1] = lo;
+    };
+    if (ev::isNumber(src)) {
+        ev::Persistent out(ev::createTypedArray(ev::elements::Float32, 2));
+        const auto info = ev::typedArrayInfo(out.get());
+        writePair(ev::toDouble(src), reinterpret_cast<float*>(info.data));
+        return out.get();
+    }
+    size_t count = 0;
+    const double* f64Data = nullptr;
+    if (ev::isTypedArray(src)) {
+        const auto info = ev::typedArrayInfo(src);
+        if (info.elementKind == ev::elements::Float64) {
+            count = info.byteLength / 8;
+            f64Data = reinterpret_cast<const double*>(info.data);
+        } else {
+            count = info.byteLength / 4;
+        }
+    } else if (ev::isObject(src)) {
+        Value lenV = ev::getProperty(src, "length");
+        if (!ev::isNumber(lenV)) return ev::throwTypeError("bro.kernel.packDF32: expected numeric array");
+        count = static_cast<size_t>(ev::toDouble(lenV));
+    } else {
+        return ev::throwTypeError("bro.kernel.packDF32: expected number, Array, or TypedArray");
+    }
+    ev::Persistent out = (args.size() > 1 && ev::isTypedArray(args[1]))
+                             ? ev::Persistent(args[1])
+                             : ev::Persistent(ev::createTypedArray(ev::elements::Float32, count * 2));
+    const auto dstInfo = ev::typedArrayInfo(out.get());
+    if (!dstInfo.data || dstInfo.elementKind != ev::elements::Float32 || dstInfo.byteLength < count * 8) {
+        return ev::throwRangeError("bro.kernel.packDF32: output Float32Array too small");
+    }
+    auto* dst = reinterpret_cast<float*>(dstInfo.data);
+    if (f64Data) {
+        for (size_t i = 0; i < count; ++i) writePair(f64Data[i], dst + i * 2);
+    } else if (ev::isTypedArray(src)) {
+        const auto sInfo = ev::typedArrayInfo(src);
+        if (sInfo.elementKind == ev::elements::Float32) {
+            const auto* f = reinterpret_cast<const float*>(sInfo.data);
+            for (size_t i = 0; i < count; ++i) writePair(static_cast<double>(f[i]), dst + i * 2);
+        } else {
+            for (size_t i = 0; i < count; ++i) writePair(ev::toDouble(ev::getElement(src, static_cast<uint32_t>(i))), dst + i * 2);
+        }
+    } else {
+        for (size_t i = 0; i < count; ++i) writePair(ev::toDouble(ev::getElement(src, static_cast<uint32_t>(i))), dst + i * 2);
+    }
+    return out.get();
+}
+
+Value js_unpackDF32(Value, std::span<const Value> args) {
+    if (args.empty() || !ev::isTypedArray(args[0])) {
+        return ev::throwTypeError("bro.kernel.unpackDF32: expected Float32Array");
+    }
+    const auto srcInfo = ev::typedArrayInfo(args[0]);
+    if (!srcInfo.data || srcInfo.elementKind != ev::elements::Float32 || (srcInfo.byteLength % 8) != 0) {
+        return ev::throwTypeError("bro.kernel.unpackDF32: expected Float32Array of even length");
+    }
+    const size_t count = srcInfo.byteLength / 8;
+    const auto* src = reinterpret_cast<const float*>(srcInfo.data);
+    ev::Persistent out = (args.size() > 1 && ev::isTypedArray(args[1]))
+                             ? ev::Persistent(args[1])
+                             : ev::Persistent(ev::createTypedArray(ev::elements::Float64, count));
+    const auto dstInfo = ev::typedArrayInfo(out.get());
+    if (!dstInfo.data || dstInfo.elementKind != ev::elements::Float64 || dstInfo.byteLength < count * 8) {
+        return ev::throwRangeError("bro.kernel.unpackDF32: output Float64Array too small");
+    }
+    auto* dst = reinterpret_cast<double*>(dstInfo.data);
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = static_cast<double>(src[i * 2]) + static_cast<double>(src[i * 2 + 1]);
+    }
+    return out.get();
 }
 
 GridShape shapeArg(Value v, const CompiledKernel& k, const std::string& what) {
@@ -731,6 +833,8 @@ void installKernel() {
         return ev::fromBool(t_device && t_device->available());
     });
     b.def("compile", 2, js_compile);
+    b.def("packDF32", 2, js_packDF32);
+    b.def("unpackDF32", 2, js_unpackDF32);
     decorateAsync(b);
     installAsyncRealmHook();
     b.def("createBuffer", 1, js_createBuffer);

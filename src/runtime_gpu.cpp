@@ -210,6 +210,14 @@ bool CompiledKernel::gpu_launch(
             switch (p.type.scalar) {
                 case ScalarKind::F32: vk_args.emplace_back(a.as_f32()); break;
                 case ScalarKind::F64: vk_args.emplace_back(a.as_f64()); break;
+                case ScalarKind::DF32: {
+                    const double d = a.as_f64();
+                    const float hi = static_cast<float>(d);
+                    const float lo = static_cast<float>(d - static_cast<double>(hi));
+                    vk_args.emplace_back(hi);
+                    vk_args.emplace_back(lo);
+                    break;
+                }
                 case ScalarKind::U32: vk_args.emplace_back(a.as_u32()); break;
                 case ScalarKind::U64: vk_args.emplace_back(a.as_u64()); break;
                 case ScalarKind::I64: vk_args.emplace_back(a.as_i64()); break;
@@ -219,12 +227,21 @@ bool CompiledKernel::gpu_launch(
             if (a.kind() == KernelArg::Kind::ScalarsF32) {
                 for (float v : a.f32_values()) vk_args.emplace_back(v);
             } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
-                for (double v : a.f64_values()) vk_args.emplace_back(v);
+                for (double v : a.f64_values()) {
+                    if (p.type.scalar == ScalarKind::DF32) {
+                        const float hi = static_cast<float>(v);
+                        const float lo = static_cast<float>(v - static_cast<double>(hi));
+                        vk_args.emplace_back(hi);
+                        vk_args.emplace_back(lo);
+                    } else {
+                        vk_args.emplace_back(v);
+                    }
+                }
             } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
                 for (int32_t v : a.i32_values()) vk_args.emplace_back(v);
             } else if (a.kind() == KernelArg::Kind::Buffer && a.buffer_ptr()) {
                 const auto* raw = static_cast<const uint8_t*>(a.buffer_ptr());
-                uint32_t elem_sz = p.type.scalar_size_bytes();
+                uint32_t elem_sz = p.type.scalar == ScalarKind::DF32 ? 4u : p.type.scalar_size_bytes();
                 if (elem_sz == 0) elem_sz = 4;
                 for (uint32_t k = 0; k < p.mir_param_count; ++k) {
                     uint64_t word = 0;

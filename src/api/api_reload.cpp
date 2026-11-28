@@ -108,6 +108,7 @@ Value js_reload(Value, std::span<const Value> args) {
         }
         releaseLater(std::exchange(next[i].cell->result, next[i].result));
         ++next[i].cell->generation;
+        bumpReloadEpoch();
         ev::Persistent names(stringArray(changed));
         ev::ObjectBuilder entry;
         entry.set("file", next[i].result->file_name);

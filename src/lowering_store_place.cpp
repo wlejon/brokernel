@@ -40,11 +40,19 @@ void collect_store_leaf_offsets(
     if (t.is_scalar()) {
         offsets.push_back(cur_byte_off);
         kinds.push_back(t.scalar);
+        if (t.scalar == ScalarKind::DF32) {
+            offsets.push_back(cur_byte_off + 4);
+            kinds.push_back(ScalarKind::DF32);
+        }
     } else if (t.is_vector()) {
         uint32_t sb = t.scalar_size_bytes();
         for (uint32_t i = 0; i < t.dimension; ++i) {
             offsets.push_back(cur_byte_off + i * sb);
             kinds.push_back(t.scalar);
+            if (t.scalar == ScalarKind::DF32) {
+                offsets.push_back(cur_byte_off + i * sb + 4);
+                kinds.push_back(ScalarKind::DF32);
+            }
         }
     } else if (t.is_array()) {
         Type elem = t.element_type();
@@ -155,6 +163,10 @@ ValueList MirBodyLowerer::store_place_load(const StorePlace& p) {
         for (uint32_t lane : p.lanes) {
             offs.push_back(lane * sb);
             kinds.push_back(p.type.scalar);
+            if (p.type.scalar == ScalarKind::DF32) {
+                offs.push_back(lane * sb + 4);
+                kinds.push_back(ScalarKind::DF32);
+            }
         }
     } else {
         collect_store_leaf_offsets(mod.types, p.type, 0, offs, kinds);
@@ -192,6 +204,10 @@ void MirBodyLowerer::store_place_store(const StorePlace& p, const ValueList& val
         for (uint32_t lane : p.lanes) {
             offs.push_back(lane * sb);
             kinds.push_back(p.type.scalar);
+            if (p.type.scalar == ScalarKind::DF32) {
+                offs.push_back(lane * sb + 4);
+                kinds.push_back(ScalarKind::DF32);
+            }
         }
     } else {
         collect_store_leaf_offsets(mod.types, p.type, 0, offs, kinds);

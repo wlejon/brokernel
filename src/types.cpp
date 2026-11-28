@@ -14,6 +14,7 @@ const char* scalar_name(ScalarKind s) noexcept {
         case ScalarKind::U64:  return "u64";
         case ScalarKind::F32:  return "f32";
         case ScalarKind::F64:  return "f64";
+        case ScalarKind::DF32: return "df32";
     }
     return "unknown";
 }
@@ -35,7 +36,8 @@ uint32_t Type::scalar_size_bytes() const noexcept {
         case ScalarKind::F32:  return 4;
         case ScalarKind::I64:
         case ScalarKind::U64:
-        case ScalarKind::F64:  return 8;
+        case ScalarKind::F64:
+        case ScalarKind::DF32: return 8;
     }
     return 0;
 }
@@ -250,9 +252,14 @@ const EnumDef* TypeRegistry::find_enum(std::string_view name) const noexcept {
 std::vector<ScalarKind> TypeRegistry::flatten_scalars(const Type& t) const {
     std::vector<ScalarKind> out;
     if (t.is_scalar()) {
-        out.push_back(t.scalar);
+        if (t.scalar == ScalarKind::DF32) {
+            out.push_back(ScalarKind::DF32);
+            out.push_back(ScalarKind::DF32);
+        } else {
+            out.push_back(t.scalar);
+        }
     } else if (t.is_vector()) {
-        out.assign(t.dimension, t.scalar);
+        out.assign(t.scalar == ScalarKind::DF32 ? t.dimension * 2 : t.dimension, t.scalar);
     } else if (t.is_array()) {
         auto elem = flatten_scalars(t.element_type());
         out.reserve(elem.size() * t.dimension);
@@ -272,8 +279,8 @@ std::vector<ScalarKind> TypeRegistry::flatten_scalars(const Type& t) const {
 
 uint32_t TypeRegistry::flat_leaf_count(const Type& t) const {
     if (t.is_void()) return 0;
-    if (t.is_scalar()) return 1;
-    if (t.is_vector()) return t.dimension;
+    if (t.is_scalar()) return t.scalar == ScalarKind::DF32 ? 2 : 1;
+    if (t.is_vector()) return t.dimension * (t.scalar == ScalarKind::DF32 ? 2 : 1);
     if (t.is_array()) return flat_leaf_count(t.element_type()) * t.dimension;
     if (t.is_struct()) {
         if (const StructDef* sd = find_struct(t.struct_id)) {
@@ -304,8 +311,14 @@ uint32_t round_up(uint32_t v, uint32_t a) { return a ? (v + a - 1) / a * a : v; 
 } // namespace
 
 TypeRegistry::BlockLayout TypeRegistry::block_layout(const Type& t, bool std140) const {
-    if (t.is_scalar()) return {4, 4};
+    if (t.is_scalar()) {
+        return t.scalar == ScalarKind::DF32 ? BlockLayout{8, 8} : BlockLayout{4, 4};
+    }
     if (t.is_vector()) {
+        if (t.scalar == ScalarKind::DF32) {
+            if (t.dimension == 2) return {16, 16};
+            return {t.dimension * 8, 16};
+        }
         if (t.dimension == 2) return {8, 8};
         return {t.dimension * 4, 16};
     }

@@ -88,4 +88,13 @@ void lower_kernel_cpu_to_mir(
     LoweredKernelMir& out,
     DiagnosticBag& diags);
 
+/// Lowers an eligible stateless point kernel directly into a standalone
+/// Bronze-ABI SSA MIR module suitable for cross-language native call fusion.
+bool lower_kernel_direct_cpu_mir(
+    const CheckedModule& mod,
+    const CheckedFunction& fn,
+    std::shared_ptr<const brass::Module>& out_mod,
+    std::string& out_entry,
+    std::string* err = nullptr);
+
 } // namespace brokernel

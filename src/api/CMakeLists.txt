@@ -4,10 +4,13 @@ add_library(brokernel_api STATIC
     api_buffer.cpp
     api_diag.cpp
     api_fast.cpp
+    api_bind.cpp
+    api_batch.cpp
     api_fn.cpp
     api_knobs.cpp
     api_modules.cpp
     api_reload.cpp
+    api_struct_pack.cpp
 )
 
 target_include_directories(brokernel_api PUBLIC

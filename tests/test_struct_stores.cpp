@@ -154,9 +154,92 @@ static void test_write_only_and_read_only_store_diagnostics() {
     assert(!r3.ok);
 }
 
+static void test_struct_store_2d_and_3d_cpu_and_gpu() {
+    struct Cell {
+        float pos[2];
+        int32_t tag;
+    };
+    static_assert(sizeof(Cell) == 12);
+
+    const char* src2d = R"(
+        struct Cell {
+            pos: vec2<f32>,
+            tag: i32,
+        }
+
+        @kernel @grid(2)
+        fn step2d(g: grid<2>, inp: read_store<Cell, 2>, out: write_store<Cell, 2>, inout: rw_store<Cell, 2>) {
+            let cur = inp.read();
+            let diag = inp.load(min(g.x() + 1, g.width() - 1), min(g.y() + 1, g.height() - 1));
+            var next: Cell;
+            next.pos = cur.pos + diag.pos * 0.5;
+            next.tag = cur.tag + g.y() * 10 + g.x();
+            out.write(next);
+            inout.write(next);
+            inout[g.x(), g.y()].pos.x += 1.0;
+        }
+    )";
+
+    auto r2 = compile_source(src2d, "struct_store_2d.bk");
+    if (!r2.ok) std::cerr << r2.error_message() << "\n";
+    assert(r2.ok);
+    const CompiledKernel* k2 = r2.find_kernel("step2d");
+    assert(k2 && k2->valid());
+
+    constexpr uint32_t W = 4, H = 3;
+    std::vector<Cell> in2d(W * H);
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            in2d[y * W + x] = Cell{{static_cast<float>(x), static_cast<float>(y * 2)}, static_cast<int32_t>(x + y)};
+        }
+    }
+    std::vector<Cell> wo2d(W * H), cpu2d(W * H), woGpu2d(W * H), gpu2d(W * H);
+    std::string err;
+    assert(k2->dispatch_cpu(GridShape(W, H), {KernelArg::store(in2d), KernelArg::store(wo2d), KernelArg::store(cpu2d)}, nullptr, &err));
+    // Verify cell (1, 1): cur = (1, 2), diag at (2, 2) = (2, 4) -> wo.pos = (2, 4), inout.pos = (3, 4)
+    assert(std::abs(wo2d[1 * W + 1].pos[0] - 2.0f) < 1e-5f);
+    assert(std::abs(cpu2d[1 * W + 1].pos[0] - 3.0f) < 1e-5f);
+    assert(std::abs(cpu2d[1 * W + 1].pos[1] - 4.0f) < 1e-5f);
+    assert(cpu2d[1 * W + 1].tag == (1 + 1) + 1 * 10 + 1);
+
+    if (k2->dispatch_gpu(GridShape(W, H), {KernelArg::store(in2d), KernelArg::store(woGpu2d), KernelArg::store(gpu2d)}, nullptr, &err)) {
+        for (size_t i = 0; i < W * H; ++i) {
+            assert(std::abs(wo2d[i].pos[0] - woGpu2d[i].pos[0]) < 1e-4f);
+            assert(std::abs(cpu2d[i].pos[0] - gpu2d[i].pos[0]) < 1e-4f);
+            assert(std::abs(cpu2d[i].pos[1] - gpu2d[i].pos[1]) < 1e-4f);
+            assert(cpu2d[i].tag == gpu2d[i].tag);
+        }
+    }
+
+    const char* src3d = R"(
+        struct Voxel { val: f32, active: i32 }
+        @kernel @grid(3)
+        fn step3d(g: grid<3>, vol: rw_store<Voxel, 3>) {
+            let c = vol.load(g.x(), g.y(), g.z());
+            var updated: Voxel;
+            updated.val = c.val * 2.0 + 1.0;
+            updated.active = c.active + g.z();
+            vol.store(g.x(), g.y(), g.z(), updated);
+        }
+    )";
+    auto r3 = compile_source(src3d, "struct_store_3d.bk");
+    if (!r3.ok) std::cerr << r3.error_message() << "\n";
+    assert(r3.ok);
+    const CompiledKernel* k3 = r3.find_kernel("step3d");
+    assert(k3 && k3->valid());
+    struct Voxel { float val; int32_t active; };
+    constexpr uint32_t D = 2;
+    std::vector<Voxel> cpu3d(W * H * D, Voxel{1.5f, 3});
+    assert(k3->dispatch_cpu(GridShape(W, H, D), {KernelArg::store(cpu3d)}, nullptr, &err));
+    const size_t idx111 = (1 * H + 1) * W + 1;
+    assert(std::abs(cpu3d[idx111].val - 4.0f) < 1e-5f);
+    assert(cpu3d[idx111].active == 4);
+}
+
 int main() {
     test_struct_store_cpu_and_gpu();
     test_write_only_and_read_only_store_diagnostics();
+    test_struct_store_2d_and_3d_cpu_and_gpu();
     std::cout << "ALL test_struct_stores PASSED\n";
     return 0;
 }

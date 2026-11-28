@@ -83,7 +83,8 @@ inline bool isStore(const KernelParamInfo& p) {
 
 inline std::optional<bronze::ElementKind> elementKindOf(ScalarKind sk) {
     switch (sk) {
-        case ScalarKind::F32: return ev::elements::Float32;
+        case ScalarKind::F32:
+        case ScalarKind::DF32: return ev::elements::Float32;
         case ScalarKind::F64: return ev::elements::Float64;
         case ScalarKind::I32:
         case ScalarKind::Bool: return ev::elements::Int32;
@@ -105,13 +106,14 @@ inline const char* elementKindName(bronze::ElementKind k) {
 }
 
 inline size_t scalarBytes(ScalarKind sk) {
-    return (sk == ScalarKind::F64 || sk == ScalarKind::I64 || sk == ScalarKind::U64) ? 8 : 4;
+    return (sk == ScalarKind::F64 || sk == ScalarKind::I64 || sk == ScalarKind::U64 || sk == ScalarKind::DF32) ? 8 : 4;
 }
 
 inline KernelArg scalarArg(ScalarKind sk, Value v) {
     switch (sk) {
         case ScalarKind::F32: return KernelArg(static_cast<float>(ev::toDouble(v)));
-        case ScalarKind::F64: return KernelArg(ev::toDouble(v));
+        case ScalarKind::F64:
+        case ScalarKind::DF32: return KernelArg(ev::toDouble(v));
         case ScalarKind::U32: return KernelArg(static_cast<uint32_t>(ev::toUint64(v)));
         case ScalarKind::I64: return KernelArg(ev::toInt64(v));
         case ScalarKind::U64: return KernelArg(ev::toUint64(v));
@@ -119,6 +121,9 @@ inline KernelArg scalarArg(ScalarKind sk, Value v) {
         default: return KernelArg(static_cast<int32_t>(ev::toInt64(v)));
     }
 }
+
+bool packJsStructValue(const TypeRegistry& types, const Type& type, Value v,
+                       uint8_t* dst, size_t dstBytes, const std::string& ctx, std::string& err);
 
 class ArgPack {
 public:
@@ -171,6 +176,18 @@ public:
                 const auto info = ev::typedArrayInfo(v);
                 bytes_[i].assign(info.data, info.data + info.byteLength);
                 args_[i] = KernelArg::buffer(static_cast<const void*>(bytes_[i].data()), bytes_[i].size());
+            } else if (ev::isObject(v) && p.role == ParamRole::Struct) {
+                const size_t nbytes = k.types ? k.types->byte_size(p.type) : 0;
+                if (!k.types || nbytes == 0) {
+                    ev::throwTypeError(what + ": '" + p.name + "' struct metadata unavailable");
+                }
+                bytes_[i].assign(nbytes, 0);
+                std::string err;
+                if (!packJsStructValue(*k.types, p.type, v, bytes_[i].data(), bytes_[i].size(),
+                                       what + ": '" + p.name + "'", err)) {
+                    ev::throwTypeError(err);
+                }
+                args_[i] = KernelArg::buffer(static_cast<const void*>(bytes_[i].data()), bytes_[i].size());
             } else if (ev::isObject(v) && p.role != ParamRole::Struct) {
                 const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(v, "length")));
                 if (n != p.mir_param_count) {
@@ -199,7 +216,8 @@ public:
                 args_[i] = KernelArg::buffer(static_cast<const void*>(bytes_[i].data()), bytes_[i].size());
             } else {
                 ev::throwTypeError(what + ": '" + p.name + "' takes " +
-                                   (p.role == ParamRole::Struct ? "a typed array of its bytes" : "an array of numbers"));
+                                   (p.role == ParamRole::Struct ? "a plain object or typed array of its bytes"
+                                                                : "an array of numbers"));
             }
             ++i;
         }
@@ -311,15 +329,47 @@ void decorateKernelDiagExtras(ev::ObjectBuilder& b);
 void decorateModuleDiagExtras(ev::ObjectBuilder& b);
 void decorateBroKernelDiagExtras(ev::ObjectBuilder& b);
 
-// Dual-residency buffers & structView (api_buffer.cpp).
+// Dual-residency buffers & structView (api_buffer.cpp) and plain-object packing (api_struct_pack.cpp).
 Value js_createBuffer(Value self, std::span<const Value> args);
 void installBufferClasses();
 void decorateBufferExtras(ev::ObjectBuilder& b);
 Value js_moduleStructView(Value self, std::span<const Value> args);
+bool packJsStructValue(const TypeRegistry& types, const Type& type, Value v,
+                       uint8_t* dst, size_t dstBytes, const std::string& ctx, std::string& err);
 
-// Zero-alloc fast CPU eval & Bronze native export (api_fast.cpp).
+// Zero-alloc fast CPU eval, bound closures & Bronze native export (api_fast.cpp, api_bind.cpp).
+struct FastEvalPlan;
+const std::atomic<uint64_t>& reloadEpochCounter();
+uint64_t currentReloadEpoch();
+void bumpReloadEpoch();
 bool tryFastEval(KernelHandle& h, std::span<const Value> args, Value& out);
+std::shared_ptr<FastEvalPlan> buildFastEvalPlan(const CompiledKernel& k);
+bool fastPlanIsEligible(const FastEvalPlan& plan);
+size_t fastPlanParamCount(const FastEvalPlan& plan);
+bool packFastArgIntoSlots(const FastEvalPlan& plan, size_t argIdx, Value v, uint64_t* slots,
+                          std::shared_ptr<GpuBuffer>* outWritableBuf, bool* outIsPinnedBuffer = nullptr);
+Value evalFastPlanSlots(const FastEvalPlan& plan, const CompiledKernel& k, const uint64_t* slots);
+bool isFastScalarParam(const FastEvalPlan& plan, size_t argIdx);
 Value js_kernelExportNative(Value self, std::span<const Value> args);
+bool exportKernelAsBronzeNative(const CompiledKernel& k, std::string_view jsPath, std::string* err);
+
+bool structViewFieldMeta(Value self, std::string_view fieldName, uint32_t& outStride,
+                         uint32_t& outOffset, ScalarKind& outScalar, std::string* err);
+Value evalResolvedKernel(KernelHandle& h, std::span<const Value> args, const char* what);
+Value runResolvedKernel(KernelHandle& h, std::span<const Value> args);
+Value evalFnWithArgs(Value self, std::span<const Value> args);
+std::shared_ptr<const CompiledKernel> unwrapFnPointKernelShared(Value self);
+void decorateBind(ev::ObjectBuilder& b, bool isFn);
+void decorateStructViewBind(ev::ObjectBuilder& b);
+Value makeTypedArrayFromVec(std::shared_ptr<std::vector<uint8_t>> vec,
+                            size_t byteLength,
+                            bronze::ElementKind ek,
+                            uint32_t elemBytes);
+bool typedArrayKindForCtor(Value ctor, bronze::ElementKind& outKind, uint32_t& outBytes);
+const std::shared_ptr<std::vector<uint8_t>>* hostBackingOf(GpuBuffer* b);
+void decorateBufferBatch(ev::ObjectBuilder& b);
+void decorateBroKernelBatch(ev::ObjectBuilder& b);
+void settleAsyncReadbacks(bool waitAll);
 
 // Runtime @knobs & knobGrad (api_knobs.cpp, helpers from api.cpp/api_fn.cpp).
 std::unordered_map<std::string, ConstValue> parseKnobOverrides(Value obj, const std::string& what);

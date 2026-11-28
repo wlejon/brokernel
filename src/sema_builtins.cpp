@@ -24,7 +24,26 @@ static void harmonize_args(std::vector<ExprPtr>& args, std::optional<Type> expec
 }
 Type FnCheckState::check_builtin_call(Expr* e, std::optional<Type> expected) {
     const std::string& n = e->name;
-    // 1. Scalar constructors / explicit casts: f32(x), f64(x), i32(x), u32(x), i64(x), u64(x), bool(x)
+    // 1. Scalar constructors / explicit casts: f32(x), f64(x), df32(x[, lo]), i32(x), u32(x), i64(x), u64(x), bool(x)
+    if (n == "df32" && e->generic_args.empty()) {
+        Type target = Type::df32();
+        if (e->args.size() == 1) {
+            check_expr(e->args[0].get(), is_unsuffixed_literal(e->args[0].get()) ? std::optional<Type>(target) : std::nullopt);
+        } else if (e->args.size() == 2) {
+            check_expr(e->args[0].get(), Type::f32());
+            coerce_expr_to_type(e->args[0].get(), Type::f32());
+            check_expr(e->args[1].get(), Type::f32());
+            coerce_expr_to_type(e->args[1].get(), Type::f32());
+            if (!e->args[0]->resolved_type.is_f32() || !e->args[1]->resolved_type.is_f32()) {
+                ctx.diags.error(e->span, "'df32(hi, lo)' expects two f32 arguments");
+            }
+        } else {
+            ctx.diags.error(e->span, "'df32(...)' expects 1 argument (x) or 2 arguments (hi, lo)");
+        }
+        mark_type_usage(target);
+        e->resolved_type = target;
+        return target;
+    }
     if ((n == "f32" || n == "f64" || n == "i32" || n == "u32" || n == "i64" || n == "u64" || n == "bool") &&
         e->generic_args.empty()) {
         TypeExpr te{e->span, n, {}};
@@ -690,6 +709,11 @@ bool check_assignable(Expr* expr, const Type& to, DiagnosticBag& diags, const So
     }
     if (from.is_f32() && to.is_f64()) {
         diags.error(span, "implicit precision conversion from 'f32' to 'f64' is forbidden; use an explicit cast ('as f64' or 'f64(...)')");
+        return false;
+    }
+    if ((from.is_df32() && to.is_float_scalar() && !to.is_df32()) ||
+        (from.is_float_scalar() && !from.is_df32() && to.is_df32())) {
+        diags.error(span, "cannot implicitly convert '" + from.to_string() + "' to '" + to.to_string() + "' (use an explicit constructor/cast)");
         return false;
     }
     diags.error(span, "type mismatch: expected '" + to.to_string() + "', got '" + from.to_string() + "'");

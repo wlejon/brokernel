@@ -9,6 +9,7 @@
 #include "embed/embed.h"
 #include "embed/embed_object_builder.h"
 #include "embed/embed_typed_array.h"
+#include "eval/eval.h"
 
 #include <atomic>
 #include <chrono>
@@ -550,6 +551,259 @@ void test_diag_constants_and_enums() {
     std::cout << "  diag, constants, enums, check, probeIf, compareCpuGpu: ok\n";
 }
 
+struct MockReadback final : public GpuReadback {
+    std::vector<uint8_t> payload;
+    mutable int polls = 0;
+    bool ready() const override { return ++polls >= 2; }
+    const void* data() const override { return payload.data(); }
+    size_t bytes() const override { return payload.size(); }
+};
+
+struct MockGpuBuffer final : public GpuBuffer {
+    std::vector<uint8_t> data;
+    explicit MockGpuBuffer(size_t n) : data(std::max<size_t>(n, 4), 0), len_(n) {}
+    size_t len_ = 0;
+    uint64_t address() const override { return reinterpret_cast<uint64_t>(data.data()); }
+    size_t bytes() const override { return len_; }
+    size_t capacity() const override { return data.size(); }
+    bool write(size_t off, const void* src, size_t n, std::string* err) override {
+        if (off + n > len_) { if (err) *err = "oob"; return false; }
+        if (n > 0) std::memcpy(data.data() + off, src, n);
+        return true;
+    }
+    bool read(size_t off, void* dst, size_t n, std::string* err) override {
+        if (off + n > len_) { if (err) *err = "oob"; return false; }
+        if (n > 0) std::memcpy(dst, data.data() + off, n);
+        return true;
+    }
+    std::shared_ptr<GpuReadback> readLater(size_t off, size_t n, std::string* err) override {
+        if (off + n > len_) { if (err) *err = "oob"; return nullptr; }
+        auto rb = std::make_shared<MockReadback>();
+        rb->payload.assign(data.begin() + static_cast<std::ptrdiff_t>(off),
+                           data.begin() + static_cast<std::ptrdiff_t>(off + n));
+        return rb;
+    }
+};
+
+struct MockGpuDevice final : public GpuDevice {
+    int begin_calls = 0;
+    int end_calls = 0;
+    bool available() const override { return true; }
+    std::shared_ptr<GpuBuffer> createBuffer(size_t bytes, std::string*) override {
+        return std::make_shared<MockGpuBuffer>(bytes);
+    }
+    std::shared_ptr<GpuProgram> createProgram(const brokernel::CompiledKernel&, std::string* err) override {
+        if (err) *err = "mock";
+        return nullptr;
+    }
+    bool dispatch(GpuProgram&, const brokernel::CompiledKernel&, const brokernel::GpuLaunch&, std::string* err) override {
+        if (err) *err = "mock";
+        return false;
+    }
+    void beginBatch() override { ++begin_calls; }
+    bool endBatch(std::string*) override { ++end_calls; return true; }
+};
+
+void test_cross_lang_features() {
+    setThreadWaitPump(nullptr, 0);
+    auto r1 = bronze::eval::evalScript(R"(
+        // Negative parse guard: malformed struct array syntax must fail cleanly without hanging.
+        let badThrew = false;
+        try {
+            bro.kernel.compile('struct BadArr { x: [f32, 2], } @kernel fn k() -> f32 { return 1.0; }');
+        } catch (e) {
+            badThrew = true;
+        }
+        if (!badThrew) throw new Error('expected compile error for [f32, 2]');
+
+        bro.kernel.registerModule('cross_helper', 'module cross_helper;\npub fn bias() -> f64 { return 1.0; }');
+        const src = [
+            "import cross_helper;",
+            "struct NestedCfg { offset: vec2<f32>, anchor: df32, gains: [f32; 2], }",
+            "struct SampleCell { weight: f32, height: df32, tag: i32, }",
+            "@kernel @cpu fn eval_cfg(cfg: NestedCfg, x: f64) -> f64 {",
+            "    let d = df32(cfg.offset.x) + cfg.anchor;",
+            "    return f64(d) * f64(cfg.gains[0]) + f64(cfg.offset.y) * f64(cfg.gains[1]) + x;",
+            "}",
+            "@kernel fn df_diff(a: df32) -> df32 {",
+            "    return (df32(16384.0) + a) - df32(16384.0);",
+            "}",
+            "@kernel @cpu fn bump_zero_ret(out: rw_store<i32, 1>, idx: i32, addv: i32) -> f64 {",
+            "    out[idx] = out[idx] + addv;",
+            "    return 0.0;",
+            "}",
+            "@kernel @grid(1) fn bump_grid(g: grid<1>, out: rw_store<i32, 1>, addv: i32) {",
+            "    out[g.x()] = out[g.x()] + addv;",
+            "}",
+            "@kernel @cpu fn store_accum(arr: read_store<f32, 1>, scale: f64, n: i32) -> f64 {",
+            "    var acc: f64 = 0.0;",
+            "    for i in 0..n {",
+            "        acc = acc + f64(arr[i]) * scale;",
+            "    }",
+            "    return acc;",
+            "}",
+            "pub fn add_mul(a: f32, b: f32, c: f32) -> f32 {",
+            "    return (a + b) * c;",
+            "}"
+        ].join('\n');
+        const mod = bro.kernel.compile(src, 'cross_lang_mod');
+
+        // 1. Plain JS object struct param + nested vector + df32 + fixed array
+        const cfgOut = mod.kernel('eval_cfg').eval({
+            offset: { x: 2.0, y: 3.0 },
+            anchor: 16384.0001220703125,
+            gains: [2.0, 5.0],
+        }, 1.0);
+        if (Math.abs(cfgOut - ((2.0 + 16384.0001220703125) * 2.0 + 15.0 + 1.0)) > 1e-6) {
+            throw new Error('plain struct eval mismatch: ' + cfgOut);
+        }
+
+        // 2. df32 + packDF32 / unpackDF32
+        const dfVal = mod.kernel('df_diff').eval(0.062623456789);
+        if (Math.abs(dfVal - 0.062623456789) > 1e-10) {
+            throw new Error('df_diff mismatch: ' + dfVal);
+        }
+        const packed = bro.kernel.packDF32(16384.0 + 0.062623456789);
+        const unpacked = bro.kernel.unpackDF32(packed);
+        if (Math.abs(unpacked[0] - (16384.0 + 0.062623456789)) > 1e-10) {
+            throw new Error('packDF32/unpackDF32 mismatch: ' + unpacked[0]);
+        }
+
+        // 3. Kernel.bind() & KernelFn.bind(), ensuring +0.0 return never double-runs side effects
+        const hBuf = bro.kernel.createBuffer(16, { residency: 'host' });
+        const iView = new Int32Array(hBuf.asTypedArray(Int32Array).buffer, 0, 4);
+        iView[0] = 0; iView[1] = 10;
+        const kBumpFn = mod.fn('bump_zero_ret').bind(hBuf, undefined, 7);
+        const zRet = kBumpFn(1);
+        if (zRet !== 0.0 || iView[1] !== 17) {
+            throw new Error('fn.bind zero-return side-effect check failed: zRet=' + zRet + ' v=' + iView[1]);
+        }
+        const kBumpGrid = mod.kernel('bump_grid').bind(undefined, hBuf, 3);
+        kBumpGrid(2);
+        if (iView[0] !== 3 || iView[1] !== 20) {
+            throw new Error('kernel.bind grid check failed: v0=' + iView[0] + ' v1=' + iView[1]);
+        }
+        const fBound = mod.fn('add_mul').bind(undefined, 4.0, undefined);
+        if (Math.abs(fBound(2.0, 3.0) - 18.0) > 1e-5) {
+            throw new Error('KernelFn.bind mismatch: ' + fBound(2.0, 3.0));
+        }
+
+        // 4. exportNative with store + scalar + df32, and StructView.exportFieldNative
+        mod.kernel('store_accum').exportNative('bro.test.storeAccum');
+        mod.kernel('df_diff').exportNative('bro.test.dfDiff');
+
+        const sv = mod.structView('SampleCell', bro.kernel.createBuffer(mod.structLayout('SampleCell').byteSize * 3, { residency: 'host' }));
+        sv.setStruct(0, { weight: 1.5, height: 16384.250123456, tag: 101 });
+        sv.setStruct(1, { weight: 3.5, height: -42.125, tag: -7 });
+        sv.exportFieldNative('height', 'bro.test.cellHeight');
+        sv.exportFieldNative('tag', 'bro.test.cellTag');
+        sv.exportFieldNative('weight', 'bro.test.cellWeightF32', 'f32[]');
+        globalThis.__testView = sv;
+    )", bronze::eval::EvalOptions{.filename = "cross_lang_setup.js"});
+    if (r1.thrown) {
+        std::cerr << "setupJs threw: " << ev::uncaughtReport(r1.value) << "\n";
+        CHECK(false);
+    }
+
+    // Separate script so Bronze compiler sees registered MIR natives and fuses calls in loops.
+    const std::string fusedJs = R"(
+        const arr = new Float32Array([1.0, 2.0, 3.0, 4.0]);
+        let sum = 0.0;
+        for (let i = 0; i < 4; ++i) {
+            sum += bro.test.storeAccum(arr, 2.0, i + 1);
+        }
+        // i=0:2, i=1:6, i=2:12, i=3:20 -> total 40
+        if (Math.abs(sum - 40.0) > 1e-6) {
+            throw new Error('fused storeAccum loop mismatch: ' + sum);
+        }
+        const dd = bro.test.dfDiff(0.062623456789);
+        if (Math.abs(dd - 0.062623456789) > 1e-10) {
+            throw new Error('fused dfDiff mismatch: ' + dd);
+        }
+
+        const sv = globalThis.__testView;
+        const h0 = bro.test.cellHeight(sv.bytes, 0);
+        const t1 = bro.test.cellTag(sv.bytes, 1);
+        const hOob = bro.test.cellHeight(sv.bytes, 99);
+        const hNeg = bro.test.cellHeight(sv.bytes, -1);
+        const f32Bytes = new Float32Array(sv.bytes.buffer, sv.bytes.byteOffset, sv.bytes.byteLength / 4);
+        const w1 = bro.test.cellWeightF32(f32Bytes, 1);
+        if (Math.abs(h0 - 16384.250123456) > 1e-6 || t1 !== -7 || hOob !== 0 || hNeg !== 0 || Math.abs(w1 - 3.5) > 1e-5) {
+            throw new Error('StructView.exportFieldNative mismatch: ' + [h0, t1, hOob, hNeg, w1].join(', '));
+        }
+        globalThis.__testFusedFn = function() { return bro.test.storeAccum(arr, 2.0, 4); };
+        if (Math.abs(globalThis.__testFusedFn() - 20.0) > 1e-6) throw new Error('pre-reload call failed');
+    )";
+
+    auto r2 = bronze::eval::evalScript(fusedJs, bronze::eval::EvalOptions{.filename = "cross_lang_fused.js"});
+    if (r2.thrown) {
+        std::cerr << "fusedJs threw: " << ev::uncaughtReport(r2.value) << "\n";
+        CHECK(false);
+    }
+
+    // Reload bumps epoch -> fused function falls back cleanly to C trampoline,
+    // and test Host readAsync + mocked GpuDevice batch() & readAsync().
+    auto mockDev = std::make_shared<MockGpuDevice>();
+    setGpuDevice(mockDev);
+
+    const std::string batchAsyncJs = R"(
+        // Trigger bro.kernel.reload epoch bump and invoke previously fused function
+        const rep = bro.kernel.reload({ cross_helper: 'pub fn bias() -> f64 { return 2.0; }' });
+        if (!Array.isArray(rep)) throw new Error('reload did not return array');
+        if (Math.abs(globalThis.__testFusedFn() - 20.0) > 1e-6) {
+            throw new Error('post-reload fallback failed');
+        }
+
+        // Nested bro.kernel.batch
+        const bRet = bro.kernel.batch(() => {
+            return bro.kernel.batch(() => 123);
+        });
+        if (bRet !== 123) throw new Error('batch return mismatch: ' + bRet);
+
+        // GPU buffer write + readAsync
+        const gbuf = bro.kernel.createBuffer(16, { residency: 'gpu' });
+        gbuf.write(new Float32Array([10.5, 20.25, -3.5, 42.0]));
+        globalThis.__readAsyncDone = false;
+        gbuf.readAsync(Float32Array).then((arr) => {
+            if (arr.length !== 4 || arr[0] !== 10.5 || arr[1] !== 20.25 || arr[2] !== -3.5 || arr[3] !== 42.0) {
+                throw new Error('readAsync GPU mismatch: ' + Array.from(arr));
+            }
+            globalThis.__readAsyncDone = true;
+        });
+
+        // Host buffer readAsync
+        const hb = bro.kernel.createBuffer(8, { residency: 'host' });
+        hb.write(new Float32Array([7.0, 9.0]));
+        globalThis.__hostReadDone = false;
+        hb.readAsync(Float32Array).then((arr) => {
+            if (arr.length !== 2 || arr[0] !== 7.0 || arr[1] !== 9.0) {
+                throw new Error('readAsync Host mismatch');
+            }
+            globalThis.__hostReadDone = true;
+        });
+    )";
+
+    auto r3 = bronze::eval::evalScript(batchAsyncJs, bronze::eval::EvalOptions{.filename = "cross_lang_async.js"});
+    if (r3.thrown) {
+        std::cerr << "batchAsyncJs threw: " << ev::uncaughtReport(r3.value) << "\n";
+        CHECK(false);
+    }
+
+    CHECK(mockDev->begin_calls == 1 && mockDev->end_calls == 1);
+    for (int i = 0; i < 4; ++i) {
+        settleAsyncCompiles(false);
+        ev::drainMicrotasks();
+    }
+
+    auto gt = ev::globalValue("globalThis");
+    CHECK(gt.found);
+    CHECK(ev::toBool(ev::getProperty(gt.value, "__readAsyncDone")));
+    CHECK(ev::toBool(ev::getProperty(gt.value, "__hostReadDone")));
+    setGpuDevice(nullptr);
+
+    std::cout << "  cross-lang (plain struct, df32, bind, exportNative MIR, StructView, batch, readAsync): ok\n";
+}
+
 } // namespace
 
 int main() {
@@ -560,6 +814,7 @@ int main() {
     test_async();
     test_realm_destroy();
     test_diag_constants_and_enums();
+    test_cross_lang_features();
     setThreadWaitPump(nullptr, 0);
     std::cout << "test_kernel_api: all passed\n";
     return 0;

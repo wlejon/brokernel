@@ -205,6 +205,12 @@ Value readScalarAt(const uint8_t* p, ScalarKind sk) {
     switch (sk) {
         case ScalarKind::F32: { float v; std::memcpy(&v, p, 4); return ev::fromDouble(v); }
         case ScalarKind::F64: { double v; std::memcpy(&v, p, 8); return ev::fromDouble(v); }
+        case ScalarKind::DF32: {
+            float hi = 0.0f, lo = 0.0f;
+            std::memcpy(&hi, p, 4);
+            std::memcpy(&lo, p + 4, 4);
+            return ev::fromDouble(static_cast<double>(hi) + static_cast<double>(lo));
+        }
         case ScalarKind::I32: { int32_t v; std::memcpy(&v, p, 4); return ev::fromDouble(v); }
         case ScalarKind::U32: { uint32_t v; std::memcpy(&v, p, 4); return ev::fromDouble(v); }
         case ScalarKind::I64: { int64_t v; std::memcpy(&v, p, 8); return ev::fromDouble(static_cast<double>(v)); }
@@ -218,6 +224,14 @@ void writeScalarAt(uint8_t* p, ScalarKind sk, Value val) {
     switch (sk) {
         case ScalarKind::F32: { float v = static_cast<float>(ev::toDouble(val)); std::memcpy(p, &v, 4); break; }
         case ScalarKind::F64: { double v = ev::toDouble(val); std::memcpy(p, &v, 8); break; }
+        case ScalarKind::DF32: {
+            const double d = ev::toDouble(val);
+            const float hi = static_cast<float>(d);
+            const float lo = static_cast<float>(d - static_cast<double>(hi));
+            std::memcpy(p, &hi, 4);
+            std::memcpy(p + 4, &lo, 4);
+            break;
+        }
         case ScalarKind::I32: { int32_t v = static_cast<int32_t>(ev::toInt64(val)); std::memcpy(p, &v, 4); break; }
         case ScalarKind::U32: { uint32_t v = static_cast<uint32_t>(ev::toUint64(val)); std::memcpy(p, &v, 4); break; }
         case ScalarKind::I64: { int64_t v = ev::toInt64(val); std::memcpy(p, &v, 8); break; }
@@ -297,6 +311,22 @@ void decorateStructView(ev::ObjectBuilder& b) {
     });
     b.accessor("count", [](Value self, std::span<const Value>) -> Value {
         return ev::fromDouble(unwrapView(self, "StructView.count")->count);
+    });
+    b.accessor("bytes", [](Value self, std::span<const Value>) -> Value {
+        StructViewHandle* vh = unwrapView(self, "StructView.bytes");
+        const uint32_t totalBytes = static_cast<uint32_t>(
+            std::min<size_t>(size_t(vh->count) * vh->byte_stride, 0xffffffffu));
+        if (vh->kernel_buf) {
+            std::string err;
+            if (!vh->kernel_buf->prepareForCpu(&err)) return ev::throwError("StructView.bytes: " + err);
+            const auto* vecPtr = hostBackingOf(vh->kernel_buf.get());
+            if (!vecPtr || !*vecPtr) return ev::throwError("StructView.bytes: buffer has no host storage");
+            return makeTypedArrayFromVec(*vecPtr, totalBytes, ev::elements::Uint8, 1);
+        }
+        const Value ta = vh->typed_array.get();
+        const Value buf = ev::getProperty(ta, "buffer");
+        const uint32_t off = static_cast<uint32_t>(ev::toUint64(ev::getProperty(ta, "byteOffset")));
+        return ev::createTypedArrayView(ev::elements::Uint8, buf, off, totalBytes);
     });
     b.accessor("fields", [](Value self, std::span<const Value>) -> Value {
         StructViewHandle* vh = unwrapView(self, "StructView.fields");
@@ -380,6 +410,7 @@ void decorateStructView(ev::ObjectBuilder& b) {
         finishViewWrite(*vh);
         return ev::undefined();
     });
+    decorateStructViewBind(b);
 }
 
 void releaseSharedVec(void* user, uint8_t*) {
@@ -406,13 +437,53 @@ bronze::ElementKind elementKindForCtor(Value ctor, uint32_t& elem_bytes) {
     return ev::elements::Uint8;
 }
 
+} // namespace
+
 const std::shared_ptr<std::vector<uint8_t>>* hostBackingOf(GpuBuffer* b) {
     if (auto* hb = dynamic_cast<HostGpuBuffer*>(b)) return &hb->backing();
     if (auto* sb = dynamic_cast<SharedGpuBuffer*>(b)) return &sb->backing();
     return nullptr;
 }
 
-} // namespace
+bool structViewFieldMeta(Value self, std::string_view fieldName, uint32_t& outStride,
+                         uint32_t& outOffset, ScalarKind& outScalar, std::string* err) {
+    auto* vh = static_cast<StructViewHandle*>(g_structViewClass.unwrap(self));
+    if (!vh) {
+        if (err) *err = "invalid StructView receiver";
+        return false;
+    }
+    const ViewField* f = findViewField(*vh, fieldName);
+    if (!f) {
+        if (err) *err = "unknown field '" + std::string(fieldName) + "'";
+        return false;
+    }
+    if (!f->type.is_scalar()) {
+        if (err) *err = "field '" + std::string(fieldName) + "' is not a scalar or df32";
+        return false;
+    }
+    outStride = vh->byte_stride;
+    outOffset = f->byte_offset;
+    outScalar = f->type.scalar;
+    return true;
+}
+
+Value makeTypedArrayFromVec(std::shared_ptr<std::vector<uint8_t>> vec,
+                            size_t byteLength,
+                            bronze::ElementKind ek,
+                            uint32_t elemBytes) {
+    auto* keep = new std::shared_ptr<std::vector<uint8_t>>(std::move(vec));
+    ev::Persistent arrBuf(ev::createExternalArrayBuffer((*keep)->data(),
+                                                        static_cast<uint32_t>(byteLength),
+                                                        releaseSharedVec,
+                                                        keep));
+    return ev::createTypedArrayView(ek, arrBuf.get(), 0, static_cast<uint32_t>(byteLength / elemBytes));
+}
+
+bool typedArrayKindForCtor(Value ctor, bronze::ElementKind& outKind, uint32_t& outBytes) {
+    outBytes = 1;
+    outKind = elementKindForCtor(ctor, outBytes);
+    return true;
+}
 
 Value js_createBuffer(Value, std::span<const Value> args) {
     BufferResidency res = BufferResidency::Gpu;

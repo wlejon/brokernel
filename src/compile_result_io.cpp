@@ -602,6 +602,10 @@ bool decode_result(ByteReader& r, CompileResult& res, std::vector<uint8_t>& had_
         res.kernels.emplace_back();
         get_kernel(r, res.kernels.back(), had_cpu[i]);
     }
+    if (r.ok()) {
+        auto types_ref = std::make_shared<const TypeRegistry>(res.types);
+        for (auto& k : res.kernels) k.types = types_ref;
+    }
     return r.ok() && r.at_end() && !res.diagnostics.has_errors();
 }
 

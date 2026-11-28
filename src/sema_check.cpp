@@ -349,6 +349,8 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
             if (e->literal_suffix == ScalarKind::Void && expected) {
                 if (expected->is_f64() || ((expected->is_vector() || expected->is_array()) && expected->scalar == ScalarKind::F64)) {
                     sk = ScalarKind::F64;
+                } else if (expected->is_df32() || ((expected->is_vector() || expected->is_array()) && expected->scalar == ScalarKind::DF32)) {
+                    sk = ScalarKind::DF32;
                 }
             }
             e->resolved_type = Type::scalar_type(sk);
@@ -627,10 +629,16 @@ Type FnCheckState::check_expr(Expr* e, std::optional<Type> expected) {
                                          recv.to_string() + "' (unwrap with '.0' first)");
                 return Type::void_type();
             }
-            // Allow .x on scalar (for D=1 generic vector code)
+            // Allow .x on scalar (for D=1 generic vector code) and .hi/.lo on df32 / vecN<df32>
             if (recv.is_scalar() && (f == "x" || f == "r")) {
                 e->resolved_type = recv;
                 return recv;
+            }
+            if ((recv.is_df32() || (recv.is_vector() && recv.scalar == ScalarKind::DF32)) &&
+                (f == "hi" || f == "lo")) {
+                Type rt = recv.is_vector() ? Type::vec(ScalarKind::F32, recv.dimension) : Type::f32();
+                e->resolved_type = rt;
+                return rt;
             }
             if (recv.is_vector()) {
                 if (f.empty() || f.size() > 4) {

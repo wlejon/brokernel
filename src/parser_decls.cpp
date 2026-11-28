@@ -275,6 +275,7 @@ StructDecl Parser::parse_struct(bool is_pub) {
     s.generic_params = parse_generic_params();
     consume(TokenKind::LBrace, "'{' in struct declaration");
     while (!check(TokenKind::RBrace) && !is_at_end()) {
+        const size_t before = pos_;
         StructFieldDecl f;
         f.span = peek().span;
         f.name = consume(TokenKind::Ident, "struct field name").text;
@@ -285,6 +286,7 @@ StructDecl Parser::parse_struct(bool is_pub) {
         if (!match(TokenKind::Comma)) {
             match(TokenKind::Semi);
         }
+        if (pos_ == before) advance();
     }
     const Token& rb = consume(TokenKind::RBrace, "'}' after struct fields");
     match(TokenKind::Semi);

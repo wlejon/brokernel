@@ -308,6 +308,16 @@ struct MirBodyLowerer {
     brass::Value* lower_scalar_math_2(const std::string& name, brass::Value* a, brass::Value* c, ScalarKind sk);
     brass::Value* lower_scalar_math_3(const std::string& name, brass::Value* x, brass::Value* y, brass::Value* z, ScalarKind sk);
 
+    // Double-float (df32) lowering (lowering_df32.cpp).
+    ValueList lower_df32_const(double val);
+    ValueList lower_df32_cast_to(const ValueList& src, ScalarKind from_sk);
+    brass::Value* lower_df32_cast_from(brass::Value* hi, brass::Value* lo, ScalarKind to_sk);
+    ValueList lower_df32_binary(BinaryOp op, const ValueList& lhs, const ValueList& rhs);
+    ValueList lower_df32_math(const std::string& name, const std::vector<ValueList>& args);
+    ValueList lower_df32_field(const ValueList& recv, const Type& rt, std::string_view fname);
+    ValueList lower_df32_cast_expr(const ValueList& sub, ScalarKind from_sk, ScalarKind to_sk);
+    std::optional<ValueList> try_lower_df32_call(const Expr* e);
+
     ValueList lower_expr(const Expr* e);
     void emit_probe(uint32_t probe_idx, const Type& val_type, const ValueList& vals);
     // Runtime checks, trap_non_finite, and conditional probe_if (lowering_checks.cpp).

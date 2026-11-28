@@ -483,6 +483,7 @@ void setThreadWaitPump(WaitPump pump, int intervalMs) {
 
 void settleAsyncCompiles(bool waitAll) {
     settleCpuWaits(waitAll);
+    settleAsyncReadbacks(waitAll);
     if (t_jobs.empty()) return;
     uint64_t seen = wakeEvents();
     for (;;) {

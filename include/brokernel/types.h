@@ -19,6 +19,7 @@ enum class ScalarKind : uint8_t {
     U64 = 5,
     F32 = 6,
     F64 = 7,
+    DF32 = 8,
 };
 
 enum class AccessMode : uint8_t {
@@ -84,6 +85,7 @@ struct Type {
     static Type u64() noexcept { return scalar_type(ScalarKind::U64); }
     static Type f32() noexcept { return scalar_type(ScalarKind::F32); }
     static Type f64() noexcept { return scalar_type(ScalarKind::F64); }
+    static Type df32() noexcept { return scalar_type(ScalarKind::DF32); }
 
     static Type vec(ScalarKind s, uint32_t lanes) noexcept {
         if (lanes <= 1) return scalar_type(s);
@@ -258,12 +260,14 @@ struct Type {
     bool is_u64() const noexcept { return is_scalar() && scalar == ScalarKind::U64; }
     bool is_f32() const noexcept { return is_scalar() && scalar == ScalarKind::F32; }
     bool is_f64() const noexcept { return is_scalar() && scalar == ScalarKind::F64; }
+    bool is_df32() const noexcept { return is_scalar() && scalar == ScalarKind::DF32; }
 
     bool is_float_scalar() const noexcept {
-        return is_scalar() && (scalar == ScalarKind::F32 || scalar == ScalarKind::F64);
+        return is_scalar() && (scalar == ScalarKind::F32 || scalar == ScalarKind::F64 || scalar == ScalarKind::DF32);
     }
     bool is_float() const noexcept {
-        return (is_scalar() || is_vector()) && (scalar == ScalarKind::F32 || scalar == ScalarKind::F64);
+        return (is_scalar() || is_vector()) &&
+               (scalar == ScalarKind::F32 || scalar == ScalarKind::F64 || scalar == ScalarKind::DF32);
     }
     bool is_signed_int() const noexcept {
         return (is_scalar() || is_vector()) && (scalar == ScalarKind::I32 || scalar == ScalarKind::I64);

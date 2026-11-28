@@ -228,6 +228,14 @@ bool pack_cpu_args(
             switch (p.type.scalar) {
                 case ScalarKind::F32: slots_out.push_back(pack_f32_bits(a.as_f32())); break;
                 case ScalarKind::F64: slots_out.push_back(pack_f64_bits(a.as_f64())); break;
+                case ScalarKind::DF32: {
+                    const double d = a.as_f64();
+                    const float hi = static_cast<float>(d);
+                    const float lo = static_cast<float>(d - static_cast<double>(hi));
+                    slots_out.push_back(pack_f32_bits(hi));
+                    slots_out.push_back(pack_f32_bits(lo));
+                    break;
+                }
                 case ScalarKind::U32: slots_out.push_back(static_cast<uint64_t>(a.as_u32())); break;
                 case ScalarKind::U64: slots_out.push_back(a.as_u64()); break;
                 case ScalarKind::I64: slots_out.push_back(static_cast<uint64_t>(a.as_i64())); break;
@@ -237,13 +245,22 @@ bool pack_cpu_args(
             if (a.kind() == KernelArg::Kind::ScalarsF32) {
                 for (float v : a.f32_values()) slots_out.push_back(pack_f32_bits(v));
             } else if (a.kind() == KernelArg::Kind::ScalarsF64) {
-                for (double v : a.f64_values()) slots_out.push_back(pack_f64_bits(v));
+                for (double v : a.f64_values()) {
+                    if (p.type.scalar == ScalarKind::DF32) {
+                        const float hi = static_cast<float>(v);
+                        const float lo = static_cast<float>(v - static_cast<double>(hi));
+                        slots_out.push_back(pack_f32_bits(hi));
+                        slots_out.push_back(pack_f32_bits(lo));
+                    } else {
+                        slots_out.push_back(pack_f64_bits(v));
+                    }
+                }
             } else if (a.kind() == KernelArg::Kind::ScalarsI32) {
                 for (int32_t v : a.i32_values()) slots_out.push_back(static_cast<uint64_t>(static_cast<uint32_t>(v)));
             } else if (a.kind() == KernelArg::Kind::Buffer && a.buffer_ptr()) {
                 const auto* raw = static_cast<const uint8_t*>(a.buffer_ptr());
                 size_t off = 0;
-                uint32_t elem_sz = p.type.scalar_size_bytes();
+                uint32_t elem_sz = p.type.scalar == ScalarKind::DF32 ? 4u : p.type.scalar_size_bytes();
                 if (elem_sz == 0) elem_sz = 4;
                 for (uint32_t k = 0; k < p.mir_param_count; ++k) {
                     uint64_t word = 0;
@@ -420,6 +437,40 @@ uint32_t CompiledKernel::cpu_grid_lanes() const {
 uint32_t CompiledKernel::cpu_shared_bytes() const {
     const CpuBuild* cpu = cpu_build(cpu_);
     return cpu ? cpu->shared_bytes : 0;
+}
+
+bool CompiledKernel::ensure_direct_cpu_mir(
+    std::shared_ptr<const brass::Module>& out_mod,
+    std::string& out_entry,
+    std::string* err) const {
+    out_mod.reset();
+    out_entry.clear();
+    if (!cpu_) {
+        if (err) *err = "kernel '" + name + "' has no CPU build";
+        return false;
+    }
+    CpuBuild* cpu = cpu_.get();
+    std::call_once(cpu->direct_mir_once, [&] {
+        if (!cpu->lower_direct_mir) {
+            cpu->direct_mir_error = "direct CPU MIR lowering unavailable for kernel '" + name + "'";
+            return;
+        }
+        try {
+            cpu->lower_direct_mir(cpu->direct_mir_module, cpu->direct_mir_entry, cpu->direct_mir_error);
+        } catch (const std::exception& ex) {
+            cpu->direct_mir_error = std::string("direct CPU MIR error: ") + ex.what();
+            cpu->direct_mir_module.reset();
+            cpu->direct_mir_entry.clear();
+        }
+        cpu->lower_direct_mir = nullptr;
+    });
+    if (!cpu->direct_mir_module || cpu->direct_mir_entry.empty()) {
+        if (err) *err = cpu->direct_mir_error.empty() ? "direct CPU MIR unavailable" : cpu->direct_mir_error;
+        return false;
+    }
+    out_mod = cpu->direct_mir_module;
+    out_entry = cpu->direct_mir_entry;
+    return true;
 }
 
 bool CompiledKernel::eval_grid_point_cpu(

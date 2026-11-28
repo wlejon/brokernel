@@ -355,6 +355,7 @@ public:
     Stage stage = Stage::Compute;
     uint32_t grid_dim = 0;               // 0 = point kernel, 1..3 = 1D/2D/3D grid kernel
     uint32_t local_size[3] = {64, 1, 1};
+    std::shared_ptr<const TypeRegistry> types;
     std::vector<KernelParamInfo> params; // Source parameters
     std::vector<KernelParamInfo> all_mir_params; // Includes implicit GridDim and ReturnStore
     std::vector<KernelParamInfo> block_bindings; // Descriptor-bound uniform<T> / buffer<T> used by the kernel
@@ -452,6 +453,10 @@ public:
     const brass::codegen::KernelFunction& cpu_grid_fn() const;
     const std::string& cpu_error() const;
     bool has_cpu_build() const noexcept { return cpu_ != nullptr; }
+    // Lazily lowers a pure-SSA Bronze-ABI MIR module for native call fusion.
+    bool ensure_direct_cpu_mir(std::shared_ptr<const brass::Module>& out_mod,
+                               std::string& out_entry,
+                               std::string* err = nullptr) const;
     // Whether the CPU functions are made already (no CPU build: true).
     bool cpu_built() const noexcept { return !cpu_ || cpu_->ready.load(std::memory_order_acquire); }
     // Cells the grid function computes per step along x: 8 or 4 (AVX2
@@ -475,6 +480,12 @@ public:
         brass::codegen::KernelFunction point_fn;
         brass::codegen::KernelFunction grid_fn;
         std::string error;
+
+        std::once_flag direct_mir_once;
+        std::function<void(std::shared_ptr<const brass::Module>&, std::string&, std::string&)> lower_direct_mir;
+        std::shared_ptr<const brass::Module> direct_mir_module;
+        std::string direct_mir_entry;
+        std::string direct_mir_error;
     };
     std::shared_ptr<CpuBuild> cpu_;
 

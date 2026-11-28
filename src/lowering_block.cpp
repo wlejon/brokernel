@@ -156,10 +156,19 @@ void MirBodyLowerer::block_words(const Type& t, bool std140, brass::Value* base,
     if (t.is_scalar()) {
         out.push_back(base);
         kinds.push_back(t.scalar);
+        if (t.scalar == ScalarKind::DF32) {
+            out.push_back(at(4));
+            kinds.push_back(ScalarKind::DF32);
+        }
     } else if (t.is_vector()) {
+        const uint32_t sb = (t.scalar == ScalarKind::DF32) ? 8u : 4u;
         for (uint32_t i = 0; i < t.dimension; ++i) {
-            out.push_back(at(4 * i));
+            out.push_back(at(sb * i));
             kinds.push_back(t.scalar);
+            if (t.scalar == ScalarKind::DF32) {
+                out.push_back(at(sb * i + 4));
+                kinds.push_back(ScalarKind::DF32);
+            }
         }
     } else if (t.is_array()) {
         uint32_t stride = block_stride(t.element_type(), std140);
@@ -186,12 +195,17 @@ ValueList MirBodyLowerer::block_load(const Expr* e, const BlockPlace& p) {
         auto it = cpu_block_ptrs.find(p.param);
         brass::Value* base_ptr = it != cpu_block_ptrs.end() ? it->second.first : b.build_iconst_i64(0);
         auto load_cpu_scalar = [&](ScalarKind sk, brass::Value* byte_off) {
-            brass::Type mt = sk == ScalarKind::F32 ? brass::Type::f32() : brass::Type::i32();
+            brass::Type mt = (sk == ScalarKind::F32 || sk == ScalarKind::DF32) ? brass::Type::f32() : brass::Type::i32();
             return b.build_load_indexed(mt, base_ptr, b.build_sext_i64(byte_off), 1, 0);
         };
         if (!p.lanes.empty()) {
+            const uint32_t lane_stride = (p.type.scalar == ScalarKind::DF32) ? 8u : 4u;
             for (uint32_t lane : p.lanes) {
-                out.push_back(load_cpu_scalar(p.type.scalar, add_bytes(b, p.offset, 4 * lane)));
+                brass::Value* off = add_bytes(b, p.offset, lane_stride * lane);
+                out.push_back(load_cpu_scalar(p.type.scalar, off));
+                if (p.type.scalar == ScalarKind::DF32) {
+                    out.push_back(load_cpu_scalar(ScalarKind::F32, add_bytes(b, off, 4)));
+                }
             }
             return out;
         }
@@ -205,7 +219,7 @@ ValueList MirBodyLowerer::block_load(const Expr* e, const BlockPlace& p) {
     }
     const uint32_t ubytes = uniform_bytes(*param);
     auto load_vec4 = [&](ScalarKind sk, brass::Value* off, const std::vector<uint32_t>& pick) {
-        brass::Type vt = sk == ScalarKind::F32 ? brass::Type::f32x4() : brass::Type::i32x4();
+        brass::Type vt = (sk == ScalarKind::F32 || sk == ScalarKind::DF32) ? brass::Type::f32x4() : brass::Type::i32x4();
         brass::Value* vec = kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes, off, vt);
         brass::Value* lanes[4] = {};
         for (uint32_t l : pick) {
@@ -214,29 +228,49 @@ ValueList MirBodyLowerer::block_load(const Expr* e, const BlockPlace& p) {
         }
     };
     if (!p.lanes.empty()) {
-        if (p.vec4_base) {
+        if (p.vec4_base && p.type.scalar != ScalarKind::DF32) {
             load_vec4(p.type.scalar, p.offset, p.lanes);
             return out;
         }
-        brass::Type t = p.type.scalar == ScalarKind::F32 ? brass::Type::f32() : brass::Type::i32();
+        brass::Type t = (p.type.scalar == ScalarKind::F32 || p.type.scalar == ScalarKind::DF32)
+                            ? brass::Type::f32()
+                            : brass::Type::i32();
+        const uint32_t lane_stride = (p.type.scalar == ScalarKind::DF32) ? 8u : 4u;
         for (uint32_t lane : p.lanes) {
-            out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
-                                         add_bytes(b, p.offset, 4 * lane), t));
+            brass::Value* off = add_bytes(b, p.offset, lane_stride * lane);
+            out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes, off, t));
+            if (p.type.scalar == ScalarKind::DF32) {
+                out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
+                                             add_bytes(b, off, 4), t));
+            }
         }
         return out;
     }
     std::function<void(const Type&, uint32_t)> emit_loads = [&](const Type& t, uint32_t rel) {
-        if (t.is_vector() && t.dimension == 4 && p.aligned16 && (rel % 16 == 0)) {
+        if (t.is_vector() && t.scalar != ScalarKind::DF32 && t.dimension == 4 && p.aligned16 && (rel % 16 == 0)) {
             load_vec4(t.scalar, add_bytes(b, p.offset, rel), {0, 1, 2, 3});
         } else if (t.is_scalar()) {
-            brass::Type mt = t.scalar == ScalarKind::F32 ? brass::Type::f32() : brass::Type::i32();
+            brass::Type mt = (t.scalar == ScalarKind::F32 || t.scalar == ScalarKind::DF32)
+                                 ? brass::Type::f32()
+                                 : brass::Type::i32();
             out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
                                          add_bytes(b, p.offset, rel), mt));
+            if (t.scalar == ScalarKind::DF32) {
+                out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
+                                             add_bytes(b, p.offset, rel + 4), mt));
+            }
         } else if (t.is_vector()) {
-            brass::Type mt = t.scalar == ScalarKind::F32 ? brass::Type::f32() : brass::Type::i32();
+            brass::Type mt = (t.scalar == ScalarKind::F32 || t.scalar == ScalarKind::DF32)
+                                 ? brass::Type::f32()
+                                 : brass::Type::i32();
+            const uint32_t stride = (t.scalar == ScalarKind::DF32) ? 8u : 4u;
             for (uint32_t i = 0; i < t.dimension; ++i) {
                 out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
-                                             add_bytes(b, p.offset, rel + 4 * i), mt));
+                                             add_bytes(b, p.offset, rel + stride * i), mt));
+                if (t.scalar == ScalarKind::DF32) {
+                    out.push_back(kb.buffer_load(param->descriptor_set, param->descriptor_binding, ubytes,
+                                                 add_bytes(b, p.offset, rel + stride * i + 4), mt));
+                }
             }
         } else if (t.is_array()) {
             uint32_t stride = block_stride(t.element_type(), p.std140);
@@ -809,7 +843,8 @@ ValueList MirBodyLowerer::shared_atomic(const Expr* e, const SharedPlace& p, con
 brass::Type to_mir_scalar_type(ScalarKind sk) {
     switch (sk) {
         case ScalarKind::I64: case ScalarKind::U64: return brass::Type::i64();
-        case ScalarKind::F32: return brass::Type::f32();
+        case ScalarKind::F32:
+        case ScalarKind::DF32: return brass::Type::f32();
         case ScalarKind::F64: return brass::Type::f64();
         default: return brass::Type::i32();
     }

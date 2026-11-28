@@ -487,6 +487,7 @@ Type SemaContext::resolve_type(
     if (n == "u64") return Type::u64();
     if (n == "f32" || n == "float") return Type::f32();
     if (n == "f64" || n == "double") return Type::f64();
+    if (n == "df32") return Type::df32();
 
     // 3. Built-in vector shorthands
     if (n == "vec2f") return Type::vec(ScalarKind::F32, 2);

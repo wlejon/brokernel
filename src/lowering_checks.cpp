@@ -8,7 +8,7 @@ namespace brokernel::detail {
 namespace {
 
 brass::Value* extract_scalar_bits_lo(brass::Builder& sb, brass::Value* sv, ScalarKind sk) {
-    if (sk == ScalarKind::F32) return sb.build_bitcast_i32_f32(sv);
+    if (sk == ScalarKind::F32 || sk == ScalarKind::DF32) return sb.build_bitcast_i32_f32(sv);
     if (sk == ScalarKind::F64) return sb.build_trunc_i32(sb.build_bitcast_i64_f64(sv));
     return sb.build_iconst_i32(0);
 }
@@ -23,7 +23,8 @@ brass::Value* extract_scalar_bits_hi(brass::Builder& sb, brass::Value* sv, Scala
 
 brass::Value* encode_probe_if_scalar_u32(brass::Builder& sb, brass::Value* sv, ScalarKind sk) {
     switch (sk) {
-        case ScalarKind::F32: return sb.build_bitcast_i32_f32(sv);
+        case ScalarKind::F32:
+        case ScalarKind::DF32: return sb.build_bitcast_i32_f32(sv);
         case ScalarKind::F64: return sb.build_bitcast_i32_f32(sb.build_fptrunc_f32_f64(sv));
         case ScalarKind::Bool: return sb.build_ne(sv, sb.build_iconst_i32(0));
         case ScalarKind::I32:
